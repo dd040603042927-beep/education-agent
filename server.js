@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
 
 const PORT = Number(process.env.PORT || 5107);
 const HOST = "127.0.0.1";
@@ -242,11 +243,210 @@ function normalizeSubject(subject) {
   return String(subject || "通用").trim() || "通用";
 }
 
+function decodeDataUrl(dataUrl) {
+  const raw = String(dataUrl || "");
+  const commaIndex = raw.indexOf(",");
+  if (commaIndex < 0) return Buffer.alloc(0);
+  return Buffer.from(raw.slice(commaIndex + 1), "base64");
+}
+
+function decodeUtf16Hex(hex) {
+  const clean = String(hex || "").replace(/\s+/g, "");
+  if (!clean) return "";
+  if (clean.length % 4 === 0) {
+    let text = "";
+    for (let i = 0; i < clean.length; i += 4) {
+      const code = parseInt(clean.slice(i, i + 4), 16);
+      if (Number.isFinite(code) && code > 0) text += String.fromCharCode(code);
+    }
+    if (/[\u4e00-\u9fa5A-Za-z0-9]/.test(text)) return text;
+  }
+  const bytes = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    const byte = parseInt(clean.slice(i, i + 2), 16);
+    if (Number.isFinite(byte)) bytes.push(byte);
+  }
+  return Buffer.from(bytes).toString("utf8").replace(/\u0000/g, "");
+}
+
+function decodePdfLiteralString(value) {
+  const body = String(value || "").replace(/^\(/, "").replace(/\)$/, "");
+  let result = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch !== "\\") {
+      result += ch;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === "n") result += "\n";
+    else if (next === "r") result += "\r";
+    else if (next === "t") result += "\t";
+    else if (next === "b") result += "\b";
+    else if (next === "f") result += "\f";
+    else if (next === "(" || next === ")" || next === "\\") result += next;
+    else if (/[0-7]/.test(next || "")) {
+      const octal = body.slice(i + 1).match(/^[0-7]{1,3}/)?.[0] || "";
+      result += String.fromCharCode(parseInt(octal, 8));
+      i += octal.length;
+      continue;
+    }
+    i += 1;
+  }
+  return result;
+}
+
+function parsePdfCMap(text) {
+  const map = new Map();
+  const bfCharBlocks = text.match(/beginbfchar[\s\S]*?endbfchar/g) || [];
+  bfCharBlocks.forEach((block) => {
+    const pairs = block.matchAll(/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>/g);
+    for (const pair of pairs) map.set(pair[1].toUpperCase(), decodeUtf16Hex(pair[2]));
+  });
+
+  const rangeBlocks = text.match(/beginbfrange[\s\S]*?endbfrange/g) || [];
+  rangeBlocks.forEach((block) => {
+    const ranges = block.matchAll(/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>/g);
+    for (const range of ranges) {
+      const start = parseInt(range[1], 16);
+      const end = parseInt(range[2], 16);
+      const target = parseInt(range[3], 16);
+      const keyWidth = range[1].length;
+      for (let code = start; code <= end && code - start < 256; code += 1) {
+        const key = code.toString(16).toUpperCase().padStart(keyWidth, "0");
+        const value = (target + code - start).toString(16).toUpperCase().padStart(4, "0");
+        map.set(key, decodeUtf16Hex(value));
+      }
+    }
+  });
+  return map;
+}
+
+function decodePdfHexString(value, cmap) {
+  const clean = String(value || "").replace(/[<>\s]/g, "").toUpperCase();
+  if (!clean) return "";
+  if (cmap && cmap.size) {
+    const keyLengths = Array.from(new Set([...cmap.keys()].map((key) => key.length))).sort((a, b) => b - a);
+    let result = "";
+    let index = 0;
+    while (index < clean.length) {
+      const keyLength = keyLengths.find((length) => cmap.has(clean.slice(index, index + length)));
+      if (keyLength) {
+        result += cmap.get(clean.slice(index, index + keyLength));
+        index += keyLength;
+      } else {
+        result += decodeUtf16Hex(clean.slice(index, index + 4));
+        index += 4;
+      }
+    }
+    return result;
+  }
+  return decodeUtf16Hex(clean);
+}
+
+function extractPdfStrings(content, cmap) {
+  const chunks = [];
+  const textBlocks = content.match(/BT[\s\S]*?ET/g) || [content];
+  textBlocks.forEach((block) => {
+    const tj = block.matchAll(/(\((?:\\.|[^\\)])*\)|<[\dA-Fa-f\s]+>)\s*Tj/g);
+    for (const match of tj) {
+      chunks.push(match[1].startsWith("(") ? decodePdfLiteralString(match[1]) : decodePdfHexString(match[1], cmap));
+    }
+
+    const tjArrays = block.matchAll(/\[([\s\S]*?)\]\s*TJ/g);
+    for (const arrayMatch of tjArrays) {
+      const strings = arrayMatch[1].match(/\((?:\\.|[^\\)])*\)|<[\dA-Fa-f\s]+>/g) || [];
+      chunks.push(strings.map((item) => item.startsWith("(") ? decodePdfLiteralString(item) : decodePdfHexString(item, cmap)).join(""));
+    }
+  });
+  return chunks.join("\n");
+}
+
+function normalizeExtractedText(text) {
+  return String(text || "")
+    .replace(/\u0000/g, "")
+    .replace(/[^\S\r\n]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractPdfTextFromBuffer(buffer) {
+  const binary = buffer.toString("latin1");
+  const streamRegex = /<<(?:.|\r|\n)*?>>\s*stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  const streams = [];
+  let match;
+  while ((match = streamRegex.exec(binary))) {
+    const fullMatch = match[0];
+    const dictionary = fullMatch.slice(0, fullMatch.indexOf("stream"));
+    let data = Buffer.from(match[1], "latin1");
+    if (/FlateDecode/.test(dictionary)) {
+      try {
+        data = zlib.inflateSync(data);
+      } catch {
+        try {
+          data = zlib.inflateRawSync(data);
+        } catch {
+          continue;
+        }
+      }
+    }
+    streams.push(data.toString("latin1"));
+  }
+
+  const cmap = new Map();
+  streams.forEach((stream) => {
+    const parsed = parsePdfCMap(stream);
+    parsed.forEach((value, key) => cmap.set(key, value));
+  });
+
+  const text = streams.map((stream) => extractPdfStrings(stream, cmap)).join("\n");
+  const fallback = extractPdfStrings(binary, cmap);
+  return normalizeExtractedText(`${text}\n${fallback}`);
+}
+
+function extractUploadedBookText(file) {
+  if (!file || !file.dataUrl) return { text: "", meta: null };
+  const name = String(file.name || "上传书本");
+  const type = String(file.type || "");
+  const buffer = decodeDataUrl(file.dataUrl);
+  if (!buffer.length) return { text: "", meta: { name, type, method: "empty-upload", characters: 0 } };
+  const lowerName = name.toLowerCase();
+  let text = "";
+  let method = "text-reader";
+  if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
+    method = "local-pdf-text-agent";
+    text = extractPdfTextFromBuffer(buffer);
+  } else {
+    text = buffer.toString("utf8");
+  }
+  return { text, meta: { name, type, method, characters: text.length } };
+}
+
+function splitKnowledgeSentences(text) {
+  return String(text || "")
+    .split(/(?<=[。！？!?；;])|\n+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 6)
+    .slice(0, 80);
+}
+
+function knowledgePointsForKeyword(text, keyword) {
+  const sentences = splitKnowledgeSentences(text);
+  const exact = sentences.filter((sentence) => sentence.includes(keyword)).slice(0, 5);
+  if (exact.length) return exact.map((sentence) => sentence.slice(0, 160));
+  return sentences.slice(0, 3).map((sentence) => sentence.slice(0, 160));
+}
+
 function extractKeywords(text, subject) {
   const source = `${subject} ${String(text || "")}`;
-  const cnWords = Array.from(new Set((source.match(/[\u4e00-\u9fa5]{2,8}/g) || []).filter((word) => !["这是", "一个", "可以", "进行", "知识", "图谱", "学生", "老师"].includes(word))));
+  const stopWords = new Set(["这是", "一个", "可以", "进行", "知识", "图谱", "学生", "老师", "内容", "文件", "上传", "生成", "学习", "教学", "本节", "掌握", "理解"]);
+  const cnWords = (source.match(/[\u4e00-\u9fa5]{2,10}/g) || []).filter((word) => !stopWords.has(word));
   const enWords = Array.from(new Set((source.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || []).map((word) => word.toLowerCase())));
-  const merged = cnWords.concat(enWords).slice(0, 12);
+  const rankedCn = Array.from(cnWords.reduce((map, word) => map.set(word, (map.get(word) || 0) + 1), new Map()).entries())
+    .sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)
+    .map(([word]) => word);
+  const merged = rankedCn.concat(enWords).slice(0, 12);
   if (merged.length >= 5) return merged;
   const fallback = {
     数学: ["函数", "方程", "导数", "图像", "概率", "数列"],
@@ -258,14 +458,26 @@ function extractKeywords(text, subject) {
   return Array.from(new Set(merged.concat(fallback[subject] || fallback.物理))).slice(0, 10);
 }
 
-function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText }) {
+function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction }) {
   const cleanSubject = normalizeSubject(subject);
   const keywords = extractKeywords(sourceText || title || sourceName, cleanSubject);
-  const nodes = [{ id: "n0", label: `${cleanSubject}知识主线`, group: "root" }];
+  const nodes = [{
+    id: "n0",
+    label: `${cleanSubject}知识主线`,
+    group: "root",
+    knowledgePoints: splitKnowledgeSentences(sourceText).slice(0, 6),
+    details: `由${sourceName || "输入内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`
+  }];
   const links = [];
   keywords.forEach((keyword, index) => {
     const nodeId = `n${index + 1}`;
-    nodes.push({ id: nodeId, label: keyword, group: index % 3 === 0 ? "concept" : "topic" });
+    nodes.push({
+      id: nodeId,
+      label: keyword,
+      group: index % 3 === 0 ? "concept" : "topic",
+      knowledgePoints: knowledgePointsForKeyword(sourceText, keyword),
+      details: `从书本内容和补充知识点中抽取的「${keyword}」相关知识。`
+    });
     links.push({ source: "n0", target: nodeId, label: index % 2 === 0 ? "包含" : "关联" });
     if (index > 1 && index % 2 === 0) links.push({ source: `n${index}`, target: nodeId, label: "递进" });
   });
@@ -275,6 +487,7 @@ function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText })
     subject: cleanSubject,
     title: title || `${cleanSubject}知识图谱`,
     sourceName: sourceName || "手动导入",
+    extraction: extraction || null,
     nodes,
     links,
     global: false,
@@ -294,10 +507,13 @@ function validateGraph(raw, fallback) {
     subject: normalizeSubject(graph.subject || fallback.subject),
     title: graph.title || fallback.title || "导入知识图谱",
     sourceName: fallback.sourceName || "JSON 导入",
+    extraction: graph.extraction || null,
     nodes: graph.nodes.map((node, index) => ({
       id: String(node.id || `n${index}`),
       label: String(node.label || node.name || `节点${index + 1}`),
-      group: String(node.group || "topic")
+      group: String(node.group || "topic"),
+      details: String(node.details || ""),
+      knowledgePoints: Array.isArray(node.knowledgePoints) ? node.knowledgePoints.map(String) : []
     })),
     links: graph.links.map((link) => ({
       source: String(link.source),
@@ -477,12 +693,15 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["userId", "subject"]);
     ensureUser(db, body.userId);
+    const uploaded = extractUploadedBookText(body.file);
+    const sourceText = [uploaded.text, body.sourceText].filter(Boolean).join("\n\n");
     const graph = buildGraphFromText({
       ownerId: body.userId,
       title: body.title,
       subject: body.subject,
-      sourceName: body.sourceName,
-      sourceText: body.sourceText
+      sourceName: body.sourceName || uploaded.meta?.name,
+      sourceText,
+      extraction: uploaded.meta ? { ...uploaded.meta, agent: body.extractor || "local-pdf-text-agent" } : null
     });
     db.knowledgeGraphs.push(graph);
     writeDb(db);

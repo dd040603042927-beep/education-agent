@@ -18,6 +18,8 @@ const state = {
   selectedMessages: new Set(),
   selectedClassId: null,
   homeworkModal: null,
+  graphViews: {},
+  graphNodeModal: null,
   searchResults: []
 };
 
@@ -410,10 +412,17 @@ function renderTeacherGraphPage() {
         <h3>生成图谱</h3>
         <form id="generateGraphForm" class="stack">
           <div class="form-grid">
-            <label>学科<select name="subject">${subjectOptions(state.user.subject || "物理")}</select></label>
+            <label>学科<input name="subject" value="${escapeHtml(state.user.subject || "")}" placeholder="例如：数学、物理、人工智能导论" required /></label>
             <label>图谱名称<input name="title" placeholder="例如：高一数学选择性必修一知识图谱" /></label>
           </div>
+          <label>内容识别工具
+            <select name="extractor">
+              <option value="local-pdf-text-agent">PDF 文本解析智能体（推荐）</option>
+              <option value="outline-fusion-agent">目录与补充内容融合工具</option>
+            </select>
+          </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
+          <p class="hint">PDF 会由后端本地解析文本层后参与生成图谱；扫描版图片 PDF 需要后续接入 OCR。</p>
           <label>补充目录或知识点<textarea name="sourceText" rows="5" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系"></textarea></label>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
@@ -425,7 +434,7 @@ function renderTeacherGraphPage() {
         <h3>直接导入图谱</h3>
         <form id="importGraphForm" class="stack">
           <div class="form-grid">
-            <label>学科<select name="subject">${subjectOptions("物理")}</select></label>
+            <label>学科<input name="subject" placeholder="例如：物理、线性代数、机器学习" /></label>
             <label>图谱名称<input name="title" placeholder="导入图谱名称" /></label>
           </div>
           <label>图谱 JSON 文件<input name="graph" type="file" accept=".json" required /></label>
@@ -437,13 +446,14 @@ function renderTeacherGraphPage() {
     <section class="panel">
       <div class="split-head">
         <h3>最近生成的知识图谱</h3>
-        <span>${graphs.length ? "双击卡片可聚焦渲染区" : "暂无图谱"}</span>
+        <span>${graphs.length ? "滚轮/按钮缩放，拖拽节点，双击节点查看知识点" : "暂无图谱"}</span>
       </div>
       <div class="graph-workspace">
         <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock("还没有图谱，请先生成或导入。")}</div>
-        <div class="graph-canvas">${selected ? renderGraphSvg(selected) : emptyBlock("选择一个图谱后将在这里渲染。")}</div>
+        <div class="graph-canvas">${selected ? renderGraphViewer(selected) : emptyBlock("选择一个图谱后将在这里渲染。")}</div>
       </div>
     </section>
+    ${renderGraphNodeModal()}
   `;
 }
 
@@ -461,32 +471,63 @@ function renderStudentGraphPage() {
     <section class="panel">
       <div class="graph-workspace">
         <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock(`数据库中暂未找到「${escapeHtml(state.graphSubject)}」图谱。`)}</div>
-        <div class="graph-canvas">${selected ? renderGraphSvg(selected) : emptyBlock("请选择其他学科查看可用图谱。")}</div>
+        <div class="graph-canvas">${selected ? renderGraphViewer(selected) : emptyBlock("请选择其他学科查看可用图谱。")}</div>
       </div>
     </section>
+    ${renderGraphNodeModal()}
   `;
 }
 
-function renderGraphSvg(graph) {
+function getGraphView(graph) {
   const width = 920;
   const height = 540;
   const cx = width / 2;
   const cy = height / 2;
   const radius = Math.min(width, height) * 0.35;
   const nodes = graph.nodes || [];
-  const links = graph.links || [];
-  const positions = {};
+  if (!state.graphViews[graph.id]) {
+    state.graphViews[graph.id] = { scale: 1, offsetX: 0, offsetY: 0, positions: {} };
+  }
+  const view = state.graphViews[graph.id];
   nodes.forEach((node, index) => {
-    if (index === 0 || node.group === "root") {
-      positions[node.id] = { x: cx, y: cy };
-    } else {
+    if (view.positions[node.id]) return;
+    if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
+      view.positions[node.id] = { x: node.x, y: node.y };
+      return;
+    }
+    if (index === 0 || node.group === "root") view.positions[node.id] = { x: cx, y: cy };
+    else {
       const angle = ((index - 1) / Math.max(1, nodes.length - 1)) * Math.PI * 2 - Math.PI / 2;
       const ring = radius + (index % 3) * 28;
-      positions[node.id] = { x: cx + Math.cos(angle) * ring, y: cy + Math.sin(angle) * ring };
+      view.positions[node.id] = { x: cx + Math.cos(angle) * ring, y: cy + Math.sin(angle) * ring };
     }
   });
+  return view;
+}
+
+function renderGraphViewer(graph) {
   return `
-    <svg class="graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(graph.title)}">
+    <div class="graph-viewer" data-graph-viewer="${graph.id}">
+      <div class="graph-toolbar">
+        <button class="mini" data-graph-zoom="out">缩小</button>
+        <button class="mini" data-graph-zoom="reset">重置</button>
+        <button class="mini" data-graph-zoom="in">放大</button>
+        <span>双击节点查看知识点，拖拽节点调整位置</span>
+      </div>
+      ${renderGraphSvg(graph)}
+    </div>
+  `;
+}
+
+function renderGraphSvg(graph) {
+  const width = 920;
+  const height = 540;
+  const links = graph.links || [];
+  const nodes = graph.nodes || [];
+  const view = getGraphView(graph);
+  const positions = view.positions;
+  return `
+    <svg class="graph-svg" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(graph.title)}">
       <defs>
         <linearGradient id="nodeGrad" x1="0%" x2="100%">
           <stop offset="0%" stop-color="#247db2"></stop>
@@ -496,34 +537,174 @@ function renderGraphSvg(graph) {
           <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#13506f" flood-opacity="0.16"></feDropShadow>
         </filter>
       </defs>
-      ${links.map((link) => {
-        const s = positions[link.source];
-        const t = positions[link.target];
-        if (!s || !t) return "";
-        const mx = (s.x + t.x) / 2;
-        const my = (s.y + t.y) / 2;
-        return `
-          <line x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" class="graph-link"></line>
-          <text x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(link.label || "关联")}</text>
-        `;
-      }).join("")}
-      ${nodes.map((node, index) => {
-        const p = positions[node.id] || { x: cx, y: cy };
-        const root = index === 0 || node.group === "root";
-        const label = String(node.label || "");
-        return `
-          <g class="graph-node" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
-            <circle r="${root ? 46 : 34}" class="${root ? "root" : ""}"></circle>
-            <text y="${label.length > 6 ? -4 : 4}" class="${root ? "root" : ""}">${escapeHtml(label.slice(0, 8))}</text>
-            ${label.length > 8 ? `<text y="16" class="small">${escapeHtml(label.slice(8, 14))}</text>` : ""}
-          </g>
-        `;
-      }).join("")}
+      <g class="graph-viewport" transform="translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})">
+        ${links.map((link, index) => {
+          const s = positions[link.source];
+          const t = positions[link.target];
+          if (!s || !t) return "";
+          const mx = (s.x + t.x) / 2;
+          const my = (s.y + t.y) / 2;
+          return `
+            <line data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" class="graph-link"></line>
+            <text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(link.label || "关联")}</text>
+          `;
+        }).join("")}
+        ${nodes.map((node, index) => {
+          const p = positions[node.id] || { x: width / 2, y: height / 2 };
+          const root = index === 0 || node.group === "root";
+          const label = String(node.label || "");
+          const pointCount = Array.isArray(node.knowledgePoints) ? node.knowledgePoints.length : 0;
+          return `
+            <g class="graph-node" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
+              <circle r="${root ? 46 : 34}" class="${root ? "root" : ""}"></circle>
+              <text y="${label.length > 6 ? -4 : 4}" class="${root ? "root" : ""}">${escapeHtml(label.slice(0, 8))}</text>
+              ${label.length > 8 ? `<text y="16" class="small ${root ? "root" : ""}">${escapeHtml(label.slice(8, 14))}</text>` : ""}
+              ${pointCount ? `<text y="${root ? 34 : 29}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
+            </g>
+          `;
+        }).join("")}
+      </g>
     </svg>
   `;
 }
 
+function renderGraphNodeModal() {
+  if (!state.graphNodeModal) return "";
+  const graph = state.data?.knowledgeGraphs?.find((item) => item.id === state.graphNodeModal.graphId);
+  const node = graph?.nodes?.find((item) => item.id === state.graphNodeModal.nodeId);
+  if (!graph || !node) return "";
+  const points = Array.isArray(node.knowledgePoints) && node.knowledgePoints.length ? node.knowledgePoints : ["该节点暂无更细知识点，可在生成时补充更多目录或正文内容。"];
+  return `
+    <div class="modal-backdrop">
+      <section class="modal graph-node-modal">
+        <button class="modal-close" id="closeGraphNodeModal">×</button>
+        <h2>${escapeHtml(node.label)}</h2>
+        <p class="hint">${escapeHtml(graph.title)} · ${escapeHtml(graph.subject)}</p>
+        ${node.details ? `<p class="answer-box">${escapeHtml(node.details)}</p>` : ""}
+        <div class="knowledge-point-list">
+          ${points.map((point, index) => `<article><strong>${index + 1}</strong><p>${escapeHtml(point)}</p></article>`).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function applyGraphTransform(svg, graphId) {
+  const view = state.graphViews[graphId];
+  const viewport = svg.querySelector(".graph-viewport");
+  if (view && viewport) viewport.setAttribute("transform", `translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})`);
+}
+
+function updateGraphDom(svg, graphId) {
+  const view = state.graphViews[graphId];
+  if (!view) return;
+  svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
+    const position = view.positions[nodeEl.dataset.nodeId];
+    if (position) nodeEl.setAttribute("transform", `translate(${position.x},${position.y})`);
+  });
+  svg.querySelectorAll(".graph-link").forEach((line) => {
+    const source = view.positions[line.dataset.linkSource];
+    const target = view.positions[line.dataset.linkTarget];
+    if (!source || !target) return;
+    line.setAttribute("x1", source.x);
+    line.setAttribute("y1", source.y);
+    line.setAttribute("x2", target.x);
+    line.setAttribute("y2", target.y);
+  });
+  svg.querySelectorAll(".graph-link-label").forEach((label) => {
+    const source = view.positions[label.dataset.linkSource];
+    const target = view.positions[label.dataset.linkTarget];
+    if (!source || !target) return;
+    label.setAttribute("x", (source.x + target.x) / 2);
+    label.setAttribute("y", (source.y + target.y) / 2);
+  });
+}
+
+function bindInteractiveGraph() {
+  const svg = document.querySelector(".graph-svg");
+  if (!svg) return;
+  const graphId = svg.dataset.graphId;
+  const graph = state.data.knowledgeGraphs.find((item) => item.id === graphId);
+  if (!graph) return;
+  getGraphView(graph);
+
+  document.querySelectorAll("[data-graph-zoom]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const view = state.graphViews[graphId];
+      if (button.dataset.graphZoom === "in") view.scale = clamp(view.scale + 0.15, 0.35, 2.8);
+      if (button.dataset.graphZoom === "out") view.scale = clamp(view.scale - 0.15, 0.35, 2.8);
+      if (button.dataset.graphZoom === "reset") {
+        view.scale = 1;
+        view.offsetX = 0;
+        view.offsetY = 0;
+      }
+      applyGraphTransform(svg, graphId);
+    });
+  });
+
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const view = state.graphViews[graphId];
+    view.scale = clamp(view.scale + (event.deltaY < 0 ? 0.08 : -0.08), 0.35, 2.8);
+    applyGraphTransform(svg, graphId);
+  }, { passive: false });
+
+  let dragged = null;
+  svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
+    nodeEl.addEventListener("dblclick", (event) => {
+      event.stopPropagation();
+      state.graphNodeModal = { graphId, nodeId: nodeEl.dataset.nodeId };
+      renderContent();
+    });
+    nodeEl.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const view = state.graphViews[graphId];
+      const start = view.positions[nodeEl.dataset.nodeId];
+      dragged = {
+        nodeId: nodeEl.dataset.nodeId,
+        x: event.clientX,
+        y: event.clientY,
+        startX: start.x,
+        startY: start.y,
+        width: rect.width,
+        height: rect.height
+      };
+      nodeEl.classList.add("dragging");
+      nodeEl.setPointerCapture?.(event.pointerId);
+    });
+  });
+
+  window.addEventListener("pointermove", (event) => {
+    if (!dragged) return;
+    const view = state.graphViews[graphId];
+    const dx = ((event.clientX - dragged.x) * 920) / dragged.width / view.scale;
+    const dy = ((event.clientY - dragged.y) * 540) / dragged.height / view.scale;
+    view.positions[dragged.nodeId] = {
+      x: clamp(dragged.startX + dx, 20, 900),
+      y: clamp(dragged.startY + dy, 20, 520)
+    };
+    updateGraphDom(svg, graphId);
+  });
+
+  window.addEventListener("pointerup", () => {
+    if (!dragged) return;
+    svg.querySelector(`[data-node-id="${CSS.escape(dragged.nodeId)}"]`)?.classList.remove("dragging");
+    dragged = null;
+  });
+}
+
 function bindGraphPage() {
+  bindInteractiveGraph();
+  document.getElementById("closeGraphNodeModal")?.addEventListener("click", () => {
+    state.graphNodeModal = null;
+    renderContent();
+  });
+
   document.querySelectorAll("[data-select-graph]").forEach((card) => {
     card.addEventListener("click", () => {
       state.selectedGraphId = card.dataset.selectGraph;
@@ -603,23 +784,27 @@ function bindGraphPage() {
     const file = form.get("book");
     let sourceText = String(form.get("sourceText") || "");
     let sourceName = "";
+    let filePayload = null;
     if (file && file.name) {
       sourceName = file.name;
       if (/\.txt$|\.md$|\.json$/i.test(file.name)) {
         sourceText += `\n${await fileToText(file)}`;
-      } else {
-        sourceText += `\n已上传书本文件：${file.name}，前端保留文件名用于生成图谱。`;
       }
+      filePayload = await fileToPayload(file);
     }
+    const subject = String(form.get("subject") || "").trim();
+    if (!subject) return showToast("请先输入学科名称", "error");
     try {
       const payload = await api("/api/graphs/generate", {
         method: "POST",
         body: {
           userId: state.user.id,
-          subject: form.get("subject"),
-          title: form.get("title") || `${form.get("subject")}知识图谱`,
+          subject,
+          title: form.get("title") || `${subject}知识图谱`,
           sourceName,
-          sourceText
+          sourceText,
+          extractor: form.get("extractor"),
+          file: filePayload
         }
       });
       state.selectedGraphId = payload.graph.id;
@@ -638,11 +823,12 @@ function bindGraphPage() {
     try {
       const text = await fileToText(file);
       const graph = JSON.parse(text);
+      const subject = String(form.get("subject") || graph.subject || "通用").trim();
       const payload = await api("/api/graphs/import", {
         method: "POST",
         body: {
           userId: state.user.id,
-          subject: form.get("subject"),
+          subject,
           title: form.get("title"),
           sourceName: file.name,
           graph
