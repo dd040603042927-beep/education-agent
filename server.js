@@ -11,8 +11,19 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const MAX_BODY_SIZE = 30 * 1024 * 1024;
+const MAX_UPLOAD_SIZE = 120 * 1024 * 1024;
+const MAX_GRAPH_SOURCE_CHARS = 320000;
+const PDF_LIMITS = {
+  maxFileBytes: 100 * 1024 * 1024,
+  maxStreams: 1400,
+  maxCompressedStreamBytes: 12 * 1024 * 1024,
+  maxInflatedStreamBytes: 5 * 1024 * 1024,
+  maxCollectedStreamChars: 14 * 1024 * 1024,
+  maxExtractedTextChars: 260000
+};
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const graphJobs = new Map();
 
 function now() {
   return new Date().toISOString();
@@ -208,6 +219,24 @@ function readBody(req) {
   });
 }
 
+function readBinaryBody(req, limit = MAX_UPLOAD_SIZE) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error(`上传文件过大，当前限制为 ${Math.round(limit / 1024 / 1024)}MB`), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks, size)));
+    req.on("error", reject);
+  });
+}
+
 function send(res, status, payload, headers = {}) {
   res.writeHead(status, { ...JSON_HEADERS, ...headers });
   res.end(JSON.stringify(payload));
@@ -241,6 +270,61 @@ function ensureUser(db, userId) {
 
 function normalizeSubject(subject) {
   return String(subject || "通用").trim() || "通用";
+}
+
+function limitText(text, maxLength = MAX_GRAPH_SOURCE_CHARS) {
+  const value = String(text || "");
+  if (value.length <= maxLength) return value;
+  const head = value.slice(0, Math.floor(maxLength * 0.72));
+  const tail = value.slice(-Math.floor(maxLength * 0.28));
+  return `${head}\n\n……中间超长内容已截断，保留开头和结尾用于生成图谱……\n\n${tail}`;
+}
+
+function createGraphJob(meta = {}) {
+  const job = {
+    id: uid("graphjob"),
+    status: "queued",
+    stage: "等待处理",
+    progress: 3,
+    message: "任务已创建",
+    graphId: null,
+    error: null,
+    meta,
+    createdAt: now(),
+    updatedAt: now()
+  };
+  graphJobs.set(job.id, job);
+  return job;
+}
+
+function updateGraphJob(jobId, patch) {
+  const job = graphJobs.get(jobId);
+  if (!job) return null;
+  Object.assign(job, patch, { updatedAt: now() });
+  return job;
+}
+
+function publicGraphJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    status: job.status,
+    stage: job.stage,
+    progress: job.progress,
+    message: job.message,
+    graphId: job.graphId,
+    error: job.error,
+    meta: job.meta,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt
+  };
+}
+
+function cleanupGraphJobs() {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, job] of graphJobs.entries()) {
+    if (new Date(job.updatedAt).getTime() < cutoff) graphJobs.delete(id);
+  }
 }
 
 function decodeDataUrl(dataUrl) {
@@ -371,56 +455,114 @@ function normalizeExtractedText(text) {
     .trim();
 }
 
-function extractPdfTextFromBuffer(buffer) {
+function isLikelyImageStream(dictionary) {
+  return /\/Subtype\s*\/Image/.test(dictionary) || /\/Image\b/.test(dictionary) || /DCTDecode|JPXDecode|JBIG2Decode|CCITTFaxDecode/.test(dictionary);
+}
+
+function extractPdfTextFromBuffer(buffer, onProgress = () => {}) {
+  if (buffer.length > PDF_LIMITS.maxFileBytes) {
+    throw Object.assign(new Error(`PDF 文件过大，当前限制为 ${Math.round(PDF_LIMITS.maxFileBytes / 1024 / 1024)}MB。建议拆分章节后上传。`), { status: 413 });
+  }
   const binary = buffer.toString("latin1");
   const streamRegex = /<<(?:.|\r|\n)*?>>\s*stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  const streams = [];
+  const contentStreams = [];
+  const cmap = new Map();
+  const stats = {
+    scannedStreams: 0,
+    skippedStreams: 0,
+    imageStreams: 0,
+    inflatedStreams: 0,
+    collectedChars: 0,
+    truncated: false
+  };
   let match;
   while ((match = streamRegex.exec(binary))) {
+    stats.scannedStreams += 1;
+    if (stats.scannedStreams > PDF_LIMITS.maxStreams) {
+      stats.truncated = true;
+      break;
+    }
     const fullMatch = match[0];
     const dictionary = fullMatch.slice(0, fullMatch.indexOf("stream"));
+    if (isLikelyImageStream(dictionary)) {
+      stats.imageStreams += 1;
+      continue;
+    }
     let data = Buffer.from(match[1], "latin1");
+    if (data.length > PDF_LIMITS.maxCompressedStreamBytes) {
+      stats.skippedStreams += 1;
+      continue;
+    }
     if (/FlateDecode/.test(dictionary)) {
       try {
-        data = zlib.inflateSync(data);
+        data = zlib.inflateSync(data, { maxOutputLength: PDF_LIMITS.maxInflatedStreamBytes });
+        stats.inflatedStreams += 1;
       } catch {
         try {
-          data = zlib.inflateRawSync(data);
+          data = zlib.inflateRawSync(data, { maxOutputLength: PDF_LIMITS.maxInflatedStreamBytes });
+          stats.inflatedStreams += 1;
         } catch {
+          stats.skippedStreams += 1;
           continue;
         }
       }
     }
-    streams.push(data.toString("latin1"));
-  }
-
-  const cmap = new Map();
-  streams.forEach((stream) => {
+    if (data.length > PDF_LIMITS.maxInflatedStreamBytes) {
+      stats.skippedStreams += 1;
+      continue;
+    }
+    const stream = data.toString("latin1");
     const parsed = parsePdfCMap(stream);
     parsed.forEach((value, key) => cmap.set(key, value));
-  });
+    if (/BT|TJ|Tj/.test(stream)) {
+      stats.collectedChars += stream.length;
+      if (stats.collectedChars <= PDF_LIMITS.maxCollectedStreamChars) {
+        contentStreams.push(stream);
+      } else {
+        stats.truncated = true;
+      }
+    }
+    if (stats.scannedStreams % 80 === 0) onProgress(stats);
+  }
 
-  const text = streams.map((stream) => extractPdfStrings(stream, cmap)).join("\n");
-  const fallback = extractPdfStrings(binary, cmap);
-  return normalizeExtractedText(`${text}\n${fallback}`);
+  let text = "";
+  for (const stream of contentStreams) {
+    text += `\n${extractPdfStrings(stream, cmap)}`;
+    if (text.length > PDF_LIMITS.maxExtractedTextChars) {
+      text = text.slice(0, PDF_LIMITS.maxExtractedTextChars);
+      stats.truncated = true;
+      break;
+    }
+  }
+  if (!text.trim() && buffer.length < 4 * 1024 * 1024) {
+    text = extractPdfStrings(binary, cmap).slice(0, PDF_LIMITS.maxExtractedTextChars);
+  }
+  return { text: normalizeExtractedText(text), stats };
 }
 
-function extractUploadedBookText(file) {
+function extractUploadedBookText(file, onProgress = () => {}) {
   if (!file || !file.dataUrl) return { text: "", meta: null };
   const name = String(file.name || "上传书本");
   const type = String(file.type || "");
   const buffer = decodeDataUrl(file.dataUrl);
-  if (!buffer.length) return { text: "", meta: { name, type, method: "empty-upload", characters: 0 } };
+  return extractUploadedBookBuffer({ name, type, buffer }, onProgress);
+}
+
+function extractUploadedBookBuffer({ name = "上传书本", type = "", buffer }, onProgress = () => {}) {
+  if (!buffer || !buffer.length) return { text: "", meta: { name, type, method: "empty-upload", characters: 0 } };
   const lowerName = name.toLowerCase();
   let text = "";
   let method = "text-reader";
+  let stats = null;
   if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
     method = "local-pdf-text-agent";
-    text = extractPdfTextFromBuffer(buffer);
+    const extracted = extractPdfTextFromBuffer(buffer, onProgress);
+    text = extracted.text;
+    stats = extracted.stats;
   } else {
-    text = buffer.toString("utf8");
+    text = buffer.toString("utf8").slice(0, PDF_LIMITS.maxExtractedTextChars);
   }
-  return { text, meta: { name, type, method, characters: text.length } };
+  return { text, meta: { name, type, method, characters: text.length, size: buffer.length, stats } };
 }
 
 function splitKnowledgeSentences(text) {
@@ -460,12 +602,13 @@ function extractKeywords(text, subject) {
 
 function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction }) {
   const cleanSubject = normalizeSubject(subject);
-  const keywords = extractKeywords(sourceText || title || sourceName, cleanSubject);
+  const graphSourceText = limitText(sourceText || title || sourceName || "");
+  const keywords = extractKeywords(graphSourceText, cleanSubject);
   const nodes = [{
     id: "n0",
     label: `${cleanSubject}知识主线`,
     group: "root",
-    knowledgePoints: splitKnowledgeSentences(sourceText).slice(0, 6),
+    knowledgePoints: splitKnowledgeSentences(graphSourceText).slice(0, 6),
     details: `由${sourceName || "输入内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`
   }];
   const links = [];
@@ -475,7 +618,7 @@ function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, e
       id: nodeId,
       label: keyword,
       group: index % 3 === 0 ? "concept" : "topic",
-      knowledgePoints: knowledgePointsForKeyword(sourceText, keyword),
+      knowledgePoints: knowledgePointsForKeyword(graphSourceText, keyword),
       details: `从书本内容和补充知识点中抽取的「${keyword}」相关知识。`
     });
     links.push({ source: "n0", target: nodeId, label: index % 2 === 0 ? "包含" : "关联" });
@@ -524,6 +667,75 @@ function validateGraph(raw, fallback) {
     createdAt: now(),
     updatedAt: now()
   };
+}
+
+function processGraphGenerationJob(jobId, payload) {
+  setImmediate(() => {
+    try {
+      updateGraphJob(jobId, {
+        status: "running",
+        stage: "解析文件",
+        progress: 22,
+        message: payload.file?.buffer?.length ? "正在解析上传文件文本层" : "正在读取输入内容"
+      });
+
+      const uploaded = payload.file?.buffer?.length
+        ? extractUploadedBookBuffer(payload.file, (stats) => {
+          updateGraphJob(jobId, {
+            progress: Math.min(58, 26 + Math.floor(stats.scannedStreams / 30)),
+            message: `已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
+          });
+        })
+        : { text: "", meta: null };
+
+      updateGraphJob(jobId, {
+        stage: "抽取知识点",
+        progress: 66,
+        message: uploaded.meta
+          ? `文本识别完成，识别 ${uploaded.meta.characters} 个字符`
+          : "正在根据补充内容抽取知识点",
+        meta: { ...graphJobs.get(jobId).meta, extraction: uploaded.meta }
+      });
+
+      const sourceText = limitText([uploaded.text, payload.sourceText].filter(Boolean).join("\n\n"));
+      const isPdf = payload.file && (String(payload.file.type || "").includes("pdf") || String(payload.file.name || "").toLowerCase().endsWith(".pdf"));
+      if (isPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim()) {
+        throw new Error("未识别到 PDF 文本层。该文件可能是扫描版图片 PDF，请补充目录/知识点，或后续接入 OCR 后再解析。");
+      }
+
+      updateGraphJob(jobId, { stage: "构建图谱", progress: 82, message: "正在生成节点、关系和节点知识点" });
+      const graph = buildGraphFromText({
+        ownerId: payload.userId,
+        title: payload.title,
+        subject: payload.subject,
+        sourceName: payload.sourceName || uploaded.meta?.name,
+        sourceText,
+        extraction: uploaded.meta ? { ...uploaded.meta, agent: payload.extractor || "local-pdf-text-agent" } : null
+      });
+
+      updateGraphJob(jobId, { stage: "保存图谱", progress: 94, message: "正在写入当前账号图谱库" });
+      const db = readDb();
+      ensureUser(db, payload.userId);
+      db.knowledgeGraphs.push(graph);
+      writeDb(db);
+      updateGraphJob(jobId, {
+        status: "complete",
+        stage: "生成完成",
+        progress: 100,
+        message: `图谱已生成：${graph.nodes.length} 个节点，${graph.links.length} 条关系`,
+        graphId: graph.id,
+        meta: { ...graphJobs.get(jobId).meta, extraction: graph.extraction }
+      });
+    } catch (error) {
+      updateGraphJob(jobId, {
+        status: "failed",
+        stage: "生成失败",
+        progress: 100,
+        message: error.message || "生成失败",
+        error: error.message || "生成失败"
+      });
+    }
+  });
 }
 
 function aiAnswer({ role, mode, prompt }) {
@@ -687,6 +899,49 @@ async function handleApi(req, res, pathname, searchParams) {
     let graphs = db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global);
     if (subject) graphs = graphs.filter((graph) => graph.subject === subject);
     return send(res, 200, { ok: true, graphs });
+  }
+
+  params = routePattern(pathname, "/api/graphs/jobs/:id");
+  if (method === "GET" && params) {
+    cleanupGraphJobs();
+    const job = graphJobs.get(params.id);
+    if (!job) return notFound(res);
+    return send(res, 200, { ok: true, job: publicGraphJob(job) });
+  }
+
+  if (method === "POST" && pathname === "/api/graphs/generate-file") {
+    const userId = searchParams.get("userId");
+    const subject = normalizeSubject(searchParams.get("subject"));
+    const title = searchParams.get("title") || `${subject}知识图谱`;
+    const sourceText = searchParams.get("sourceText") || "";
+    const sourceName = searchParams.get("sourceName") || "上传书本";
+    const extractor = searchParams.get("extractor") || "local-pdf-text-agent";
+    assertRequired({ userId, subject }, ["userId", "subject"]);
+    ensureUser(db, userId);
+    const buffer = await readBinaryBody(req, MAX_UPLOAD_SIZE);
+    if (!buffer.length) return sendError(res, 400, "上传文件为空");
+    const job = createGraphJob({
+      subject,
+      title,
+      sourceName,
+      fileSize: buffer.length,
+      extractor
+    });
+    send(res, 202, { ok: true, job: publicGraphJob(job) });
+    processGraphGenerationJob(job.id, {
+      userId,
+      subject,
+      title,
+      sourceName,
+      sourceText,
+      extractor,
+      file: {
+        name: sourceName,
+        type: searchParams.get("fileType") || req.headers["content-type"] || "",
+        buffer
+      }
+    });
+    return;
   }
 
   if (method === "POST" && pathname === "/api/graphs/generate") {

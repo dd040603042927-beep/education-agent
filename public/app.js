@@ -20,6 +20,8 @@ const state = {
   homeworkModal: null,
   graphViews: {},
   graphNodeModal: null,
+  graphJob: null,
+  graphJobTimer: null,
   searchResults: []
 };
 
@@ -71,6 +73,14 @@ function escapeHtml(value) {
 function fmtTime(value) {
   if (!value) return "";
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return "0B";
+  if (value < 1024) return `${value}B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
+  return `${(value / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function roleName(role) {
@@ -393,6 +403,37 @@ function graphCard(graph) {
   `;
 }
 
+function renderGraphProgress() {
+  const job = state.graphJob || {
+    status: "idle",
+    stage: "等待开始",
+    progress: 0,
+    message: "选择 PDF/TXT/EPUB 并点击生成后，这里会显示上传、解析、抽取、生成和保存进度。"
+  };
+  const statusText = {
+    idle: "未开始",
+    queued: "排队中",
+    running: "处理中",
+    complete: "已完成",
+    failed: "失败"
+  }[job.status] || job.status;
+  return `
+    <section class="progress-card ${job.status}">
+      <div class="split-head">
+        <h3>生成进度</h3>
+        <span>${statusText}</span>
+      </div>
+      <div class="progress-track"><span style="width:${clamp(Number(job.progress || 0), 0, 100)}%"></span></div>
+      <div class="progress-meta">
+        <strong>${escapeHtml(job.stage || "等待开始")}</strong>
+        <span>${clamp(Number(job.progress || 0), 0, 100)}%</span>
+      </div>
+      <p>${escapeHtml(job.error || job.message || "")}</p>
+      ${job.meta?.extraction ? `<small>解析工具：${escapeHtml(job.meta.extraction.method || job.meta.extractor || "PDF 文本解析智能体")}；识别字符：${job.meta.extraction.characters || 0}；文件大小：${formatBytes(job.meta.extraction.size || job.meta.fileSize || 0)}</small>` : ""}
+    </section>
+  `;
+}
+
 function renderTeacherGraphPage() {
   const graphs = graphListForCurrentRole();
   const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || graphs[0];
@@ -429,6 +470,7 @@ function renderTeacherGraphPage() {
             <button class="ghost" type="button" id="sampleGraphBtn">生成示例</button>
           </div>
         </form>
+        ${renderGraphProgress()}
       </section>
       <section class="panel">
         <h3>直接导入图谱</h3>
@@ -698,6 +740,72 @@ function bindInteractiveGraph() {
   });
 }
 
+function stopGraphJobPolling() {
+  if (state.graphJobTimer) clearTimeout(state.graphJobTimer);
+  state.graphJobTimer = null;
+}
+
+function refreshGraphProgress() {
+  if (state.page === "graph") renderContent();
+}
+
+async function pollGraphJob(jobId) {
+  stopGraphJobPolling();
+  const tick = async () => {
+    try {
+      const payload = await api(`/api/graphs/jobs/${jobId}`);
+      state.graphJob = payload.job;
+      if (payload.job.status === "complete") {
+        state.selectedGraphId = payload.job.graphId;
+        await loadState();
+        renderShell();
+        showToast("知识图谱已生成");
+        return;
+      }
+      if (payload.job.status === "failed") {
+        refreshGraphProgress();
+        showToast(payload.job.error || "图谱生成失败", "error");
+        return;
+      }
+      refreshGraphProgress();
+      state.graphJobTimer = setTimeout(tick, 700);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  };
+  state.graphJobTimer = setTimeout(tick, 500);
+}
+
+async function generateGraphFromUploadedFile({ file, subject, title, sourceText, sourceName, extractor }) {
+  state.graphJob = {
+    status: "running",
+    stage: "上传文件",
+    progress: 12,
+    message: `正在上传 ${file.name}（${formatBytes(file.size)}），大文件请保持页面打开。`,
+    meta: { sourceName: file.name, fileSize: file.size, extractor }
+  };
+  renderContent();
+  const params = new URLSearchParams({
+    userId: state.user.id,
+    subject,
+    title,
+    sourceText,
+    sourceName,
+    fileType: file.type || "application/octet-stream",
+    extractor
+  });
+  const response = await fetch(`/api/graphs/generate-file?${params.toString()}`, {
+    method: "POST",
+    headers: { "content-type": file.type || "application/octet-stream" },
+    body: file
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok === false) throw new Error(payload.error || `上传失败：${response.status}`);
+  state.graphJob = payload.job;
+  renderContent();
+  await pollGraphJob(payload.job.id);
+}
+
 function bindGraphPage() {
   bindInteractiveGraph();
   document.getElementById("closeGraphNodeModal")?.addEventListener("click", () => {
@@ -784,29 +892,50 @@ function bindGraphPage() {
     const file = form.get("book");
     let sourceText = String(form.get("sourceText") || "");
     let sourceName = "";
-    let filePayload = null;
+    const extractor = String(form.get("extractor") || "local-pdf-text-agent");
     if (file && file.name) {
       sourceName = file.name;
-      if (/\.txt$|\.md$|\.json$/i.test(file.name)) {
-        sourceText += `\n${await fileToText(file)}`;
-      }
-      filePayload = await fileToPayload(file);
     }
     const subject = String(form.get("subject") || "").trim();
     if (!subject) return showToast("请先输入学科名称", "error");
+    const title = String(form.get("title") || `${subject}知识图谱`).trim();
     try {
+      if (file && file.name) {
+        await generateGraphFromUploadedFile({
+          file,
+          subject,
+          title,
+          sourceText,
+          sourceName,
+          extractor
+        });
+        return;
+      }
+      state.graphJob = {
+        status: "running",
+        stage: "抽取知识点",
+        progress: 45,
+        message: "正在根据补充目录或知识点生成图谱"
+      };
+      renderContent();
       const payload = await api("/api/graphs/generate", {
         method: "POST",
         body: {
           userId: state.user.id,
           subject,
-          title: form.get("title") || `${subject}知识图谱`,
+          title,
           sourceName,
           sourceText,
-          extractor: form.get("extractor"),
-          file: filePayload
+          extractor
         }
       });
+      state.graphJob = {
+        status: "complete",
+        stage: "生成完成",
+        progress: 100,
+        message: `图谱已生成：${payload.graph.nodes.length} 个节点，${payload.graph.links.length} 条关系`,
+        graphId: payload.graph.id
+      };
       state.selectedGraphId = payload.graph.id;
       await loadState();
       renderShell();
