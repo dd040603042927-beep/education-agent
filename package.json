@@ -1,0 +1,13 @@
+{
+  "name": "education-agent-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "智慧教育智能体平台前后端原型",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

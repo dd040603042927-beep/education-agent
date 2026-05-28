@@ -1,0 +1,1720 @@
+const app = document.getElementById("app");
+const toast = document.getElementById("toast");
+
+const state = {
+  user: null,
+  data: null,
+  page: "graph",
+  selectedGraphId: null,
+  graphSubject: "物理",
+  activeConversationId: null,
+  aiMode: "explain",
+  modelSubject: "物理",
+  modelMode: "ideal",
+  modelComponents: [],
+  selectedComponentId: null,
+  loadedModelId: null,
+  activeThreadId: null,
+  selectedMessages: new Set(),
+  selectedClassId: null,
+  homeworkModal: null,
+  searchResults: []
+};
+
+const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
+
+const teacherMenus = [
+  { key: "graph", icon: "📘", label: "导入书本生成图谱" },
+  { key: "ai", icon: "🎓", label: "教学指导（对话）" },
+  { key: "history", icon: "💬", label: "历史对话" },
+  { key: "models", icon: "🧠", label: "模型显示" },
+  { key: "chat", icon: "☁️", label: "聊天信息" },
+  { key: "classes", icon: "🏫", label: "班级管理" },
+  { key: "homework", icon: "✏️", label: "作业管理" },
+  { key: "profile", icon: "ℹ️", label: "个人信息" }
+];
+
+const studentMenus = [
+  { key: "graph", icon: "📗", label: "知识图谱" },
+  { key: "ai", icon: "☁️", label: "发起对话" },
+  { key: "history", icon: "📜", label: "历史对话" },
+  { key: "models", icon: "🧠", label: "模型显示" },
+  { key: "chat", icon: "☁️", label: "聊天信息" },
+  { key: "homework", icon: "📥", label: "作业提交" },
+  { key: "profile", icon: "ℹ️", label: "个人信息" }
+];
+
+const componentPalette = [
+  { type: "cart", icon: "▣", label: "小车", subject: "物理", defaults: { mass: "2kg", velocity: "0m/s" } },
+  { type: "slope", icon: "╱", label: "斜面", subject: "物理", defaults: { angle: "30°", friction: "0.2" } },
+  { type: "spring", icon: "⌁", label: "弹簧", subject: "物理", defaults: { k: "20N/m" } },
+  { type: "pulley", icon: "○", label: "滑轮", subject: "物理", defaults: { radius: "0.2m" } },
+  { type: "battery", icon: "▥", label: "电源", subject: "物理", defaults: { voltage: "6V" } },
+  { type: "resistor", icon: "▱", label: "电阻", subject: "物理", defaults: { resistance: "10Ω" } },
+  { type: "lens", icon: "◐", label: "透镜", subject: "物理", defaults: { focal: "10cm" } },
+  { type: "axis", icon: "＋", label: "坐标系", subject: "通用", defaults: { scale: "1:1" } },
+  { type: "point", icon: "●", label: "质点", subject: "物理", defaults: { position: "(0,0)" } },
+  { type: "formula", icon: "ƒ", label: "公式块", subject: "通用", defaults: { formula: "F=ma" } }
+];
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function fmtTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function roleName(role) {
+  return role === "teacher" ? "教师" : "学生";
+}
+
+function showToast(message, type = "ok") {
+  toast.textContent = message;
+  toast.className = `toast ${type}`;
+  setTimeout(() => toast.classList.add("hidden"), 2600);
+}
+
+async function api(path, options = {}) {
+  const init = {
+    method: options.method || "GET",
+    headers: { "content-type": "application/json" }
+  };
+  if (options.body !== undefined) init.body = JSON.stringify(options.body);
+  const res = await fetch(path, init);
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok || payload.ok === false) {
+    throw new Error(payload.error || `请求失败：${res.status}`);
+  }
+  return payload;
+}
+
+function fileToPayload(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: file.name, type: file.type || "application/octet-stream", size: file.size, dataUrl: reader.result });
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+function fileToText(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => resolve("");
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function getCurrentUser() {
+  const raw = localStorage.getItem("edu-user");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function loadState() {
+  if (!state.user) return;
+  const payload = await api(`/api/state?userId=${encodeURIComponent(state.user.id)}`);
+  state.data = payload.state;
+  state.user = payload.state.user;
+  localStorage.setItem("edu-user", JSON.stringify(state.user));
+  if (!state.selectedClassId && state.data.classes.length) state.selectedClassId = state.data.classes[0].id;
+  if (!state.selectedGraphId && state.data.knowledgeGraphs.length) state.selectedGraphId = state.data.knowledgeGraphs[0].id;
+  if (!state.activeThreadId && state.data.chatThreads.length) state.activeThreadId = state.data.chatThreads[0].id;
+}
+
+async function boot() {
+  state.user = getCurrentUser();
+  if (!state.user) {
+    renderAuth();
+    return;
+  }
+  try {
+    await loadState();
+    renderShell();
+  } catch (error) {
+    localStorage.removeItem("edu-user");
+    state.user = null;
+    showToast(error.message, "error");
+    renderAuth();
+  }
+}
+
+function subjectOptions(selected) {
+  return subjects.map((subject) => `<option value="${subject}" ${subject === selected ? "selected" : ""}>${subject}</option>`).join("");
+}
+
+function renderAuth() {
+  app.innerHTML = `
+    <main class="auth-shell">
+      <section class="auth-visual">
+        <div class="brand-mark">🧠</div>
+        <h1>智慧教育智能体平台</h1>
+        <p>教师端与学生端共用一套账号体系，注册时选择身份，系统自动分配 8 位 ID。</p>
+        <div class="auth-points">
+          <span>知识图谱</span>
+          <span>AI 对话</span>
+          <span>模型构建</span>
+          <span>班级作业</span>
+        </div>
+      </section>
+      <section class="auth-panel">
+        <div class="tabs">
+          <button class="tab active" data-auth-tab="login">登录</button>
+          <button class="tab" data-auth-tab="register">注册</button>
+        </div>
+        <form id="loginForm" class="auth-form">
+          <label>账号 ID 或姓名<input name="account" placeholder="示例：20260001 或 黄豆" required /></label>
+          <label>密码<input name="password" type="password" placeholder="示例账号密码：123456" required /></label>
+          <button class="primary wide" type="submit">进入平台</button>
+          <p class="hint">内置教师：20260001 / 黄豆；内置学生：20260002 / 绿豆。</p>
+        </form>
+        <form id="registerForm" class="auth-form hidden">
+          <label>姓名<input name="name" placeholder="请输入姓名" required /></label>
+          <label>密码<input name="password" type="password" placeholder="设置登录密码" required /></label>
+          <label>身份
+            <select name="role">
+              <option value="teacher">教师</option>
+              <option value="student">学生</option>
+            </select>
+          </label>
+          <label>任教学科 / 初始班级<input name="subject" placeholder="教师填学科，学生可填班级" /></label>
+          <button class="primary wide" type="submit">注册并分配 8 位 ID</button>
+          <p id="registerResult" class="hint"></p>
+        </form>
+      </section>
+    </main>
+  `;
+
+  document.querySelectorAll("[data-auth-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll("[data-auth-tab]").forEach((item) => item.classList.remove("active"));
+      button.classList.add("active");
+      document.getElementById("loginForm").classList.toggle("hidden", button.dataset.authTab !== "login");
+      document.getElementById("registerForm").classList.toggle("hidden", button.dataset.authTab !== "register");
+    });
+  });
+
+  document.getElementById("loginForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const payload = await api("/api/auth/login", {
+        method: "POST",
+        body: { account: form.get("account"), password: form.get("password") }
+      });
+      state.user = payload.user;
+      state.data = payload.state;
+      localStorage.setItem("edu-user", JSON.stringify(state.user));
+      state.page = "graph";
+      renderShell();
+      showToast("登录成功");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+
+  document.getElementById("registerForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const role = form.get("role");
+    try {
+      const payload = await api("/api/auth/register", {
+        method: "POST",
+        body: {
+          name: form.get("name"),
+          password: form.get("password"),
+          role,
+          subject: role === "teacher" ? form.get("subject") : "",
+          className: role === "student" ? form.get("subject") : ""
+        }
+      });
+      document.getElementById("registerResult").textContent = `${payload.message}，请使用该 ID 登录。`;
+      event.currentTarget.reset();
+      showToast("注册成功");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderShell() {
+  const menus = state.user.role === "teacher" ? teacherMenus : studentMenus;
+  const classes = state.data?.classes || [];
+  app.innerHTML = `
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="side-brand">
+          <strong>${state.user.role === "teacher" ? "📖 教学中枢" : "📚 学习索引"}</strong>
+          <span>${escapeHtml(state.user.name)}（${roleName(state.user.role)}）</span>
+          <small>ID：${state.user.id}</small>
+        </div>
+        <div class="section-label">${state.user.role === "teacher" ? "教师端" : "学生端"}</div>
+        <nav class="nav">
+          ${menus.map((item) => `
+            <button class="nav-item ${state.page === item.key ? "active" : ""}" data-page="${item.key}">
+              <span>${item.icon}</span>${item.label}
+            </button>
+          `).join("")}
+        </nav>
+        <div class="profile-mini">
+          <strong>${state.user.role === "teacher" ? "🏫 我的信息" : "👤 我的信息"}</strong>
+          <dl>
+            <dt>姓名：</dt><dd>${escapeHtml(state.user.name)}</dd>
+            <dt>${state.user.role === "teacher" ? "学科：" : "班级："}</dt><dd>${escapeHtml(state.user.role === "teacher" ? (state.user.subject || "未设置") : (state.user.className || "未加入"))}</dd>
+            <dt>${state.user.role === "teacher" ? "班级数：" : "班级数："}</dt><dd>${classes.length || 0}</dd>
+          </dl>
+        </div>
+        <button id="logoutBtn" class="ghost wide">退出登录</button>
+      </aside>
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <strong>🧠 智慧教育智能体平台</strong>
+            <span>${state.user.role === "teacher" ? "面向备课、授课、班级与作业闭环" : "面向学习、练习、模型与作业提交"}</span>
+          </div>
+        </header>
+        <section id="content" class="content"></section>
+      </main>
+      <div class="floating-tools">
+        <button title="刷新数据" id="refreshBtn">↻</button>
+        <button title="回到知识图谱" data-page="graph">✦</button>
+      </div>
+    </div>
+  `;
+  document.querySelectorAll("[data-page]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.page = button.dataset.page;
+      state.selectedMessages.clear();
+      await loadState();
+      renderShell();
+    });
+  });
+  document.getElementById("logoutBtn").addEventListener("click", () => {
+    localStorage.removeItem("edu-user");
+    Object.assign(state, {
+      user: null,
+      data: null,
+      page: "graph",
+      activeConversationId: null,
+      activeThreadId: null
+    });
+    renderAuth();
+  });
+  document.getElementById("refreshBtn").addEventListener("click", async () => {
+    await loadState();
+    renderShell();
+    showToast("数据已刷新");
+  });
+  renderContent();
+}
+
+function renderContent() {
+  const content = document.getElementById("content");
+  const pageMap = {
+    graph: renderGraphPage,
+    ai: renderAiPage,
+    history: renderHistoryPage,
+    models: renderModelPage,
+    chat: renderChatPage,
+    classes: renderClassPage,
+    homework: state.user.role === "teacher" ? renderTeacherHomeworkPage : renderStudentHomeworkPage,
+    profile: renderProfilePage
+  };
+  const renderer = pageMap[state.page] || renderGraphPage;
+  content.innerHTML = renderer();
+  bindCurrentPage();
+}
+
+function bindCurrentPage() {
+  const binders = {
+    graph: bindGraphPage,
+    ai: bindAiPage,
+    history: bindHistoryPage,
+    models: bindModelPage,
+    chat: bindChatPage,
+    classes: bindClassPage,
+    homework: state.user.role === "teacher" ? bindTeacherHomeworkPage : bindStudentHomeworkPage,
+    profile: bindProfilePage
+  };
+  (binders[state.page] || bindGraphPage)();
+}
+
+function graphListForCurrentRole() {
+  let graphs = state.data.knowledgeGraphs || [];
+  if (state.user.role === "student") {
+    graphs = graphs.filter((graph) => graph.global && (!state.graphSubject || graph.subject === state.graphSubject));
+  }
+  return graphs;
+}
+
+function renderGraphPage() {
+  return state.user.role === "teacher" ? renderTeacherGraphPage() : renderStudentGraphPage();
+}
+
+function graphCard(graph) {
+  const active = state.selectedGraphId === graph.id ? "active" : "";
+  return `
+    <article class="list-card ${active}" data-select-graph="${graph.id}">
+      <div>
+        <h3>${escapeHtml(graph.title)}</h3>
+        <p>${escapeHtml(graph.subject)} · 节点 ${graph.nodes.length} · 关系 ${graph.links.length}</p>
+        <small>${graph.global ? "已上传总图谱" : "账号私有"} · ${fmtTime(graph.createdAt)}</small>
+      </div>
+      <div class="row-actions">
+        <button class="mini" data-export-graph="${graph.id}">导出</button>
+        ${graph.ownerId === state.user.id && !graph.global ? `<button class="mini" data-global-graph="${graph.id}">上传总图谱</button>` : ""}
+        ${graph.ownerId === state.user.id ? `<button class="mini danger" data-delete-graph="${graph.id}">删除</button>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function renderTeacherGraphPage() {
+  const graphs = graphListForCurrentRole();
+  const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || graphs[0];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>📘 导入书本 / 知识图谱</h2>
+        <p>导入书本生成知识图谱，也可以直接导入图谱 JSON；图谱存储在当前账号下，可导出、删除或上传到总图谱。</p>
+      </div>
+      <div class="stat-strip">
+        <span>${graphs.length}<small>账号可见图谱</small></span>
+        <span>${graphs.filter((item) => item.global).length}<small>总图谱</small></span>
+      </div>
+    </div>
+    <div class="grid two">
+      <section class="panel">
+        <h3>生成图谱</h3>
+        <form id="generateGraphForm" class="stack">
+          <div class="form-grid">
+            <label>学科<select name="subject">${subjectOptions(state.user.subject || "物理")}</select></label>
+            <label>图谱名称<input name="title" placeholder="例如：高一数学选择性必修一知识图谱" /></label>
+          </div>
+          <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
+          <label>补充目录或知识点<textarea name="sourceText" rows="5" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系"></textarea></label>
+          <div class="actions">
+            <button class="primary" type="submit">🚀 生成图谱</button>
+            <button class="ghost" type="button" id="sampleGraphBtn">生成示例</button>
+          </div>
+        </form>
+      </section>
+      <section class="panel">
+        <h3>直接导入图谱</h3>
+        <form id="importGraphForm" class="stack">
+          <div class="form-grid">
+            <label>学科<select name="subject">${subjectOptions("物理")}</select></label>
+            <label>图谱名称<input name="title" placeholder="导入图谱名称" /></label>
+          </div>
+          <label>图谱 JSON 文件<input name="graph" type="file" accept=".json" required /></label>
+          <p class="hint">JSON 需要包含 nodes 与 links，例如：{"nodes":[{"id":"n1","label":"力学"}],"links":[]}。</p>
+          <button class="primary" type="submit">✅ 确认导入</button>
+        </form>
+      </section>
+    </div>
+    <section class="panel">
+      <div class="split-head">
+        <h3>最近生成的知识图谱</h3>
+        <span>${graphs.length ? "双击卡片可聚焦渲染区" : "暂无图谱"}</span>
+      </div>
+      <div class="graph-workspace">
+        <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock("还没有图谱，请先生成或导入。")}</div>
+        <div class="graph-canvas">${selected ? renderGraphSvg(selected) : emptyBlock("选择一个图谱后将在这里渲染。")}</div>
+      </div>
+    </section>
+  `;
+}
+
+function renderStudentGraphPage() {
+  const graphs = graphListForCurrentRole();
+  const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || graphs[0];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>📗 学科知识图谱</h2>
+        <p>选择学科后，系统会检查数据库中总图谱是否存在对应学科图谱，并渲染可学习的知识网络。</p>
+      </div>
+      <label class="compact-label">学科<select id="studentGraphSubject">${subjectOptions(state.graphSubject)}</select></label>
+    </div>
+    <section class="panel">
+      <div class="graph-workspace">
+        <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock(`数据库中暂未找到「${escapeHtml(state.graphSubject)}」图谱。`)}</div>
+        <div class="graph-canvas">${selected ? renderGraphSvg(selected) : emptyBlock("请选择其他学科查看可用图谱。")}</div>
+      </div>
+    </section>
+  `;
+}
+
+function renderGraphSvg(graph) {
+  const width = 920;
+  const height = 540;
+  const cx = width / 2;
+  const cy = height / 2;
+  const radius = Math.min(width, height) * 0.35;
+  const nodes = graph.nodes || [];
+  const links = graph.links || [];
+  const positions = {};
+  nodes.forEach((node, index) => {
+    if (index === 0 || node.group === "root") {
+      positions[node.id] = { x: cx, y: cy };
+    } else {
+      const angle = ((index - 1) / Math.max(1, nodes.length - 1)) * Math.PI * 2 - Math.PI / 2;
+      const ring = radius + (index % 3) * 28;
+      positions[node.id] = { x: cx + Math.cos(angle) * ring, y: cy + Math.sin(angle) * ring };
+    }
+  });
+  return `
+    <svg class="graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(graph.title)}">
+      <defs>
+        <linearGradient id="nodeGrad" x1="0%" x2="100%">
+          <stop offset="0%" stop-color="#247db2"></stop>
+          <stop offset="100%" stop-color="#37a38b"></stop>
+        </linearGradient>
+        <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#13506f" flood-opacity="0.16"></feDropShadow>
+        </filter>
+      </defs>
+      ${links.map((link) => {
+        const s = positions[link.source];
+        const t = positions[link.target];
+        if (!s || !t) return "";
+        const mx = (s.x + t.x) / 2;
+        const my = (s.y + t.y) / 2;
+        return `
+          <line x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" class="graph-link"></line>
+          <text x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(link.label || "关联")}</text>
+        `;
+      }).join("")}
+      ${nodes.map((node, index) => {
+        const p = positions[node.id] || { x: cx, y: cy };
+        const root = index === 0 || node.group === "root";
+        const label = String(node.label || "");
+        return `
+          <g class="graph-node" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
+            <circle r="${root ? 46 : 34}" class="${root ? "root" : ""}"></circle>
+            <text y="${label.length > 6 ? -4 : 4}" class="${root ? "root" : ""}">${escapeHtml(label.slice(0, 8))}</text>
+            ${label.length > 8 ? `<text y="16" class="small">${escapeHtml(label.slice(8, 14))}</text>` : ""}
+          </g>
+        `;
+      }).join("")}
+    </svg>
+  `;
+}
+
+function bindGraphPage() {
+  document.querySelectorAll("[data-select-graph]").forEach((card) => {
+    card.addEventListener("click", () => {
+      state.selectedGraphId = card.dataset.selectGraph;
+      renderContent();
+    });
+    card.addEventListener("dblclick", () => {
+      document.querySelector(".graph-canvas")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  });
+
+  document.querySelectorAll("[data-export-graph]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const graph = state.data.knowledgeGraphs.find((item) => item.id === button.dataset.exportGraph);
+      if (graph) downloadJson(`${graph.title}.json`, graph);
+    });
+  });
+
+  document.querySelectorAll("[data-delete-graph]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (!confirm("确认删除该图谱？")) return;
+      try {
+        await api(`/api/graphs/${button.dataset.deleteGraph}?userId=${state.user.id}`, { method: "DELETE" });
+        state.selectedGraphId = null;
+        await loadState();
+        renderShell();
+        showToast("图谱已删除");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-global-graph]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      try {
+        await api(`/api/graphs/${button.dataset.globalGraph}/upload-global`, { method: "POST", body: { userId: state.user.id } });
+        await loadState();
+        renderShell();
+        showToast("已上传到总图谱");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+
+  document.getElementById("studentGraphSubject")?.addEventListener("change", (event) => {
+    state.graphSubject = event.target.value;
+    state.selectedGraphId = null;
+    renderContent();
+  });
+
+  document.getElementById("sampleGraphBtn")?.addEventListener("click", async () => {
+    try {
+      await api("/api/graphs/generate", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          subject: state.user.subject || "物理",
+          title: `${state.user.subject || "物理"}课堂示例知识图谱`,
+          sourceText: "概念定义 核心公式 例题拆解 易错点 实验探究 综合应用"
+        }
+      });
+      await loadState();
+      renderShell();
+      showToast("示例图谱已生成");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+
+  document.getElementById("generateGraphForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const file = form.get("book");
+    let sourceText = String(form.get("sourceText") || "");
+    let sourceName = "";
+    if (file && file.name) {
+      sourceName = file.name;
+      if (/\.txt$|\.md$|\.json$/i.test(file.name)) {
+        sourceText += `\n${await fileToText(file)}`;
+      } else {
+        sourceText += `\n已上传书本文件：${file.name}，前端保留文件名用于生成图谱。`;
+      }
+    }
+    try {
+      const payload = await api("/api/graphs/generate", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          subject: form.get("subject"),
+          title: form.get("title") || `${form.get("subject")}知识图谱`,
+          sourceName,
+          sourceText
+        }
+      });
+      state.selectedGraphId = payload.graph.id;
+      await loadState();
+      renderShell();
+      showToast("知识图谱已生成");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+
+  document.getElementById("importGraphForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const file = form.get("graph");
+    try {
+      const text = await fileToText(file);
+      const graph = JSON.parse(text);
+      const payload = await api("/api/graphs/import", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          subject: form.get("subject"),
+          title: form.get("title"),
+          sourceName: file.name,
+          graph
+        }
+      });
+      state.selectedGraphId = payload.graph.id;
+      await loadState();
+      renderShell();
+      showToast("图谱导入成功");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderAiPage() {
+  const isTeacher = state.user.role === "teacher";
+  const conversations = state.data.conversations || [];
+  const active = conversations.find((conv) => conv.id === state.activeConversationId) || conversations[0];
+  if (active && !state.activeConversationId) state.activeConversationId = active.id;
+  const modeItems = isTeacher
+    ? [
+      { key: "explain", label: "讲解策略" },
+      { key: "questions", label: "知识点出题" },
+      { key: "plan", label: "教学方案" }
+    ]
+    : [
+      { key: "explain", label: "问题解答" },
+      { key: "questions", label: "知识点出题" },
+      { key: "plan", label: "学习方向" }
+    ];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>${isTeacher ? "✨ 教学指导" : "☁️ 发起对话"}</h2>
+        <p>${isTeacher ? "根据教师提问生成讲解策略、练习题和教学方案，并自动写入历史对话。" : "根据学生提问答疑、出题并规划学习方向，对话可在历史中回看。"} </p>
+      </div>
+      <button id="newConversationBtn" class="primary">新建对话</button>
+    </div>
+    <div class="chat-layout">
+      <aside class="conversation-list">
+        ${conversations.map((conv) => `
+          <button class="${active?.id === conv.id ? "active" : ""}" data-conversation="${conv.id}">
+            <strong>${escapeHtml(conv.title || "新的对话")}</strong>
+            <span>${fmtTime(conv.updatedAt)}</span>
+          </button>
+        `).join("") || emptyBlock("暂无历史对话")}
+      </aside>
+      <section class="panel chat-panel">
+        <div class="segmented">
+          ${modeItems.map((item) => `<button class="${state.aiMode === item.key ? "active" : ""}" data-ai-mode="${item.key}">${item.label}</button>`).join("")}
+        </div>
+        <div class="message-stream" id="aiMessages">
+          ${(active?.messages || []).map((message) => `
+            <div class="bubble ${message.role}">
+              <span>${message.role === "assistant" ? "AI" : "我"}</span>
+              <p>${escapeHtml(message.content)}</p>
+            </div>
+          `).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "输入知识点或课堂问题，我会生成可执行的教学建议。" : "输入你的学习问题，我会给出分步骤指导。"}</p></div>`}
+        </div>
+        <form id="aiForm" class="composer">
+          <input name="prompt" placeholder="${isTeacher ? "例如：牛顿第二定律如何讲得更容易理解" : "例如：我不会判断运动学题该用哪个公式"}" />
+          <button class="primary" type="submit">发送</button>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+function bindAiPage() {
+  document.querySelectorAll("[data-ai-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.aiMode = button.dataset.aiMode;
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-conversation]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.activeConversationId = button.dataset.conversation;
+      renderContent();
+    });
+  });
+  document.getElementById("newConversationBtn")?.addEventListener("click", async () => {
+    try {
+      const payload = await api("/api/conversations", {
+        method: "POST",
+        body: { userId: state.user.id, mode: state.aiMode, title: "新的对话" }
+      });
+      state.activeConversationId = payload.conversation.id;
+      await loadState();
+      renderShell();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  const stream = document.getElementById("aiMessages");
+  if (stream) stream.scrollTop = stream.scrollHeight;
+  document.getElementById("aiForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const prompt = String(form.get("prompt") || "").trim();
+    if (!prompt) return;
+    try {
+      const payload = await api("/api/ai/chat", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          conversationId: state.activeConversationId,
+          mode: state.aiMode,
+          prompt
+        }
+      });
+      state.activeConversationId = payload.conversation.id;
+      await loadState();
+      renderShell();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderHistoryPage() {
+  const conversations = state.data.conversations || [];
+  const active = conversations.find((conv) => conv.id === state.activeConversationId) || conversations[0];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>💬 历史对话</h2>
+        <p>所有教学指导和学习对话都会按账号保存，新建对话后也可以在这里回看和继续。</p>
+      </div>
+    </div>
+    <div class="chat-layout">
+      <aside class="conversation-list">
+        ${conversations.map((conv) => `
+          <button class="${active?.id === conv.id ? "active" : ""}" data-history-conversation="${conv.id}">
+            <strong>${escapeHtml(conv.title || "新的对话")}</strong>
+            <span>${fmtTime(conv.updatedAt)} · ${escapeHtml(conv.mode)}</span>
+          </button>
+        `).join("") || emptyBlock("暂无历史对话")}
+      </aside>
+      <section class="panel chat-panel">
+        ${active ? `
+          <div class="split-head">
+            <h3>${escapeHtml(active.title || "新的对话")}</h3>
+            <div class="actions">
+              <button class="primary" id="continueConversationBtn">继续对话</button>
+              <button class="danger" id="deleteConversationBtn">删除</button>
+            </div>
+          </div>
+          <div class="message-stream">
+            ${active.messages.map((message) => `
+              <div class="bubble ${message.role}">
+                <span>${message.role === "assistant" ? "AI" : "我"}</span>
+                <p>${escapeHtml(message.content)}</p>
+              </div>
+            `).join("")}
+          </div>
+        ` : emptyBlock("选择一条历史对话查看详情。")}
+      </section>
+    </div>
+  `;
+}
+
+function bindHistoryPage() {
+  document.querySelectorAll("[data-history-conversation]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.activeConversationId = button.dataset.historyConversation;
+      renderContent();
+    });
+  });
+  document.getElementById("continueConversationBtn")?.addEventListener("click", () => {
+    state.page = "ai";
+    renderShell();
+  });
+  document.getElementById("deleteConversationBtn")?.addEventListener("click", async () => {
+    if (!state.activeConversationId || !confirm("确认删除这条对话？")) return;
+    try {
+      await api(`/api/conversations/${state.activeConversationId}?userId=${state.user.id}`, { method: "DELETE" });
+      state.activeConversationId = null;
+      await loadState();
+      renderShell();
+      showToast("历史对话已删除");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderModelPage() {
+  const models = (state.data.models || []).filter((model) => model.subject === state.modelSubject);
+  const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
+  return `
+    <div class="page-head">
+      <div>
+        <h2>🧠 模型显示</h2>
+        <p>选择学科后拖拉组件模拟真实或理想状态，模型可保存、下载或从账号删除。</p>
+      </div>
+      <div class="inline-controls">
+        <label>学科<select id="modelSubject">${subjectOptions(state.modelSubject)}</select></label>
+        <div class="segmented compact">
+          <button class="${state.modelMode === "ideal" ? "active" : ""}" data-model-mode="ideal">理想状态</button>
+          <button class="${state.modelMode === "real" ? "active" : ""}" data-model-mode="real">真实状态</button>
+        </div>
+      </div>
+    </div>
+    <div class="model-layout">
+      <section class="panel palette-panel">
+        <h3>组件库</h3>
+        <div class="palette">
+          ${componentPalette.map((item) => `
+            <button draggable="true" class="palette-item" data-component-type="${item.type}" title="拖入画布">
+              <span>${item.icon}</span>${item.label}
+            </button>
+          `).join("")}
+        </div>
+        <form id="saveModelForm" class="stack">
+          <label>模型名称<input name="name" value="${escapeHtml(models.find((model) => model.id === state.loadedModelId)?.name || "")}" placeholder="例如：斜面小车运动模型" /></label>
+          <label>说明<textarea name="notes" rows="3" placeholder="记录参数、题目来源或使用场景"></textarea></label>
+          <button class="primary" type="submit">保存模型</button>
+          <button class="ghost" type="button" id="downloadDraftModel">下载当前模型</button>
+          <button class="ghost" type="button" id="clearModelCanvas">清空画布</button>
+        </form>
+      </section>
+      <section class="panel model-canvas-panel">
+        <div class="split-head">
+          <h3>${escapeHtml(state.modelSubject)}模型画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
+          <span>将左侧组件拖到画布中，可继续拖动调整位置。</span>
+        </div>
+        <div id="modelCanvas" class="model-canvas">
+          <div class="axis-line x"></div>
+          <div class="axis-line y"></div>
+          ${state.modelComponents.map((item) => renderModelComponent(item)).join("")}
+        </div>
+        <div class="inspector">
+          ${selected ? `
+            <strong>当前组件：${escapeHtml(selected.label)}</strong>
+            <div class="property-grid">
+              ${Object.entries(selected.props || {}).map(([key, value]) => `
+                <label>${escapeHtml(key)}<input data-prop-key="${escapeHtml(key)}" value="${escapeHtml(value)}" /></label>
+              `).join("")}
+            </div>
+            <button class="danger" id="deleteComponentBtn">删除组件</button>
+          ` : `<span>选中组件后可编辑参数。</span>`}
+        </div>
+      </section>
+      <section class="panel saved-models">
+        <h3>已保存模型</h3>
+        <div class="saved-list">
+          ${models.map((model) => `
+            <article class="list-card">
+              <div>
+                <h3>${escapeHtml(model.name)}</h3>
+                <p>${escapeHtml(model.mode === "real" ? "真实状态" : "理想状态")} · ${model.components.length} 个组件</p>
+                <small>${fmtTime(model.updatedAt)}</small>
+              </div>
+              <div class="row-actions">
+                <button class="mini" data-load-model="${model.id}">载入</button>
+                <button class="mini" data-download-model="${model.id}">下载</button>
+                <button class="mini danger" data-delete-model="${model.id}">删除</button>
+              </div>
+            </article>
+          `).join("") || emptyBlock("当前学科还没有保存模型。")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderModelComponent(item) {
+  return `
+    <button class="model-node ${state.selectedComponentId === item.id ? "active" : ""}" style="left:${item.x}%; top:${item.y}%;" data-node-id="${item.id}" title="${escapeHtml(item.label)}">
+      <span>${escapeHtml(item.icon)}</span>
+      <small>${escapeHtml(item.label)}</small>
+    </button>
+  `;
+}
+
+function bindModelPage() {
+  document.getElementById("modelSubject")?.addEventListener("change", (event) => {
+    state.modelSubject = event.target.value;
+    state.modelComponents = [];
+    state.selectedComponentId = null;
+    state.loadedModelId = null;
+    renderContent();
+  });
+  document.querySelectorAll("[data-model-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.modelMode = button.dataset.modelMode;
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-component-type]").forEach((button) => {
+    button.addEventListener("dragstart", (event) => {
+      event.dataTransfer.setData("text/plain", button.dataset.componentType);
+    });
+  });
+  const canvas = document.getElementById("modelCanvas");
+  canvas?.addEventListener("dragover", (event) => event.preventDefault());
+  canvas?.addEventListener("drop", (event) => {
+    event.preventDefault();
+    const type = event.dataTransfer.getData("text/plain");
+    const meta = componentPalette.find((item) => item.type === type);
+    if (!meta) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.max(4, Math.min(92, ((event.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(8, Math.min(88, ((event.clientY - rect.top) / rect.height) * 100));
+    const component = {
+      id: `cmp_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      type: meta.type,
+      icon: meta.icon,
+      label: meta.label,
+      x: Number(x.toFixed(2)),
+      y: Number(y.toFixed(2)),
+      props: { ...meta.defaults }
+    };
+    state.modelComponents.push(component);
+    state.selectedComponentId = component.id;
+    renderContent();
+  });
+  document.querySelectorAll("[data-node-id]").forEach((node) => {
+    node.addEventListener("click", () => {
+      state.selectedComponentId = node.dataset.nodeId;
+      renderContent();
+    });
+    node.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      state.selectedComponentId = node.dataset.nodeId;
+      const target = state.modelComponents.find((item) => item.id === node.dataset.nodeId);
+      const rect = canvas.getBoundingClientRect();
+      const move = (moveEvent) => {
+        const x = Math.max(4, Math.min(92, ((moveEvent.clientX - rect.left) / rect.width) * 100));
+        const y = Math.max(8, Math.min(88, ((moveEvent.clientY - rect.top) / rect.height) * 100));
+        target.x = Number(x.toFixed(2));
+        target.y = Number(y.toFixed(2));
+        node.style.left = `${target.x}%`;
+        node.style.top = `${target.y}%`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        renderContent();
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    });
+  });
+  document.querySelectorAll("[data-prop-key]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
+      if (selected) selected.props[input.dataset.propKey] = input.value;
+    });
+  });
+  document.getElementById("deleteComponentBtn")?.addEventListener("click", () => {
+    state.modelComponents = state.modelComponents.filter((item) => item.id !== state.selectedComponentId);
+    state.selectedComponentId = null;
+    renderContent();
+  });
+  document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
+    state.modelComponents = [];
+    state.selectedComponentId = null;
+    state.loadedModelId = null;
+    renderContent();
+  });
+  document.getElementById("downloadDraftModel")?.addEventListener("click", () => {
+    downloadJson(`${state.modelSubject}-模型草稿.json`, {
+      name: "未命名模型",
+      subject: state.modelSubject,
+      mode: state.modelMode,
+      components: state.modelComponents
+    });
+  });
+  document.getElementById("saveModelForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get("name") || "").trim();
+    if (!name) return showToast("请填写模型名称", "error");
+    try {
+      const payload = await api("/api/models", {
+        method: "POST",
+        body: {
+          id: state.loadedModelId,
+          userId: state.user.id,
+          name,
+          subject: state.modelSubject,
+          mode: state.modelMode,
+          components: state.modelComponents,
+          notes: form.get("notes")
+        }
+      });
+      state.loadedModelId = payload.model.id;
+      await loadState();
+      renderShell();
+      showToast("模型已保存");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-load-model]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const model = state.data.models.find((item) => item.id === button.dataset.loadModel);
+      if (!model) return;
+      state.loadedModelId = model.id;
+      state.modelSubject = model.subject;
+      state.modelMode = model.mode;
+      state.modelComponents = JSON.parse(JSON.stringify(model.components || []));
+      state.selectedComponentId = null;
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-download-model]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const model = state.data.models.find((item) => item.id === button.dataset.downloadModel);
+      if (model) downloadJson(`${model.name}.json`, model);
+    });
+  });
+  document.querySelectorAll("[data-delete-model]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确认从当前账号删除该模型？")) return;
+      try {
+        await api(`/api/models/${button.dataset.deleteModel}?userId=${state.user.id}`, { method: "DELETE" });
+        if (state.loadedModelId === button.dataset.deleteModel) state.loadedModelId = null;
+        await loadState();
+        renderShell();
+        showToast("模型已删除");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+}
+
+function renderChatPage() {
+  const threads = state.data.chatThreads || [];
+  const active = threads.find((thread) => thread.id === state.activeThreadId) || threads[0];
+  const friends = state.data.friends || [];
+  if (active && !state.activeThreadId) state.activeThreadId = active.id;
+  return `
+    <div class="page-head">
+      <div>
+        <h2>☁️ 聊天信息</h2>
+        <p>可以按学生或老师的 ID、姓名添加好友，发起私聊或群聊，并删除选中的聊天记录。</p>
+      </div>
+    </div>
+    <div class="chat-layout wide">
+      <aside class="panel contact-panel">
+        <h3>添加好友</h3>
+        <form id="addFriendForm" class="inline-form">
+          <input name="target" placeholder="输入 ID 或姓名" />
+          <button class="primary" type="submit">添加</button>
+        </form>
+        <form id="searchUserForm" class="inline-form">
+          <input name="query" placeholder="搜索用户" />
+          <button class="ghost" type="submit">搜索</button>
+        </form>
+        <div class="search-results">
+          ${state.searchResults.map((user) => `
+            <button data-add-result="${user.id}">${escapeHtml(user.name)} · ${user.id} · ${roleName(user.role)}</button>
+          `).join("")}
+        </div>
+        <h3>好友</h3>
+        <div class="contact-list">
+          ${friends.map((friend) => `
+            <div class="contact-row">
+              <button data-open-friend="${friend.id}">${escapeHtml(friend.name)}<span>${friend.id}</span></button>
+              <button class="icon-danger" data-delete-friend="${friend.id}" title="删除好友">×</button>
+            </div>
+          `).join("") || emptyBlock("暂无好友")}
+        </div>
+        <h3>创建群聊</h3>
+        <form id="groupForm" class="stack">
+          <input name="name" placeholder="群聊名称" />
+          <div class="check-list">
+            ${friends.map((friend) => `<label><input type="checkbox" name="member" value="${friend.id}" />${escapeHtml(friend.name)}</label>`).join("") || `<span class="hint">添加好友后可创建群聊</span>`}
+          </div>
+          <button class="primary" type="submit">创建群聊</button>
+        </form>
+      </aside>
+      <aside class="conversation-list">
+        ${threads.map((thread) => `
+          <button class="${active?.id === thread.id ? "active" : ""}" data-thread="${thread.id}">
+            <strong>${escapeHtml(thread.name)}</strong>
+            <span>${thread.type === "group" ? "群聊" : "私聊"} · ${thread.messages.length} 条</span>
+          </button>
+        `).join("") || emptyBlock("暂无聊天")}
+      </aside>
+      <section class="panel chat-panel">
+        ${active ? `
+          <div class="split-head">
+            <h3>${escapeHtml(active.name)}</h3>
+            <button class="danger" id="deleteSelectedMessages">删除选中记录</button>
+          </div>
+          <div class="message-stream">
+            ${active.messages.map((message) => {
+              const from = state.data.users.find((user) => user.id === message.fromUserId);
+              const mine = message.fromUserId === state.user.id;
+              return `
+                <label class="chat-message ${mine ? "mine" : ""}">
+                  <input type="checkbox" data-message-check="${message.id}" ${state.selectedMessages.has(message.id) ? "checked" : ""} />
+                  <span>${escapeHtml(from?.name || message.fromUserId)}</span>
+                  <p>${escapeHtml(message.content)}</p>
+                </label>
+              `;
+            }).join("") || `<div class="bubble assistant"><span>系统</span><p>还没有消息。</p></div>`}
+          </div>
+          <form id="chatForm" class="composer">
+            <input name="content" placeholder="输入聊天内容" />
+            <button class="primary" type="submit">发送</button>
+          </form>
+        ` : emptyBlock("添加好友或创建群聊后即可开始聊天。")}
+      </section>
+    </div>
+  `;
+}
+
+function bindChatPage() {
+  document.getElementById("addFriendForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: form.get("target") } });
+      await loadState();
+      renderShell();
+      showToast("好友已添加");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("searchUserForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const payload = await api(`/api/users/search?userId=${state.user.id}&query=${encodeURIComponent(form.get("query") || "")}`);
+      state.searchResults = payload.users;
+      renderContent();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-add-result]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: button.dataset.addResult } });
+        state.searchResults = [];
+        await loadState();
+        renderShell();
+        showToast("好友已添加");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-open-friend]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: button.dataset.openFriend } });
+        await loadState();
+        const thread = state.data.chatThreads.find((item) => item.type === "direct" && item.memberIds.includes(button.dataset.openFriend));
+        if (thread) state.activeThreadId = thread.id;
+        renderShell();
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-delete-friend]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确认删除该好友？聊天线程会保留，但好友关系会解除。")) return;
+      try {
+        await api(`/api/friends/${button.dataset.deleteFriend}?userId=${state.user.id}`, { method: "DELETE" });
+        await loadState();
+        renderShell();
+        showToast("好友已删除");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-thread]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.activeThreadId = button.dataset.thread;
+      state.selectedMessages.clear();
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-message-check]").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (input.checked) state.selectedMessages.add(input.dataset.messageCheck);
+      else state.selectedMessages.delete(input.dataset.messageCheck);
+    });
+  });
+  document.getElementById("chatForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const content = String(form.get("content") || "").trim();
+    if (!content) return;
+    try {
+      await api("/api/chat/messages", {
+        method: "POST",
+        body: { threadId: state.activeThreadId, fromUserId: state.user.id, content }
+      });
+      await loadState();
+      renderShell();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("deleteSelectedMessages")?.addEventListener("click", async () => {
+    if (!state.selectedMessages.size) return showToast("请先选择要删除的记录", "error");
+    try {
+      await api("/api/chat/messages", {
+        method: "DELETE",
+        body: { threadId: state.activeThreadId, userId: state.user.id, messageIds: Array.from(state.selectedMessages) }
+      });
+      state.selectedMessages.clear();
+      await loadState();
+      renderShell();
+      showToast("已删除选中的聊天记录");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("groupForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const memberIds = form.getAll("member");
+    try {
+      const payload = await api("/api/chat/groups", {
+        method: "POST",
+        body: { ownerId: state.user.id, name: form.get("name") || "新的群聊", memberIds }
+      });
+      state.activeThreadId = payload.thread.id;
+      await loadState();
+      renderShell();
+      showToast("群聊已创建");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderClassPage() {
+  if (state.user.role !== "teacher") return emptyBlock("学生端不显示班级管理。");
+  const classes = state.data.classes || [];
+  const active = classes.find((klass) => klass.id === state.selectedClassId) || classes[0];
+  if (active && !state.selectedClassId) state.selectedClassId = active.id;
+  const students = active ? active.studentIds.map((id) => state.data.users.find((user) => user.id === id)).filter(Boolean) : [];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>🏫 班级管理</h2>
+        <p>教师可按学科创建多个班级，导入学生信息并处理学生申请；名单匹配会自动通过，不匹配则添加到班级。</p>
+      </div>
+    </div>
+    <div class="grid two">
+      <section class="panel">
+        <h3>创建班级</h3>
+        <form id="createClassForm" class="stack">
+          <div class="form-grid">
+            <label>班级名称<input name="name" placeholder="例如：高一 3 班" /></label>
+            <label>学科<select name="subject">${subjectOptions(state.user.subject || "物理")}</select></label>
+          </div>
+          <button class="primary" type="submit">创建班级</button>
+        </form>
+        <div class="class-tabs">
+          ${classes.map((klass) => `<button class="${active?.id === klass.id ? "active" : ""}" data-class="${klass.id}">${escapeHtml(klass.name)}<span>${escapeHtml(klass.subject)}</span></button>`).join("") || emptyBlock("暂无班级")}
+        </div>
+      </section>
+      <section class="panel">
+        <h3>导入学生信息</h3>
+        ${active ? `
+          <form id="importStudentsForm" class="stack">
+            <p class="hint">每行一名学生，格式：姓名,8位ID。没有账号的学生会创建占位账号，默认密码 123456。</p>
+            <textarea name="students" rows="7" placeholder="张三,20261234&#10;李四,20262345"></textarea>
+            <button class="primary" type="submit">导入到 ${escapeHtml(active.name)}</button>
+          </form>
+        ` : emptyBlock("请先创建或选择班级。")}
+      </section>
+    </div>
+    <section class="panel">
+      ${active ? `
+        <div class="split-head">
+          <h3>${escapeHtml(active.name)} · ${escapeHtml(active.subject)}</h3>
+          <span>邀请码：${escapeHtml(active.inviteCode)} · 学生 ${students.length} 人</span>
+        </div>
+        <div class="grid two">
+          <div>
+            <h3>学生名单</h3>
+            <div class="table-list">
+              ${students.map((student) => `<div><span>${escapeHtml(student.name)}</span><span>${student.id}</span><span>${escapeHtml(student.className || active.name)}</span></div>`).join("") || emptyBlock("暂无学生")}
+            </div>
+          </div>
+          <div>
+            <h3>申请记录</h3>
+            <div class="table-list">
+              ${(active.applications || []).map((item) => `<div><span>${escapeHtml(item.studentName)}</span><span>${escapeHtml(item.status)}</span><span>${escapeHtml(item.reason)}</span></div>`).join("") || emptyBlock("暂无申请")}
+            </div>
+          </div>
+        </div>
+      ` : emptyBlock("请选择班级。")}
+    </section>
+  `;
+}
+
+function bindClassPage() {
+  document.getElementById("createClassForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const payload = await api("/api/classes", {
+        method: "POST",
+        body: { teacherId: state.user.id, name: form.get("name"), subject: form.get("subject") }
+      });
+      state.selectedClassId = payload.class.id;
+      await loadState();
+      renderShell();
+      showToast("班级已创建");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-class]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedClassId = button.dataset.class;
+      renderContent();
+    });
+  });
+  document.getElementById("importStudentsForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const rows = String(form.get("students") || "").split(/\r?\n/).map((line) => {
+      const [name, id] = line.split(/[,，\s]+/).map((item) => item?.trim());
+      return { name, id };
+    }).filter((row) => row.name || row.id);
+    try {
+      const payload = await api(`/api/classes/${state.selectedClassId}/import-students`, {
+        method: "POST",
+        body: { teacherId: state.user.id, students: rows }
+      });
+      await loadState();
+      renderShell();
+      showToast(`已导入 ${payload.added.length} 名学生`);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderTeacherHomeworkPage() {
+  const classes = state.data.classes || [];
+  const activeClassId = state.selectedClassId || classes[0]?.id || "";
+  const homework = (state.data.homework || []).filter((item) => !activeClassId || item.classId === activeClassId);
+  const submissions = state.data.submissions || [];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>✏️ 作业管理</h2>
+        <p>教师可布置文字、图片、视频作业和参考答案，学生提交后支持 AI 批改与手动批改。</p>
+      </div>
+    </div>
+    <div class="grid two">
+      <section class="panel">
+        <h3>布置作业</h3>
+        <form id="createHomeworkForm" class="stack">
+          <label>班级<select name="classId">${classes.map((klass) => `<option value="${klass.id}" ${klass.id === activeClassId ? "selected" : ""}>${escapeHtml(klass.name)} · ${escapeHtml(klass.subject)}</option>`).join("")}</select></label>
+          <label>标题<input name="title" placeholder="作业标题" /></label>
+          <label>作业内容<textarea name="description" rows="4" placeholder="可填写文字说明"></textarea></label>
+          <label>上传作业图片/视频<input name="attachments" type="file" multiple accept="image/*,video/*" /></label>
+          <label>参考答案<textarea name="answer" rows="4" placeholder="用于 AI 批改匹配"></textarea></label>
+          <button class="primary" type="submit">发布作业</button>
+        </form>
+      </section>
+      <section class="panel">
+        <div class="split-head">
+          <h3>已发布作业</h3>
+          <label class="compact-label">班级<select id="homeworkClassSelect">${classes.map((klass) => `<option value="${klass.id}" ${klass.id === activeClassId ? "selected" : ""}>${escapeHtml(klass.name)}</option>`).join("")}</select></label>
+        </div>
+        <div class="saved-list">
+          ${homework.map((item) => `
+            <article class="list-card">
+              <div>
+                <h3>${escapeHtml(item.title)}</h3>
+                <p>${escapeHtml(item.description).slice(0, 80) || "无文字说明"}</p>
+                <small>${fmtTime(item.createdAt)} · 提交 ${submissions.filter((sub) => sub.homeworkId === item.id).length} 份</small>
+              </div>
+            </article>
+          `).join("") || emptyBlock("该班级暂无作业")}
+        </div>
+      </section>
+    </div>
+    <section class="panel">
+      <h3>提交与批改</h3>
+      <div class="submission-grid">
+        ${homework.flatMap((item) => submissions.filter((sub) => sub.homeworkId === item.id).map((sub) => renderSubmissionCard(item, sub))).join("") || emptyBlock("暂无学生提交。")}
+      </div>
+    </section>
+    ${state.homeworkModal ? renderSubmissionModal() : ""}
+  `;
+}
+
+function renderSubmissionCard(homework, submission) {
+  const student = state.data.users.find((user) => user.id === submission.studentId);
+  return `
+    <article class="submission-card">
+      <h3>${escapeHtml(homework.title)}</h3>
+      <p>${escapeHtml(student?.name || submission.studentId)} · ${submission.status === "graded" ? `已批改 ${submission.score} 分` : "待批改"}</p>
+      <small>${fmtTime(submission.updatedAt)}</small>
+      <div class="actions">
+        <button class="mini" data-view-submission="${submission.id}">查看/手动批改</button>
+        <button class="mini primary" data-ai-grade="${submission.id}">AI 批改</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderSubmissionModal() {
+  const submission = state.data.submissions.find((item) => item.id === state.homeworkModal);
+  if (!submission) return "";
+  const homework = state.data.homework.find((item) => item.id === submission.homeworkId);
+  const student = state.data.users.find((user) => user.id === submission.studentId);
+  return `
+    <div class="modal-backdrop">
+      <section class="modal large">
+        <button class="modal-close" id="closeSubmissionModal">×</button>
+        <h2>手动批改 · ${escapeHtml(homework?.title || "")}</h2>
+        <div class="review-layout">
+          <div>
+            <h3>学生答案</h3>
+            <p class="answer-box">${escapeHtml(submission.answerText || "未填写文字答案")}</p>
+            ${renderAttachments(submission.attachments)}
+          </div>
+          <form id="manualGradeForm" class="stack">
+            <p>学生：${escapeHtml(student?.name || submission.studentId)}</p>
+            <label>分数<input name="score" type="number" min="0" max="100" value="${submission.score ?? ""}" /></label>
+            <label>评语<textarea name="comment" rows="5">${escapeHtml(submission.comment || "")}</textarea></label>
+            <button class="primary" type="submit">保存手动批改</button>
+          </form>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindTeacherHomeworkPage() {
+  document.getElementById("homeworkClassSelect")?.addEventListener("change", (event) => {
+    state.selectedClassId = event.target.value;
+    renderContent();
+  });
+  document.getElementById("createHomeworkForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const files = form.getAll("attachments").filter((file) => file && file.name);
+    try {
+      const attachments = await Promise.all(files.map(fileToPayload));
+      const payload = await api("/api/homework", {
+        method: "POST",
+        body: {
+          teacherId: state.user.id,
+          classId: form.get("classId"),
+          title: form.get("title"),
+          description: form.get("description"),
+          answer: form.get("answer"),
+          attachments
+        }
+      });
+      state.selectedClassId = payload.homework.classId;
+      await loadState();
+      renderShell();
+      showToast("作业已发布");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-ai-grade]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/api/submissions/${button.dataset.aiGrade}/ai-grade`, { method: "POST", body: { teacherId: state.user.id } });
+        await loadState();
+        renderShell();
+        showToast("AI 批改完成");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-view-submission]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.homeworkModal = button.dataset.viewSubmission;
+      renderContent();
+    });
+  });
+  document.getElementById("closeSubmissionModal")?.addEventListener("click", () => {
+    state.homeworkModal = null;
+    renderContent();
+  });
+  document.getElementById("manualGradeForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      await api(`/api/submissions/${state.homeworkModal}/manual-grade`, {
+        method: "POST",
+        body: { teacherId: state.user.id, score: form.get("score"), comment: form.get("comment") }
+      });
+      state.homeworkModal = null;
+      await loadState();
+      renderShell();
+      showToast("手动批改已保存");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderStudentHomeworkPage() {
+  const homework = state.data.homework || [];
+  const submissions = state.data.submissions || [];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>📥 作业提交</h2>
+        <p>这里会显示所在班级老师发布的作业，可提交文字、图片或视频答案；老师批改后显示分数。</p>
+      </div>
+    </div>
+    <section class="homework-list">
+      ${homework.map((item) => {
+        const klass = state.data.classes.find((classItem) => classItem.id === item.classId);
+        const submission = submissions.find((sub) => sub.homeworkId === item.id && sub.studentId === state.user.id);
+        return `
+          <article class="panel homework-card">
+            <div class="split-head">
+              <div>
+                <h3>${escapeHtml(item.title)}</h3>
+                <p>${escapeHtml(klass?.name || "")} · ${fmtTime(item.createdAt)}</p>
+              </div>
+              <strong class="score-badge ${submission?.status === "graded" ? "done" : ""}">${submission?.status === "graded" ? `${submission.score} 分` : (submission ? "待批改" : "未提交")}</strong>
+            </div>
+            <p>${escapeHtml(item.description)}</p>
+            ${renderAttachments(item.attachments)}
+            ${submission?.comment ? `<p class="feedback">评语：${escapeHtml(submission.comment)}</p>` : ""}
+            <form class="submitHomeworkForm stack" data-homework-id="${item.id}">
+              <label>文字答案<textarea name="answerText" rows="4">${escapeHtml(submission?.answerText || "")}</textarea></label>
+              <label>上传图片/视频答案<input name="attachments" type="file" accept="image/*,video/*" multiple /></label>
+              <button class="primary" type="submit">${submission ? "更新提交" : "提交作业"}</button>
+            </form>
+          </article>
+        `;
+      }).join("") || emptyBlock("当前班级还没有老师发布作业。")}
+    </section>
+  `;
+}
+
+function bindStudentHomeworkPage() {
+  document.querySelectorAll(".submitHomeworkForm").forEach((formEl) => {
+    formEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      const files = form.getAll("attachments").filter((file) => file && file.name);
+      try {
+        const attachments = await Promise.all(files.map(fileToPayload));
+        await api(`/api/homework/${event.currentTarget.dataset.homeworkId}/submit`, {
+          method: "POST",
+          body: { studentId: state.user.id, answerText: form.get("answerText"), attachments }
+        });
+        await loadState();
+        renderShell();
+        showToast("作业已提交");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+}
+
+function renderProfilePage() {
+  const isStudent = state.user.role === "student";
+  return `
+    <div class="page-head">
+      <div>
+        <h2>ℹ️ 个人信息</h2>
+        <p>维护账号信息。用户 ID 为系统自动分配的 8 位编号，用于添加好友、加入班级和关联作业。</p>
+      </div>
+    </div>
+    <div class="grid two">
+      <section class="panel">
+        <h3>账号资料</h3>
+        <form id="profileForm" class="stack">
+          <label>8 位 ID<input value="${state.user.id}" disabled /></label>
+          <label>身份<input value="${roleName(state.user.role)}" disabled /></label>
+          <label>姓名<input name="name" value="${escapeHtml(state.user.name)}" /></label>
+          <label>${isStudent ? "班级" : "学科"}<input name="${isStudent ? "className" : "subject"}" value="${escapeHtml(isStudent ? (state.user.className || "") : (state.user.subject || ""))}" /></label>
+          <label>邮箱<input name="email" value="${escapeHtml(state.user.email || "")}" /></label>
+          <label>电话<input name="phone" value="${escapeHtml(state.user.phone || "")}" /></label>
+          <button class="primary" type="submit">保存资料</button>
+        </form>
+      </section>
+      <section class="panel">
+        <h3>${isStudent ? "加入班级" : "账号能力"}</h3>
+        ${isStudent ? `
+          <form id="joinClassForm" class="stack">
+            <label>班级邀请码或班级 ID<input name="classCode" placeholder="向老师获取班级邀请码" /></label>
+            <button class="primary" type="submit">申请加入</button>
+          </form>
+          <div class="table-list">
+            ${(state.data.classes || []).map((klass) => `<div><span>${escapeHtml(klass.name)}</span><span>${escapeHtml(klass.subject)}</span><span>${escapeHtml(klass.inviteCode)}</span></div>`).join("") || emptyBlock("尚未加入班级")}
+          </div>
+        ` : `
+          <div class="capability-grid">
+            <span>创建多学科班级</span>
+            <span>导入学生名单</span>
+            <span>发布多媒体作业</span>
+            <span>AI/手动批改</span>
+            <span>上传总知识图谱</span>
+            <span>保存学科模型</span>
+          </div>
+        `}
+      </section>
+    </div>
+  `;
+}
+
+function bindProfilePage() {
+  document.getElementById("profileForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = {
+      name: form.get("name"),
+      email: form.get("email"),
+      phone: form.get("phone")
+    };
+    if (state.user.role === "student") body.className = form.get("className");
+    else body.subject = form.get("subject");
+    try {
+      const payload = await api(`/api/users/${state.user.id}`, { method: "PUT", body });
+      state.user = payload.user;
+      await loadState();
+      renderShell();
+      showToast("资料已保存");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("joinClassForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const payload = await api(`/api/classes/${encodeURIComponent(form.get("classCode"))}/apply`, {
+        method: "POST",
+        body: { studentId: state.user.id }
+      });
+      await loadState();
+      renderShell();
+      showToast(payload.application.reason);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function renderAttachments(attachments = []) {
+  if (!attachments.length) return "";
+  return `
+    <div class="attachments">
+      ${attachments.map((file) => {
+        if (String(file.type).startsWith("image/")) return `<img src="${file.dataUrl}" alt="${escapeHtml(file.name)}" />`;
+        if (String(file.type).startsWith("video/")) return `<video src="${file.dataUrl}" controls></video>`;
+        return `<a href="${file.dataUrl}" download="${escapeHtml(file.name)}">${escapeHtml(file.name)}</a>`;
+      }).join("")}
+    </div>
+  `;
+}
+
+function emptyBlock(message) {
+  return `<div class="empty">${message}</div>`;
+}
+
+boot();
