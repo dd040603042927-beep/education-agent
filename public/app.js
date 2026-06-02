@@ -37,6 +37,8 @@ const state = {
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
+const GRAPH_LAYOUT_VERSION = "graph-layout-v4";
+const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细分"]);
 
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
@@ -503,17 +505,17 @@ function renderTeacherGraphPage() {
           </div>
           <label>图谱 JSON 文件<input name="graph" type="file" accept=".json" required /></label>
           <p class="hint">JSON 需要包含 nodes 与 links，例如：{"nodes":[{"id":"n1","label":"力学"}],"links":[]}。</p>
-          <button class="primary" type="submit">✅ 确认导入</button>
         </form>
         <label class="supplement-field">补充目录或知识点
           <textarea name="sourceText" form="generateGraphForm" rows="6" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系">${escapeHtml(draft.sourceText || "")}</textarea>
         </label>
+        <button class="primary" type="submit" form="importGraphForm">✅ 确认导入</button>
       </section>
     </div>
     <section class="panel">
       <div class="split-head">
         <h3>最近生成的知识图谱</h3>
-        <span>${graphs.length ? "滚轮/按钮缩放，拖拽节点，双击节点查看知识点" : "暂无图谱"}</span>
+        <span>${graphs.length ? "滚轮/按钮缩放，拖拽空白区域移动整个图谱，双击节点查看知识点" : "暂无图谱"}</span>
       </div>
       <div class="graph-workspace">
         <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock("还没有图谱，请先生成或导入。")}</div>
@@ -567,6 +569,16 @@ function graphSiblingSpacing(level) {
   return 30;
 }
 
+function isTreeLink(link) {
+  return TREE_LINK_LABELS.has(String(link?.label || link?.relation || ""));
+}
+
+function isComplexGraph(graph) {
+  const nodes = graph.nodes || [];
+  const maxLevel = nodes.reduce((max, node, index) => Math.max(max, graphNodeLevel(node, index)), 0);
+  return nodes.length > 60 || maxLevel >= 3;
+}
+
 function graphGroupClass(group) {
   return String(group || "topic").replace(/[^a-zA-Z0-9_-]/g, "") || "topic";
 }
@@ -590,7 +602,8 @@ function graphLabelLines(label, maxChars = 7, maxLines = 2) {
 function graphParentMap(graph) {
   const nodesById = new Map((graph.nodes || []).map((node, index) => [node.id, { node, index }]));
   const parents = new Map();
-  (graph.links || []).forEach((link) => {
+  const orderedLinks = (graph.links || []).slice().sort((a, b) => Number(!isTreeLink(a)) - Number(!isTreeLink(b)));
+  orderedLinks.forEach((link) => {
     const source = nodesById.get(link.source);
     const target = nodesById.get(link.target);
     if (!source || !target) return;
@@ -601,16 +614,152 @@ function graphParentMap(graph) {
   return parents;
 }
 
-function getGraphView(graph) {
-  const width = GRAPH_WIDTH;
-  const height = GRAPH_HEIGHT;
+function graphChildrenMap(parents) {
+  const children = new Map();
+  parents.forEach((parentId, childId) => {
+    if (!children.has(parentId)) children.set(parentId, []);
+    children.get(parentId).push(childId);
+  });
+  return children;
+}
+
+function graphCanvasSize(graph) {
   const nodes = graph.nodes || [];
-  const signature = nodes.map((node, index) => `${node.id}:${graphNodeLevel(node, index)}:${node.x || ""}:${node.y || ""}`).join("|");
+  if (!isComplexGraph(graph)) {
+    return { width: GRAPH_WIDTH, height: GRAPH_HEIGHT, pixelHeight: 700, complex: false };
+  }
+  const parents = graphParentMap(graph);
+  const children = graphChildrenMap(parents);
+  const root = nodes.find((node, index) => graphNodeLevel(node, index) === 0 || node.group === "root") || nodes[0];
+  const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]));
+  const childNodes = (id) => (children.get(id) || [])
+    .map((childId) => nodes.find((node) => node.id === childId))
+    .filter(Boolean);
+  const chapters = root
+    ? childNodes(root.id).filter((node) => graphNodeLevel(node, nodeIndex.get(node.id) || 0) <= 1)
+    : [];
+  const fallbackChapters = nodes.filter((node, index) => graphNodeLevel(node, index) === 1);
+  const chapterNodes = chapters.length ? chapters : fallbackChapters;
+  const sectionSpacing = 52;
+  const chapterGap = 58;
+  const totalRows = chapterNodes.reduce((sum, chapter) => {
+    const sections = childNodes(chapter.id).filter((node) => graphNodeLevel(node, nodeIndex.get(node.id) || 0) === 2);
+    const rowCount = Math.max(1, sections.length || childNodes(chapter.id).length);
+    return sum + rowCount;
+  }, 0);
+  const height = Math.max(980, 160 + totalRows * sectionSpacing + Math.max(0, chapterNodes.length - 1) * chapterGap);
+  return {
+    width: 1900,
+    height,
+    pixelHeight: Math.min(1500, Math.max(780, Math.round(height * 0.64))),
+    complex: true
+  };
+}
+
+function getComplexGraphPositions(graph, width, height, parents, children) {
+  const nodes = graph.nodes || [];
+  const byId = new Map(nodes.map((node, index) => [node.id, { node, index }]));
+  const positions = {};
+  const rootEntry = nodes
+    .map((node, index) => ({ node, index }))
+    .find((entry) => graphNodeLevel(entry.node, entry.index) === 0 || entry.node.group === "root") || { node: nodes[0], index: 0 };
+  const childEntries = (id) => (children.get(id) || [])
+    .map((childId) => byId.get(childId))
+    .filter(Boolean);
+  const chapters = rootEntry.node
+    ? childEntries(rootEntry.node.id).filter((entry) => graphNodeLevel(entry.node, entry.index) <= 1)
+    : [];
+  const chapterEntries = chapters.length
+    ? chapters
+    : nodes.map((node, index) => ({ node, index })).filter((entry) => graphNodeLevel(entry.node, entry.index) === 1);
+  const sectionSpacing = 52;
+  const chapterGap = 58;
+  const rootX = 92;
+  const chapterX = 260;
+  const sectionX = 520;
+  const detailStartX = 790;
+  const detailColumnGap = 220;
+  const detailRowGap = 42;
+  let cursorY = 96;
+  const chapterCenters = [];
+
+  chapterEntries.forEach((chapterEntry) => {
+    const sections = childEntries(chapterEntry.node.id).filter((entry) => graphNodeLevel(entry.node, entry.index) === 2);
+    const effectiveSections = sections.length ? sections : childEntries(chapterEntry.node.id);
+    const rowHeights = effectiveSections.map((sectionEntry) => {
+      const detailCount = childEntries(sectionEntry.node.id).length;
+      return Math.max(sectionSpacing, Math.ceil(Math.max(1, detailCount) / 5) * detailRowGap + 12);
+    });
+    const laneHeight = Math.max(132, rowHeights.reduce((sum, rowHeight) => sum + rowHeight, 0));
+    const laneTop = cursorY;
+    const laneCenter = laneTop + laneHeight / 2;
+    positions[chapterEntry.node.id] = { x: chapterX, y: laneCenter };
+    chapterCenters.push(laneCenter);
+
+    let rowY = laneTop;
+    effectiveSections.forEach((sectionEntry, sectionIndex) => {
+      const rowHeight = rowHeights[sectionIndex] || sectionSpacing;
+      const sectionY = rowY + rowHeight / 2;
+      positions[sectionEntry.node.id] = { x: sectionX, y: sectionY };
+      const details = childEntries(sectionEntry.node.id);
+      details.forEach((detailEntry, detailIndex) => {
+        const column = detailIndex % 5;
+        const row = Math.floor(detailIndex / 5);
+        const rowCount = Math.max(1, Math.ceil(details.length / 5));
+        positions[detailEntry.node.id] = {
+          x: detailStartX + column * detailColumnGap,
+          y: sectionY + (row - (rowCount - 1) / 2) * detailRowGap
+        };
+      });
+      rowY += rowHeight;
+    });
+    cursorY += laneHeight + chapterGap;
+  });
+
+  if (rootEntry.node) {
+    positions[rootEntry.node.id] = {
+      x: rootX,
+      y: chapterCenters.length ? (chapterCenters[0] + chapterCenters[chapterCenters.length - 1]) / 2 : height / 2
+    };
+  }
+
+  let orphanIndex = 0;
+  nodes.forEach((node, index) => {
+    if (positions[node.id]) return;
+    const level = graphNodeLevel(node, index);
+    positions[node.id] = {
+      x: level <= 1 ? chapterX : level === 2 ? sectionX : detailStartX + (orphanIndex % 5) * detailColumnGap,
+      y: Math.min(height - 70, 80 + orphanIndex * 48)
+    };
+    orphanIndex += 1;
+  });
+
+  return positions;
+}
+
+function getGraphView(graph) {
+  const size = graphCanvasSize(graph);
+  const width = size.width;
+  const height = size.height;
+  const nodes = graph.nodes || [];
+  const signatureParts = nodes.map((node, index) => {
+    const storedPosition = size.complex ? "" : `${node.x || ""}:${node.y || ""}`;
+    return `${node.id}:${graphNodeLevel(node, index)}:${storedPosition}`;
+  });
+  const signature = `${GRAPH_LAYOUT_VERSION}:${width}:${height}:${signatureParts.join("|")}`;
   if (!state.graphViews[graph.id] || state.graphViews[graph.id].signature !== signature) {
-    state.graphViews[graph.id] = { scale: 0.72, offsetX: 0, offsetY: 0, positions: {}, signature };
+    state.graphViews[graph.id] = { scale: size.complex ? 0.96 : 0.72, offsetX: 0, offsetY: 0, positions: {}, signature };
   }
   const view = state.graphViews[graph.id];
   const parents = graphParentMap(graph);
+  const children = graphChildrenMap(parents);
+  if (size.complex) {
+    const layoutPositions = getComplexGraphPositions(graph, width, height, parents, children);
+    nodes.forEach((node) => {
+      if (!view.positions[node.id] && layoutPositions[node.id]) view.positions[node.id] = layoutPositions[node.id];
+    });
+    return view;
+  }
   const byLevel = new Map();
   nodes.forEach((node, index) => {
     const level = graphNodeLevel(node, index);
@@ -659,7 +808,7 @@ function renderGraphViewer(graph) {
         <button class="mini" data-graph-zoom="out">缩小</button>
         <button class="mini" data-graph-zoom="reset">重置</button>
         <button class="mini" data-graph-zoom="in">放大</button>
-        <span>双击节点查看知识点，拖拽节点调整位置</span>
+        <span>拖拽空白区域移动图谱，拖拽节点调整位置，双击节点查看知识点</span>
       </div>
       ${renderGraphSvg(graph)}
     </div>
@@ -667,14 +816,15 @@ function renderGraphViewer(graph) {
 }
 
 function renderGraphSvg(graph) {
-  const width = GRAPH_WIDTH;
-  const height = GRAPH_HEIGHT;
+  const size = graphCanvasSize(graph);
+  const width = size.width;
+  const height = size.height;
   const links = graph.links || [];
   const nodes = graph.nodes || [];
   const view = getGraphView(graph);
   const positions = view.positions;
   return `
-    <svg class="graph-svg" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(graph.title)}">
+    <svg class="graph-svg" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" style="height:${size.pixelHeight}px; min-height:${size.pixelHeight}px" role="img" aria-label="${escapeHtml(graph.title)}">
       <defs>
         <linearGradient id="nodeGrad" x1="0%" x2="100%">
           <stop offset="0%" stop-color="#247db2"></stop>
@@ -694,9 +844,12 @@ function renderGraphSvg(graph) {
           if (!s || !t) return "";
           const mx = (s.x + t.x) / 2;
           const my = (s.y + t.y) / 2;
+          const label = String(link.label || "关联");
+          const treeLink = isTreeLink(link);
+          const showLabel = !size.complex || !treeLink;
           return `
-            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${graphLinkPath(s, t)}" class="graph-link" marker-end="url(#arrowHead)"></path>
-            <text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(link.label || "关联")}</text>
+            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${graphLinkPath(s, t)}" class="graph-link ${treeLink ? "tree" : "cross"}" marker-end="url(#arrowHead)"></path>
+            ${showLabel ? `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(label)}</text>` : ""}
           `;
         }).join("")}
         ${nodes.map((node, index) => {
@@ -706,13 +859,18 @@ function renderGraphSvg(graph) {
           const radius = graphNodeRadius(node, index);
           const groupClass = graphGroupClass(node.group);
           const label = String(node.label || "");
-          const labelLines = graphLabelLines(label, root ? 7 : 6, 2);
+          const detail = level >= 3 || groupClass === "detail";
+          const chipNode = size.complex && level >= 2;
+          const rectNode = detail || chipNode;
+          const labelLines = graphLabelLines(label, rectNode ? 10 : root ? 7 : 6, 2);
           const pointCount = Array.isArray(node.knowledgePoints) ? node.knowledgePoints.length : 0;
           return `
             <g class="graph-node level-${level} ${groupClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
-              <circle r="${radius}" class="${root ? "root" : groupClass}"></circle>
-              ${labelLines.map((line, lineIndex) => `<text y="${labelLines.length === 1 ? -3 : -10 + lineIndex * 16}" class="${root ? "root" : ""}">${escapeHtml(line)}</text>`).join("")}
-              ${pointCount ? `<text y="${radius - 11}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
+              ${rectNode
+                ? `<rect x="-92" y="-22" width="184" height="44" rx="8" class="${detail ? "detail" : groupClass}"></rect>`
+                : `<circle r="${radius}" class="${root ? "root" : groupClass}"></circle>`}
+              ${labelLines.map((line, lineIndex) => `<text y="${labelLines.length === 1 ? (rectNode ? 0 : -3) : -8 + lineIndex * 15}" class="${root ? "root" : ""}">${escapeHtml(line)}</text>`).join("")}
+              ${pointCount && !rectNode ? `<text y="${radius - 11}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
             </g>
           `;
         }).join("")}
@@ -780,6 +938,7 @@ function bindInteractiveGraph() {
   const graphId = svg.dataset.graphId;
   const graph = state.data.knowledgeGraphs.find((item) => item.id === graphId);
   if (!graph) return;
+  const size = graphCanvasSize(graph);
   getGraphView(graph);
 
   document.querySelectorAll("[data-graph-zoom]").forEach((button) => {
@@ -788,9 +947,12 @@ function bindInteractiveGraph() {
       if (button.dataset.graphZoom === "in") view.scale = clamp(view.scale + 0.15, 0.35, 2.8);
       if (button.dataset.graphZoom === "out") view.scale = clamp(view.scale - 0.15, 0.35, 2.8);
       if (button.dataset.graphZoom === "reset") {
-        view.scale = 1;
+        view.scale = size.complex ? 0.96 : 1;
         view.offsetX = 0;
         view.offsetY = 0;
+        view.positions = {};
+        getGraphView(graph);
+        updateGraphDom(svg, graphId);
       }
       applyGraphTransform(svg, graphId);
     });
@@ -804,6 +966,7 @@ function bindInteractiveGraph() {
   }, { passive: false });
 
   let dragged = null;
+  let panning = null;
   svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
     nodeEl.addEventListener("dblclick", (event) => {
       event.stopPropagation();
@@ -829,19 +992,49 @@ function bindInteractiveGraph() {
     });
   });
 
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest(".graph-node")) return;
+    event.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const view = state.graphViews[graphId];
+    panning = {
+      x: event.clientX,
+      y: event.clientY,
+      startOffsetX: view.offsetX,
+      startOffsetY: view.offsetY,
+      width: rect.width,
+      height: rect.height
+    };
+    svg.classList.add("panning");
+    svg.setPointerCapture?.(event.pointerId);
+  });
+
   window.addEventListener("pointermove", (event) => {
+    if (panning) {
+      const view = state.graphViews[graphId];
+      const dx = ((event.clientX - panning.x) * size.width) / panning.width / view.scale;
+      const dy = ((event.clientY - panning.y) * size.height) / panning.height / view.scale;
+      view.offsetX = panning.startOffsetX + dx;
+      view.offsetY = panning.startOffsetY + dy;
+      applyGraphTransform(svg, graphId);
+      return;
+    }
     if (!dragged) return;
     const view = state.graphViews[graphId];
-    const dx = ((event.clientX - dragged.x) * GRAPH_WIDTH) / dragged.width / view.scale;
-    const dy = ((event.clientY - dragged.y) * GRAPH_HEIGHT) / dragged.height / view.scale;
+    const dx = ((event.clientX - dragged.x) * size.width) / dragged.width / view.scale;
+    const dy = ((event.clientY - dragged.y) * size.height) / dragged.height / view.scale;
     view.positions[dragged.nodeId] = {
-      x: clamp(dragged.startX + dx, 30, GRAPH_WIDTH - 30),
-      y: clamp(dragged.startY + dy, 30, GRAPH_HEIGHT - 30)
+      x: clamp(dragged.startX + dx, 30, size.width - 30),
+      y: clamp(dragged.startY + dy, 30, size.height - 30)
     };
     updateGraphDom(svg, graphId);
   });
 
   window.addEventListener("pointerup", () => {
+    if (panning) {
+      svg.classList.remove("panning");
+      panning = null;
+    }
     if (!dragged) return;
     svg.querySelector(`[data-node-id="${CSS.escape(dragged.nodeId)}"]`)?.classList.remove("dragging");
     dragged = null;
