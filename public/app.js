@@ -37,8 +37,18 @@ const state = {
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
-const GRAPH_LAYOUT_VERSION = "graph-layout-v9-linked-drag-network";
+const GRAPH_LAYOUT_VERSION = "graph-layout-v10-education-kg";
 const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细分"]);
+const EDUCATION_RELATION_LABELS = {
+  contains: "层级包含",
+  prerequisite: "前置依赖",
+  misconception: "易混淆/迷思概念",
+  "cross-link": "横向关联",
+  assessment: "考察属性",
+  resource: "教学资源",
+  competency: "核心素养",
+  semantic: "语义关联"
+};
 
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
@@ -400,11 +410,19 @@ function renderGraphPage() {
 
 function graphCard(graph) {
   const active = state.selectedGraphId === graph.id ? "active" : "";
+  const graphRagReady = graph.meta?.graphRagReady || graph.meta?.graphRag?.ready;
+  const layerCount = Array.isArray(graph.meta?.ontologyLayers) ? graph.meta.ontologyLayers.length : 0;
+  const relationTypes = Array.isArray(graph.meta?.semanticRelations) ? graph.meta.semanticRelations.length : new Set((graph.links || []).map((link) => link.type || link.label)).size;
   return `
     <article class="list-card ${active}" data-select-graph="${graph.id}">
       <div>
         <h3>${escapeHtml(graph.title)}</h3>
         <p>${escapeHtml(graph.subject)} · 节点 ${graph.nodes.length} · 关系 ${graph.links.length}</p>
+        <div class="graph-badges">
+          ${graphRagReady ? `<span class="graph-badge ready">GraphRAG</span>` : ""}
+          <span class="graph-badge">${layerCount || 5} 维教育图谱</span>
+          <span class="graph-badge">${relationTypes || 1} 类语义关系</span>
+        </div>
         <small>${graph.global ? "已上传总图谱" : "账号私有"} · ${fmtTime(graph.createdAt)}</small>
       </div>
       <div class="row-actions">
@@ -570,7 +588,7 @@ function graphSiblingSpacing(level) {
 }
 
 function isTreeLink(link) {
-  return TREE_LINK_LABELS.has(String(link?.label || link?.relation || ""));
+  return String(link?.type || "") === "contains" || TREE_LINK_LABELS.has(String(link?.label || link?.relation || ""));
 }
 
 function isComplexGraph(graph) {
@@ -581,6 +599,35 @@ function isComplexGraph(graph) {
 
 function graphGroupClass(group) {
   return String(group || "topic").replace(/[^a-zA-Z0-9_-]/g, "") || "topic";
+}
+
+function educationRelationLabel(link) {
+  const type = String(link?.type || "");
+  return link?.typeLabel || EDUCATION_RELATION_LABELS[type] || EDUCATION_RELATION_LABELS.semantic;
+}
+
+function graphMasteryClass(node) {
+  const stateText = String(node?.learnerState?.status || "");
+  const mastery = Number(node?.learnerState?.mastery);
+  if (stateText.includes("未") || (Number.isFinite(mastery) && mastery < 0.35)) return "mastery-low";
+  if (stateText.includes("模糊") || (Number.isFinite(mastery) && mastery < 0.58)) return "mastery-mid";
+  if (stateText.includes("精通") || (Number.isFinite(mastery) && mastery >= 0.82)) return "mastery-expert";
+  return "mastery-high";
+}
+
+function percentText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "未知";
+  return `${Math.round(clamp(number, 0, 1) * 100)}%`;
+}
+
+function resourceTypeLabel(type) {
+  return {
+    "micro-video": "微课",
+    exercise: "练习",
+    "interactive-sim": "互动实验",
+    "worked-example": "例题"
+  }[type] || "资源";
 }
 
 function graphLinkPath(source, target) {
@@ -1080,12 +1127,14 @@ function renderGraphSvg(graph) {
           const level = graphNodeLevel(node, index);
           const radius = size.complex ? graphNetworkRadius(node, index, nodes.length) : graphNodeRadius(node, index);
           const groupClass = graphGroupClass(node.group);
+          const masteryClass = graphMasteryClass(node);
           const label = String(node.label || "");
           const labelLines = graphInnerLabelLines(label, radius, root);
           const lineHeight = root ? 15 : radius >= 42 ? 13 : radius >= 34 ? 11 : 10;
           return `
-            <g class="graph-node level-${level} ${groupClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
+            <g class="graph-node level-${level} ${groupClass} ${masteryClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
               <title>${escapeHtml(label)}</title>
+              <circle r="${radius + 7}" class="mastery-ring"></circle>
               <circle r="${radius}" class="${root ? "root" : groupClass}"></circle>
               ${labelLines.map((line, lineIndex) => {
                 const labelY = (lineIndex - (labelLines.length - 1) / 2) * lineHeight;
@@ -1118,6 +1167,22 @@ function renderGraphNodeModal() {
   const points = enrichedNodePoints(graph, node, context);
   const childLabels = context.children.map((item) => item.label).slice(0, 12);
   const relationLines = context.relationLines.slice(0, 10);
+  const ontology = node.ontology || {};
+  const cognitive = node.cognitive || {};
+  const learner = node.learnerState || {};
+  const assessment = node.assessment || {};
+  const graphRag = node.graphRag || {};
+  const navigation = node.navigation || {};
+  const competencies = Array.isArray(node.competencies) ? node.competencies : [];
+  const resources = Array.isArray(node.resources) ? node.resources : [];
+  const learningPath = graphShortestLearningPath(graph, node, context);
+  const weaknesses = graphWeaknessAttribution(graph, node);
+  const localSubgraph = graphLocalSubgraphSummary(graph, node, context);
+  const graphKeywords = Array.isArray(graphRag.keywords)
+    ? graphRag.keywords
+    : String(graphRag.keywords || node.label).split(/[、，,\s/]+/).filter(Boolean);
+  const mastery = Number(learner.mastery);
+  const masteryWidth = Number.isFinite(mastery) ? clamp(mastery, 0, 1) * 100 : 0;
   return `
     <div class="modal-backdrop">
       <section class="modal graph-node-modal">
@@ -1125,6 +1190,12 @@ function renderGraphNodeModal() {
         <h2>${escapeHtml(node.label)}</h2>
         <p class="hint">${escapeHtml(graph.title)} · ${escapeHtml(graph.subject)}</p>
         ${node.details ? `<p class="answer-box">${escapeHtml(node.details)}</p>` : ""}
+        <div class="node-chip-row">
+          <span class="node-chip">${escapeHtml(ontology.layer || "知识节点")}</span>
+          <span class="node-chip">${escapeHtml(cognitive.bloom || "理解")}层级</span>
+          <span class="node-chip">${escapeHtml(learner.status || "待诊断")} ${percentText(learner.mastery)}</span>
+          ${graph.meta?.graphRagReady || graph.meta?.graphRag?.ready ? `<span class="node-chip strong">GraphRAG 可检索</span>` : ""}
+        </div>
         <div class="node-context-grid">
           <article>
             <strong>知识路径</strong>
@@ -1142,6 +1213,53 @@ function renderGraphNodeModal() {
             <strong>关联数量</strong>
             <p>入边 ${context.incoming.length} 条，出边 ${context.outgoing.length} 条，跨章节 ${context.crossRelations.length} 条。</p>
           </article>
+        </div>
+        <div class="node-edu-grid">
+          <article>
+            <strong>多维本体</strong>
+            <p>领域：${escapeHtml(ontology.domain || graph.subject || "通用")}；类型：${escapeHtml(ontology.type || "knowledge-point")}；父节点：${escapeHtml(ontology.parent || context.parent?.label || "根节点")}。</p>
+          </article>
+          <article>
+            <strong>布鲁姆认知</strong>
+            <p>${escapeHtml(cognitive.objective || `围绕「${node.label}」完成理解、应用和迁移。`)}</p>
+          </article>
+          <article>
+            <strong>学习者认知热力</strong>
+            <div class="mastery-meter"><span style="width:${masteryWidth}%"></span></div>
+            <p>${escapeHtml(learner.status || "待诊断")}，掌握度 ${percentText(learner.mastery)}，权重 ${escapeHtml(learner.weight ?? "待计算")}。${escapeHtml(learner.evidence || "后续可接入做题、提问和停留时间实时更新。")}</p>
+          </article>
+          <article>
+            <strong>考察属性</strong>
+            <p>考频：${escapeHtml(assessment.examFrequency || "待统计")}；难度：${escapeHtml(assessment.difficulty ?? "待统计")}；区分度：${escapeHtml(assessment.discrimination ?? "待统计")}。</p>
+          </article>
+        </div>
+        <div class="node-relations">
+          <h3>核心素养与教学资源</h3>
+          <div class="node-chip-row">${(competencies.length ? competencies : ["问题解决"]).map((item) => `<span class="node-chip">${escapeHtml(item)}</span>`).join("")}</div>
+          ${resources.length ? `
+            <div class="node-resource-list">
+              ${resources.slice(0, 6).map((item) => `
+                <article>
+                  <strong>${escapeHtml(resourceTypeLabel(item.type))}</strong>
+                  <p>${escapeHtml(item.title || "教学资源")}：${escapeHtml(item.use || "用于复习、讲解或迁移练习。")}</p>
+                </article>
+              `).join("")}
+            </div>
+          ` : ""}
+        </div>
+        <div class="node-relations">
+          <h3>GraphRAG 局部子图</h3>
+          <p>检索角色：${escapeHtml(graphRag.retrievalRole || "retrieval-concept")}；关键词：${escapeHtml((graphKeywords.length ? graphKeywords : [node.label]).join("、"))}。</p>
+          <p>局部节点：${escapeHtml(localSubgraph.nodes.join("、") || node.label)}。</p>
+          <p>关系类型：${escapeHtml(localSubgraph.relations.join("、") || "层级包含")}。</p>
+          <p>${escapeHtml(localSubgraph.prompt)}</p>
+        </div>
+        <div class="node-relations">
+          <h3>学习导航与薄弱点归因</h3>
+          <p>最短学习路径：${escapeHtml(learningPath.join(" → ") || node.label)}。</p>
+          <p>薄弱点追溯：${escapeHtml(weaknesses.map((item) => `${item.label}（${item.status}，${percentText(item.mastery)}）`).join("；"))}。</p>
+          <p>${escapeHtml(navigation.shortestPathHint || `优先沿前置依赖和章节关系学习「${node.label}」。`)}</p>
+          <p>${escapeHtml(navigation.weaknessTraceHint || node.misconception || "若相关题目出错，先回看前置节点和易混淆概念。")}</p>
         </div>
         ${relationLines.length ? `
           <div class="node-relations">
@@ -1332,7 +1450,9 @@ function graphNodeContext(graph, node) {
   const relationLines = incoming.concat(outgoing).map((link) => {
     const source = nodesById.get(link.source)?.label || link.source;
     const target = nodesById.get(link.target)?.label || link.target;
-    return `${source} -> ${target}：${link.label || "关联"}`;
+    const type = educationRelationLabel(link);
+    const pedagogy = link.pedagogy ? `，${link.pedagogy}` : "";
+    return `${source} -> ${target}：${link.label || type}（${type}${pedagogy}）`;
   });
   return {
     path,
@@ -1345,18 +1465,106 @@ function graphNodeContext(graph, node) {
   };
 }
 
+function isPrerequisiteLink(link) {
+  const label = String(link?.label || link?.relation || "");
+  return String(link?.type || "") === "prerequisite" || /前置|递进|支撑|驱动|进入|服务/.test(label);
+}
+
+function graphShortestLearningPath(graph, node, context) {
+  const nodesById = new Map((graph.nodes || []).map((item) => [item.id, item]));
+  const prerequisiteByTarget = new Map();
+  (graph.links || []).forEach((link) => {
+    if (!isPrerequisiteLink(link)) return;
+    if (!prerequisiteByTarget.has(link.target)) prerequisiteByTarget.set(link.target, []);
+    prerequisiteByTarget.get(link.target).push(link.source);
+  });
+  const ordered = [];
+  const visited = new Set();
+  const tracePrerequisite = (id, depth = 0) => {
+    if (depth > 6 || visited.has(id)) return;
+    visited.add(id);
+    (prerequisiteByTarget.get(id) || []).forEach((sourceId) => {
+      tracePrerequisite(sourceId, depth + 1);
+      const sourceNode = nodesById.get(sourceId);
+      if (sourceNode) ordered.push(sourceNode.label);
+    });
+  };
+  tracePrerequisite(node.id);
+  (context?.path || []).forEach((item) => ordered.push(item.label));
+  ordered.push(node.label);
+  return uniqueTexts(ordered).slice(-10);
+}
+
+function graphWeaknessAttribution(graph, node) {
+  const nodesById = new Map((graph.nodes || []).map((item) => [item.id, item]));
+  const prerequisiteByTarget = new Map();
+  (graph.links || []).forEach((link) => {
+    if (!isPrerequisiteLink(link)) return;
+    if (!prerequisiteByTarget.has(link.target)) prerequisiteByTarget.set(link.target, []);
+    prerequisiteByTarget.get(link.target).push(link.source);
+  });
+  const visited = new Set([node.id]);
+  const queue = [node.id];
+  const candidates = [];
+  while (queue.length && candidates.length < 12) {
+    const currentId = queue.shift();
+    (prerequisiteByTarget.get(currentId) || []).forEach((sourceId) => {
+      if (visited.has(sourceId)) return;
+      visited.add(sourceId);
+      const sourceNode = nodesById.get(sourceId);
+      if (sourceNode) {
+        candidates.push(sourceNode);
+        queue.push(sourceId);
+      }
+    });
+  }
+  const fallback = candidates.length ? candidates : [node];
+  return fallback
+    .map((item) => ({
+      label: item.label,
+      status: item.learnerState?.status || "待诊断",
+      mastery: Number(item.learnerState?.mastery ?? 0.5)
+    }))
+    .sort((a, b) => a.mastery - b.mastery)
+    .slice(0, 4);
+}
+
+function graphLocalSubgraphSummary(graph, node, context) {
+  const nodesById = new Map((graph.nodes || []).map((item) => [item.id, item]));
+  const neighborIds = new Set([node.id]);
+  (context?.path || []).forEach((item) => neighborIds.add(item.id));
+  (context?.children || []).slice(0, 8).forEach((item) => neighborIds.add(item.id));
+  (context?.incoming || []).concat(context?.outgoing || []).forEach((link) => {
+    neighborIds.add(link.source);
+    neighborIds.add(link.target);
+  });
+  const neighborLabels = Array.from(neighborIds).map((id) => nodesById.get(id)?.label).filter(Boolean);
+  const relationTypes = uniqueTexts((context?.incoming || []).concat(context?.outgoing || []).map(educationRelationLabel));
+  return {
+    nodes: uniqueTexts(neighborLabels).slice(0, 14),
+    relations: relationTypes.slice(0, 8),
+    prompt: node.graphRag?.promptHint || `回答「${node.label}」相关问题时，优先使用当前节点、前置依赖、下级节点和易错提醒。`
+  };
+}
+
 function enrichedNodePoints(graph, node, context) {
   const label = String(node.label || "该节点");
   const parentLabel = context.parent?.label || graph.subject || "当前图谱";
   const childLabels = context.children.map((item) => item.label).slice(0, 8);
   const relationSummary = context.relationLines.slice(0, 5).join("；");
+  const cognitive = node.cognitive || {};
+  const assessment = node.assessment || {};
+  const competencies = Array.isArray(node.competencies) ? node.competencies.join("、") : "";
   const generated = [
     context.path.length ? `知识路径：${context.path.map((item) => item.label).join(" / ")}。` : "",
     `学习定位：「${label}」属于「${parentLabel}」模块，复习时先明确它解决的问题，再看它与相邻节点的关系。`,
+    cognitive.objective ? `认知目标：${cognitive.objective}` : "",
+    competencies ? `核心素养：本节点主要训练${competencies}。` : "",
+    assessment.examFrequency ? `考察属性：考频${assessment.examFrequency}，难度${assessment.difficulty}，区分度${assessment.discrimination}。` : "",
     childLabels.length ? `下级知识点：${childLabels.join("、")}。这些节点可作为展开复习和出题的直接入口。` : `该节点是当前分支的末级知识点，适合用定义、步骤、适用条件和典型题型四个角度复习。`,
     relationSummary ? `图谱关系：${relationSummary}。` : "",
     `掌握要求：能用自己的话解释「${label}」，能说明它和「${parentLabel}」的联系，并能举出一个教材或试题中的应用场景。`,
-    `易错提醒：不要只记节点名称，要同时记录前提条件、数据流或控制流方向，以及它对性能、存储或执行过程的影响。`
+    node.misconception || `易错提醒：不要只记节点名称，要同时记录前提条件、数据流或控制流方向，以及它对性能、存储或执行过程的影响。`
   ];
   return uniqueTexts(generated.concat(node.knowledgePoints || [])).slice(0, 12);
 }

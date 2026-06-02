@@ -66,7 +66,7 @@ function sampleGraph(ownerId, subject, title, global = false) {
   for (let i = 1; i < words.length; i += 1) {
     if (i % 2 === 0) links.push({ source: `n${i}`, target: `n${i + 1}`, label: "支撑" });
   }
-  return {
+  return enhanceGraphForEducation({
     id: uid("graph"),
     ownerId,
     subject,
@@ -77,7 +77,7 @@ function sampleGraph(ownerId, subject, title, global = false) {
     global,
     createdAt: now(),
     updatedAt: now()
-  };
+  });
 }
 
 function createInitialDb() {
@@ -1140,14 +1140,285 @@ function looksLikeComputerOrganization(subject, text) {
   return /计算机组成|组成原理|computer organization|cpu|cache|指令系统|存储系统|总线|中央处理器|输入\/输出|i\/o/.test(source);
 }
 
-function makeGraphNode({ id, label, group, level, knowledgePoints = [], details = "" }) {
+const EDUCATION_COGNITIVE_LEVELS = ["记忆", "理解", "应用", "分析", "评价", "创造"];
+const EDUCATION_COMPETENCIES = ["逻辑推理", "模型建构", "科学探究", "数据意识", "问题解决", "系统思维", "价值判断"];
+const EDUCATION_ONTOLOGY_LAYERS = ["学科知识图谱", "认知能力图谱", "教学资源图谱", "素养与价值图谱", "学习者认知图谱"];
+const EDUCATION_SEMANTIC_RELATIONS = ["contains", "prerequisite", "misconception", "cross-link", "assessment", "resource", "competency", "semantic"];
+const EDUCATION_GRAPHRAG_SCHEMA = ["层级路径", "前置依赖", "下级知识点", "易混淆概念", "教学资源", "考察属性", "学生掌握状态"];
+
+function stableNumber(value, modulo = 100) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0) % modulo;
+}
+
+function inferOntologyType(group, level) {
+  if (level === 0 || group === "root") return "domain-root";
+  if (level === 1 || group === "chapter") return "chapter";
+  if (level === 2 || group === "concept" || group === "topic") return "knowledge-point";
+  return "micro-objective";
+}
+
+function inferCognitiveLevel(label, level = 2) {
+  const text = String(label || "");
+  if (/设计|创造|综合|方案|建构|项目/.test(text)) return "创造";
+  if (/评价|比较|权衡|优劣|性能指标/.test(text)) return "评价";
+  if (/分析|过程|机制|原理|数据流|控制流|地址变换/.test(text)) return "分析";
+  if (/应用|计算|例题|执行|操作|实验|DMA|Cache|CPU/.test(text)) return "应用";
+  if (/概念|结构|功能|分类|特点/.test(text)) return "理解";
+  return EDUCATION_COGNITIVE_LEVELS[Math.min(EDUCATION_COGNITIVE_LEVELS.length - 1, Math.max(0, level + 1))] || "理解";
+}
+
+function inferCompetencies(label, subject = "") {
+  const text = `${subject} ${label}`;
+  const result = [];
+  if (/数学|函数|导数|公式|运算|数制|编码|逻辑/.test(text)) result.push("逻辑推理");
+  if (/物理|实验|探究|I\/O|总线|Cache|CPU|系统|结构/.test(text)) result.push("科学探究", "模型建构");
+  if (/数据|存储|地址|编码|图|表|统计/.test(text)) result.push("数据意识");
+  if (/方案|应用|题|问题|执行|性能/.test(text)) result.push("问题解决");
+  if (/组成|系统|层次|网络|架构|总线|计算机/.test(text)) result.push("系统思维");
+  if (!result.length) result.push(EDUCATION_COMPETENCIES[stableNumber(text, EDUCATION_COMPETENCIES.length)]);
+  return Array.from(new Set(result)).slice(0, 3);
+}
+
+function inferNodeResources(label, subject = "") {
+  const topic = String(label || "知识点");
+  return [
+    { type: "micro-video", title: `${topic} 5 分钟微课`, use: "课前预习或错题后快速回看" },
+    { type: "exercise", title: `${topic} 分层练习`, use: "基础题、迁移题、综合题逐级检测" },
+    { type: /实验|CPU|Cache|总线|I\/O|物理|系统/.test(`${subject}${topic}`) ? "interactive-sim" : "worked-example", title: `${topic} 互动模型/例题`, use: "把抽象过程可视化，支撑应用与分析" }
+  ];
+}
+
+function inferAssessment(label, level = 2) {
+  const seed = stableNumber(label, 100);
+  const difficulty = Math.min(0.95, Math.max(0.18, 0.25 + level * 0.13 + seed / 420));
+  return {
+    examFrequency: seed > 72 ? "高频" : seed > 38 ? "中频" : "低频",
+    difficulty: Number(difficulty.toFixed(2)),
+    discrimination: Number(Math.min(0.92, 0.35 + difficulty * 0.58).toFixed(2))
+  };
+}
+
+function inferLearnerState(label, level = 2) {
+  const seed = stableNumber(label, 100);
+  const states = ["未掌握", "模糊", "基本掌握", "精通"];
+  const index = level <= 1 ? 2 : seed > 72 ? 1 : seed > 42 ? 2 : seed > 18 ? 0 : 3;
+  const mastery = [0.18, 0.42, 0.68, 0.9][index];
+  return {
+    status: states[index],
+    mastery,
+    heat: Number((1 - mastery).toFixed(2)),
+    weight: Number((1 + level * 0.18 + (100 - seed) / 180).toFixed(2)),
+    evidence: "依据节点层级、知识点关系和模拟学习行为生成，可接入真实做题/提问/停留时间实时更新。"
+  };
+}
+
+function relationTypeLabel(type) {
+  return {
+    contains: "层级包含",
+    prerequisite: "前置依赖",
+    misconception: "易混淆/迷思概念",
+    "cross-link": "横向关联",
+    assessment: "考察属性",
+    resource: "教学资源",
+    competency: "核心素养",
+    semantic: "语义关联"
+  }[type] || "语义关联";
+}
+
+function educationalNodeProfile({ label, group, level, subject, parentLabel, details }) {
+  return {
+    ontology: {
+      domain: subject || "通用",
+      type: inferOntologyType(group, level),
+      parent: parentLabel || "",
+      layer: level === 0 ? "学科根" : level === 1 ? "章" : level === 2 ? "节/知识点" : "考点/微目标"
+    },
+    cognitive: {
+      bloom: inferCognitiveLevel(label, level),
+      objective: `学生能够围绕「${label}」完成${inferCognitiveLevel(label, level)}层级的解释、迁移或问题解决。`
+    },
+    resources: inferNodeResources(label, subject),
+    competencies: inferCompetencies(label, subject),
+    assessment: inferAssessment(label, level),
+    learnerState: inferLearnerState(label, level),
+    graphRag: {
+      retrievalRole: level <= 1 ? "context-anchor" : level === 2 ? "retrieval-concept" : "evidence-node",
+      keywords: Array.from(new Set(String(label || "").split(/[、，,\s/]+/).filter(Boolean))).slice(0, 6),
+      contextSchema: EDUCATION_GRAPHRAG_SCHEMA,
+      subgraphQuery: "向上取层级路径，向下取 1-2 层子节点，同时取 prerequisite、misconception、cross-link 关系。",
+      promptHint: `回答与「${label}」相关问题时，优先提取它的前置依赖、下级节点、易混淆点、典型例题和资源节点。`
+    },
+    navigation: {
+      learningPathRole: level <= 1 ? "路径锚点" : level === 2 ? "核心学习节点" : "补救/考点节点",
+      shortestPathHint: `从当前已掌握节点到「${label}」时，优先沿前置依赖和章节包含关系生成最短学习路径。`,
+      weaknessTraceHint: `若「${label}」相关题目出错，沿 prerequisite 入边向前追溯低掌握度节点，定位真正薄弱点。`
+    },
+    misconception: /易错|混淆|问题|错误|风险/.test(`${label}${details || ""}`)
+      ? `学生容易把「${label}」与相邻概念边界混淆，应先比较定义、条件和适用场景。`
+      : `学习「${label}」时要避免只背名称，应同时说明条件、过程、例题和相邻关系。`
+  };
+}
+
+function makeGraphNode({ id, label, group, level, knowledgePoints = [], details = "", subject = "", parentLabel = "" }) {
+  const profile = educationalNodeProfile({ label, group, level, subject, parentLabel, details });
   return {
     id,
     label,
     group,
     level,
     details,
-    knowledgePoints: knowledgePoints.filter(Boolean).map((point) => String(point).slice(0, 180))
+    knowledgePoints: knowledgePoints.filter(Boolean).map((point) => String(point).slice(0, 180)),
+    ...profile
+  };
+}
+
+function educationalLink(link, index = 0) {
+  const rawLabel = String(link.label || link.relation || "关联");
+  let type = String(link.type || "");
+  if (!type) {
+    if (/包含|章节|模块|细分/.test(rawLabel)) type = "contains";
+    else if (/前置|递进|支撑|驱动|进入|服务/.test(rawLabel)) type = "prerequisite";
+    else if (/易混|迷思|常见问题|易错/.test(rawLabel)) type = "misconception";
+    else if (/考|高频|难度|区分度/.test(rawLabel)) type = "assessment";
+    else if (/跨|关联|连接|响应|参与|缓解/.test(rawLabel)) type = "cross-link";
+    else type = "semantic";
+  }
+  return {
+    source: String(link.source),
+    target: String(link.target),
+    label: rawLabel,
+    type,
+    typeLabel: relationTypeLabel(type),
+    weight: Number.isFinite(Number(link.weight)) ? Number(link.weight) : Number((0.55 + stableNumber(`${link.source}-${link.target}-${rawLabel}`, 40) / 100).toFixed(2)),
+    pedagogy: link.pedagogy || (
+      type === "prerequisite" ? "学习路径规划和薄弱点归因优先使用"
+        : type === "misconception" ? "用于提前预警常见错误概念"
+          : type === "assessment" ? "用于考频、难度和区分度分析"
+            : type === "cross-link" ? "用于跨章节/跨学科迁移"
+              : "用于层级上下文组织"
+    )
+  };
+}
+
+function isContainsEducationLink(link) {
+  return String(link.type || "") === "contains" || /包含|章节|模块|细分|一级/.test(String(link.label || link.relation || ""));
+}
+
+function graphEducationStats(nodes, links) {
+  const countBy = (items, getter) => items.reduce((acc, item) => {
+    const key = getter(item) || "未知";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    ontology: countBy(nodes, (node) => node.ontology?.layer),
+    cognitive: countBy(nodes, (node) => node.cognitive?.bloom),
+    learnerState: countBy(nodes, (node) => node.learnerState?.status),
+    relationTypes: countBy(links, (link) => link.type)
+  };
+}
+
+function enhanceGraphForEducation(graph) {
+  const nodes = graph.nodes || [];
+  const nodeMap = new Map(nodes.map((node) => [String(node.id), node]));
+  const parentByChild = new Map();
+  (graph.links || []).forEach((link) => {
+    if (isContainsEducationLink(link) && !parentByChild.has(String(link.target))) {
+      parentByChild.set(String(link.target), String(link.source));
+    }
+  });
+  const enhancedNodes = nodes.map((node, index) => {
+    const id = String(node.id || `n${index}`);
+    const label = String(node.label || node.name || `节点${index + 1}`);
+    const level = Number.isFinite(Number(node.level)) ? Number(node.level) : index === 0 ? 0 : undefined;
+    const parent = nodeMap.get(parentByChild.get(id));
+    const profile = educationalNodeProfile({
+      label,
+      group: node.group || "topic",
+      level: Number.isFinite(Number(level)) ? Number(level) : 2,
+      subject: graph.subject,
+      parentLabel: parent?.label || "",
+      details: node.details
+    });
+    return {
+      ...node,
+      id,
+      label,
+      group: String(node.group || "topic"),
+      level,
+      details: String(node.details || ""),
+      knowledgePoints: Array.isArray(node.knowledgePoints) ? node.knowledgePoints.map(String) : [],
+      ontology: { ...profile.ontology, ...(node.ontology || {}) },
+      cognitive: { ...profile.cognitive, ...(node.cognitive || {}) },
+      resources: Array.isArray(node.resources) && node.resources.length ? node.resources : profile.resources,
+      competencies: Array.isArray(node.competencies) && node.competencies.length ? node.competencies : profile.competencies,
+      assessment: { ...profile.assessment, ...(node.assessment || {}) },
+      learnerState: { ...profile.learnerState, ...(node.learnerState || {}) },
+      graphRag: { ...profile.graphRag, ...(node.graphRag || {}) },
+      navigation: { ...profile.navigation, ...(node.navigation || {}) },
+      misconception: node.misconception || profile.misconception
+    };
+  });
+  const enhancedLinks = (graph.links || []).map(educationalLink);
+  const existing = new Set(enhancedLinks.map((link) => `${link.source}->${link.target}:${link.type}`));
+  const childrenByParent = new Map();
+  enhancedLinks.forEach((link) => {
+    if (!["contains"].includes(link.type)) return;
+    if (!childrenByParent.has(link.source)) childrenByParent.set(link.source, []);
+    childrenByParent.get(link.source).push(link.target);
+  });
+  childrenByParent.forEach((children) => {
+    children.forEach((target, index) => {
+      if (index === 0) return;
+      const source = children[index - 1];
+      const key = `${source}->${target}:prerequisite`;
+      if (!existing.has(key)) {
+        enhancedLinks.push(educationalLink({ source, target, label: "前置依赖", type: "prerequisite" }));
+        existing.add(key);
+      }
+    });
+  });
+  enhancedNodes.forEach((node) => {
+    if (!/易错|常见问题|混淆|误区|小结/.test(String(node.label))) return;
+    const parentId = parentByChild.get(node.id);
+    if (!parentId) return;
+    const key = `${parentId}->${node.id}:misconception`;
+    if (!existing.has(key)) {
+      enhancedLinks.push(educationalLink({ source: parentId, target: node.id, label: "易混淆/迷思概念", type: "misconception" }));
+      existing.add(key);
+    }
+  });
+  const educationStats = graphEducationStats(enhancedNodes, enhancedLinks);
+  return {
+    ...graph,
+    nodes: enhancedNodes,
+    links: enhancedLinks,
+    meta: {
+      ...(graph.meta || {}),
+      educationModel: "Domain KG + Cognitive KG + Resource KG + Competency KG + Learner State KG",
+      graphRagReady: true,
+      ontologyLayers: EDUCATION_ONTOLOGY_LAYERS,
+      semanticRelations: EDUCATION_SEMANTIC_RELATIONS,
+      graphRag: {
+        ready: true,
+        localSubgraphExtraction: true,
+        contextSchema: EDUCATION_GRAPHRAG_SCHEMA,
+        hallucinationControl: "优先用局部子图、前置依赖、例题资源和节点证据组织大模型上下文。"
+      },
+      navigation: {
+        shortestLearningPath: true,
+        weaknessAttribution: true,
+        dynamicLearnerOverlay: true
+      },
+      stats: educationStats,
+      updatedBy: "education-kg-enricher"
+    }
   };
 }
 
@@ -1178,6 +1449,7 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
     label: "计算机组成原理",
     group: "root",
     level: 0,
+    subject: cleanSubject,
     details: `由${sourceName || "教材内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`,
     knowledgePoints: [
       "围绕数据表示、存储系统、指令系统、CPU、总线与 I/O 建立计算机硬件系统知识主线。",
@@ -1193,6 +1465,8 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
       label: chapter.label,
       group: "chapter",
       level: 1,
+      subject: cleanSubject,
+      parentLabel: "计算机组成原理",
       details: chapter.details,
       knowledgePoints: chapter.points
     }));
@@ -1211,6 +1485,8 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
         label,
         group: sectionIndex % 2 === 0 ? "concept" : "topic",
         level: 2,
+        subject: cleanSubject,
+        parentLabel: chapter.label,
         details: `「${chapter.label}」下的核心知识点：${label}`,
         knowledgePoints: points.length ? points : knowledgePointsForKeyword(sourceText, label)
       }));
@@ -1227,6 +1503,8 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
           label: childLabel,
           group: "detail",
           level: 3,
+          subject: cleanSubject,
+          parentLabel: label,
           details: `「${chapter.label} > ${label}」下的三级知识点：${childLabel}`,
           knowledgePoints: childPoints
         }));
@@ -1245,7 +1523,7 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
     ["c7s3", "c3s2", "直接访问主存"],
     ["c3s1", "c5s1", "服务 CPU 访存"]
   ].forEach(([source, target, label]) => links.push({ source, target, label }));
-  return {
+  return enhanceGraphForEducation({
     id: uid("graph"),
     ownerId,
     subject: cleanSubject,
@@ -1257,7 +1535,7 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
     global: false,
     createdAt: now(),
     updatedAt: now()
-  };
+  });
 }
 
 function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction }) {
@@ -1267,44 +1545,49 @@ function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, e
     return buildComputerOrganizationGraph({ ownerId, title, subject: cleanSubject, sourceName, sourceText: graphSourceText, extraction });
   }
   const keywords = extractKeywords(graphSourceText, cleanSubject);
-  const nodes = [{
+  const nodes = [makeGraphNode({
     id: "n0",
     label: `${cleanSubject}知识主线`,
     group: "root",
     level: 0,
+    subject: cleanSubject,
     knowledgePoints: splitKnowledgeSentences(graphSourceText).slice(0, 6),
     details: `由${sourceName || "输入内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`
-  }];
+  })];
   const links = [];
   const groups = [];
   for (let i = 0; i < keywords.length; i += 3) groups.push(keywords.slice(i, i + 3));
   groups.forEach((group, groupIndex) => {
     const chapterId = `g${groupIndex + 1}`;
     const chapterLabel = group[0] || `模块${groupIndex + 1}`;
-    nodes.push({
+    nodes.push(makeGraphNode({
       id: chapterId,
       label: chapterLabel,
       group: "chapter",
       level: 1,
+      subject: cleanSubject,
+      parentLabel: `${cleanSubject}知识主线`,
       knowledgePoints: knowledgePointsForKeyword(graphSourceText, chapterLabel),
       details: `从书本内容中抽取的一级模块：「${chapterLabel}」。`
-    });
+    }));
     links.push({ source: "n0", target: chapterId, label: "一级模块" });
     group.slice(1).forEach((keyword, sectionIndex) => {
       const nodeId = `${chapterId}s${sectionIndex + 1}`;
-      nodes.push({
+      nodes.push(makeGraphNode({
         id: nodeId,
         label: keyword,
         group: sectionIndex % 2 === 0 ? "concept" : "topic",
         level: 2,
+        subject: cleanSubject,
+        parentLabel: chapterLabel,
         knowledgePoints: knowledgePointsForKeyword(graphSourceText, keyword),
         details: `从书本内容和补充知识点中抽取的「${keyword}」相关知识。`
-      });
+      }));
       links.push({ source: chapterId, target: nodeId, label: "包含" });
     });
     if (groupIndex > 0) links.push({ source: `g${groupIndex}`, target: chapterId, label: "递进" });
   });
-  return {
+  return enhanceGraphForEducation({
     id: uid("graph"),
     ownerId,
     subject: cleanSubject,
@@ -1316,7 +1599,7 @@ function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, e
     global: false,
     createdAt: now(),
     updatedAt: now()
-  };
+  });
 }
 
 function validateGraph(raw, fallback) {
@@ -1324,7 +1607,7 @@ function validateGraph(raw, fallback) {
   if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.links)) {
     throw Object.assign(new Error("图谱 JSON 需要包含 nodes 和 links 数组"), { status: 400 });
   }
-  return {
+  const sanitized = {
     id: uid("graph"),
     ownerId: fallback.ownerId,
     subject: normalizeSubject(graph.subject || fallback.subject),
@@ -1339,17 +1622,31 @@ function validateGraph(raw, fallback) {
       x: Number.isFinite(Number(node.x)) ? Number(node.x) : undefined,
       y: Number.isFinite(Number(node.y)) ? Number(node.y) : undefined,
       details: String(node.details || ""),
-      knowledgePoints: Array.isArray(node.knowledgePoints) ? node.knowledgePoints.map(String) : []
+      knowledgePoints: Array.isArray(node.knowledgePoints) ? node.knowledgePoints.map(String) : [],
+      ontology: node.ontology && typeof node.ontology === "object" ? node.ontology : undefined,
+      cognitive: node.cognitive && typeof node.cognitive === "object" ? node.cognitive : undefined,
+      resources: Array.isArray(node.resources) ? node.resources : undefined,
+      competencies: Array.isArray(node.competencies) ? node.competencies.map(String) : undefined,
+      assessment: node.assessment && typeof node.assessment === "object" ? node.assessment : undefined,
+      learnerState: node.learnerState && typeof node.learnerState === "object" ? node.learnerState : undefined,
+      graphRag: node.graphRag && typeof node.graphRag === "object" ? node.graphRag : undefined,
+      navigation: node.navigation && typeof node.navigation === "object" ? node.navigation : undefined,
+      misconception: node.misconception ? String(node.misconception) : undefined
     })),
     links: graph.links.map((link) => ({
       source: String(link.source),
       target: String(link.target),
-      label: String(link.label || link.relation || "关联")
+      label: String(link.label || link.relation || "关联"),
+      type: link.type ? String(link.type) : undefined,
+      typeLabel: link.typeLabel ? String(link.typeLabel) : undefined,
+      weight: Number.isFinite(Number(link.weight)) ? Number(link.weight) : undefined,
+      pedagogy: link.pedagogy ? String(link.pedagogy) : undefined
     })),
     global: false,
     createdAt: now(),
     updatedAt: now()
   };
+  return enhanceGraphForEducation(sanitized);
 }
 
 function processGraphGenerationJob(jobId, payload) {
@@ -1554,7 +1851,9 @@ function getRelevantState(db, userId) {
   return {
     user: publicUser(user),
     users: db.users.map(publicUser),
-    knowledgeGraphs: db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global),
+    knowledgeGraphs: db.knowledgeGraphs
+      .filter((graph) => graph.ownerId === userId || graph.global)
+      .map((graph) => enhanceGraphForEducation(graph)),
     conversations: db.conversations.filter((conv) => conv.userId === userId),
     models: db.models.filter((model) => model.ownerId === userId),
     friends: db.friendships.filter((item) => item.userId === userId).map((item) => publicUser(getUser(db, item.friendId))).filter(Boolean),
@@ -1637,7 +1936,7 @@ async function handleApi(req, res, pathname, searchParams) {
     ensureUser(db, userId);
     let graphs = db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global);
     if (subject) graphs = graphs.filter((graph) => graph.subject === subject);
-    return send(res, 200, { ok: true, graphs });
+    return send(res, 200, { ok: true, graphs: graphs.map((graph) => enhanceGraphForEducation(graph)) });
   }
 
   if (method === "POST" && pathname === "/api/uploads/start") {
@@ -1806,14 +2105,14 @@ async function handleApi(req, res, pathname, searchParams) {
     graph.global = true;
     graph.updatedAt = now();
     writeDb(db);
-    return send(res, 200, { ok: true, graph });
+    return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
 
   params = routePattern(pathname, "/api/graphs/:id");
   if (method === "GET" && params) {
     const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
     if (!graph) return notFound(res);
-    return send(res, 200, { ok: true, graph });
+    return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
   if (method === "DELETE" && params) {
     const userId = searchParams.get("userId");
