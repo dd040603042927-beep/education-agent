@@ -24,6 +24,7 @@ const PDF_LIMITS = {
   maxCollectedStreamChars: 14 * 1024 * 1024,
   maxExtractedTextChars: 260000
 };
+const PDF_AGENT_TIMEOUT_MS = Math.max(4 * 60 * 1000, Number(process.env.PDF_AGENT_TIMEOUT_MS || 20 * 60 * 1000));
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const graphJobs = new Map();
@@ -645,7 +646,12 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
     const python = resolvePythonCommand();
     const child = spawn(python, [scriptPath, filePath, outputPath, String(maxChars)], {
       windowsHide: true,
-      cwd: ROOT
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PYTHONUTF8: "1",
+        PYTHONIOENCODING: "utf-8"
+      }
     });
     let stdout = "";
     let stderrBuffer = "";
@@ -653,8 +659,8 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
     const startedAt = Date.now();
     const timeout = setTimeout(() => {
       child.kill();
-      reject(new Error("高级 PDF 智能体解析超时，请尝试拆分 PDF 或减少页数后重试"));
-    }, 4 * 60 * 1000);
+      reject(new Error("高级 PDF/OCR 智能体解析超时，请尝试拆分 PDF、减少 OCR 页数，或设置 PDF_AGENT_OCR_MAX_PAGES 后重试"));
+    }, PDF_AGENT_TIMEOUT_MS);
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -709,7 +715,7 @@ async function extractUploadedBookFile({ name = "上传书本", type = "", fileP
   if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
     try {
       const advanced = await runAdvancedPdfAgent({ filePath, maxChars: PDF_LIMITS.maxExtractedTextChars }, onProgress);
-      if (advanced.text.trim().length >= 20) {
+      if (advanced.text.trim().length >= 20 || advanced.meta?.ocrUsed) {
         return {
           text: advanced.text,
           meta: {
@@ -727,7 +733,7 @@ async function extractUploadedBookFile({ name = "上传书本", type = "", fileP
     }
 
     if (size > PDF_LIMITS.maxFileBytes) {
-      throw new Error("高级 PDF 智能体未能识别文本，且文件过大，无法使用轻量解析兜底。请确认 PDF 是否为扫描版，或接入 OCR 后再处理。");
+      throw new Error("高级 PDF/OCR 智能体未能识别到可用文本，且文件过大，无法使用轻量解析兜底。请确认 PaddleOCR 环境可用，或先粘贴目录/知识点后再处理。");
     }
     const buffer = fs.readFileSync(filePath);
     return extractUploadedBookBuffer({ name, type, buffer }, onProgress);
@@ -847,18 +853,24 @@ function processGraphGenerationJob(jobId, payload) {
         status: "running",
         stage: "解析文件",
         progress: 22,
-        message: payload.file?.filePath || payload.file?.buffer?.length ? "正在解析上传文件文本层" : "正在读取输入内容"
+        message: payload.file?.filePath || payload.file?.buffer?.length ? "正在解析上传文件，扫描版 PDF 会自动尝试 OCR" : "正在读取输入内容"
       });
 
       const uploaded = payload.file?.filePath
         ? await extractUploadedBookFile(payload.file, (stats) => {
+          const totalPages = Number(stats.pages || 0);
+          const currentPage = Number(stats.page || 0);
+          const isOcrStage = String(stats.stage || "").startsWith("ocr") || /OCR/i.test(String(stats.method || ""));
+          const pdfPageInfo = stats.pdfPage
+            ? `（PDF 第 ${stats.pdfPage}${stats.pdfPages ? `/${stats.pdfPages}` : ""} 页）`
+            : "";
           updateGraphJob(jobId, {
-            progress: stats.pages
-              ? Math.min(62, 24 + Math.floor((Number(stats.page || 0) / Math.max(1, Number(stats.pages))) * 38))
+            progress: totalPages
+              ? Math.min(62, 24 + Math.floor((currentPage / Math.max(1, totalPages)) * 38))
               : Math.min(58, 26 + Math.floor(Number(stats.scannedStreams || 0) / 30)),
-            message: stats.pages
-              ? `${stats.method || "PDF 智能体"} 正在解析第 ${stats.page}/${stats.pages} 页，已识别 ${stats.characters || 0} 字符`
-              : (stats.message || `已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`)
+            message: stats.message || (totalPages
+              ? `${stats.method || "PDF 智能体"} 正在${isOcrStage ? "OCR" : "解析"}第 ${currentPage}/${totalPages} 页${pdfPageInfo}，已识别 ${stats.characters || 0} 字符`
+              : (stats.message || `已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`))
           });
         })
         : payload.file?.buffer?.length
@@ -882,7 +894,7 @@ function processGraphGenerationJob(jobId, payload) {
       const sourceText = limitText([uploaded.text, payload.sourceText].filter(Boolean).join("\n\n"));
       const isPdf = payload.file && (String(payload.file.type || "").includes("pdf") || String(payload.file.name || "").toLowerCase().endsWith(".pdf"));
       if (isPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim()) {
-        throw new Error("未识别到 PDF 文本层。该文件可能是扫描版图片 PDF，请补充目录/知识点，或后续接入 OCR 后再解析。");
+        throw new Error("PDF 文本层和 OCR 都未识别到可用于生成图谱的内容。请确认本机 PaddleOCR 可用，或在补充目录/知识点中粘贴章节信息后再生成。");
       }
 
       updateGraphJob(jobId, { stage: "构建图谱", progress: 82, message: "正在生成节点、关系和节点知识点" });

@@ -417,6 +417,10 @@ function renderGraphProgress() {
     complete: "已完成",
     failed: "失败"
   }[job.status] || job.status;
+  const extraction = job.meta?.extraction;
+  const ocrInfo = extraction?.stats?.ocrUsed
+    ? `；OCR 页数：${extraction.stats.ocrPages || 0}/${extraction.stats.ocrPlannedPages || extraction.stats.ocrTotalPdfPages || 0}`
+    : "";
   return `
     <section class="progress-card ${job.status}">
       <div class="split-head">
@@ -429,7 +433,7 @@ function renderGraphProgress() {
         <span>${clamp(Number(job.progress || 0), 0, 100)}%</span>
       </div>
       <p>${escapeHtml(job.error || job.message || "")}</p>
-      ${job.meta?.extraction ? `<small>解析工具：${escapeHtml(job.meta.extraction.method || job.meta.extractor || "PDF 文本解析智能体")}；识别字符：${job.meta.extraction.characters || 0}；文件大小：${formatBytes(job.meta.extraction.size || job.meta.fileSize || 0)}</small>` : ""}
+      ${extraction ? `<small>解析工具：${escapeHtml(extraction.method || extraction.extractor || "PDF/OCR 解析智能体")}；识别字符：${extraction.characters || 0}；文件大小：${formatBytes(extraction.size || extraction.fileSize || 0)}${ocrInfo}</small>` : ""}
     </section>
   `;
 }
@@ -458,13 +462,13 @@ function renderTeacherGraphPage() {
           </div>
           <label>内容识别工具
             <select name="extractor">
-              <option value="advanced-python-pdf-agent">高级 PDF 智能体（PyMuPDF/pypdf，推荐）</option>
+              <option value="advanced-python-pdf-agent">高级 PDF/OCR 智能体（PyMuPDF/PaddleOCR，推荐）</option>
               <option value="local-pdf-text-agent">轻量 PDF 文本解析智能体</option>
               <option value="outline-fusion-agent">目录与补充内容融合工具</option>
             </select>
           </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
-          <p class="hint">大 PDF 会自动分块上传；后端优先使用高级 PDF 智能体读取文本层，再生成图谱。扫描版图片 PDF 需要后续接入 OCR。</p>
+          <p class="hint">大 PDF 会自动分块上传；后端优先读取 PDF 文本层，扫描版图片 PDF 会自动调用本地 OCR，耗时会比普通 PDF 更长。</p>
           <label>补充目录或知识点<textarea name="sourceText" rows="5" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系"></textarea></label>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
