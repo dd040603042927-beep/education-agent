@@ -694,6 +694,11 @@ p {
   stroke: #c98a32;
 }
 
+.graph-node circle.detail {
+  fill: #f6f4fb;
+  stroke: #7467a8;
+}
+
 .graph-node {
   cursor: grab;
 }
@@ -719,6 +724,11 @@ p {
 .graph-node text.root {
   fill: #fff;
   font-size: 13px;
+}
+
+.graph-node.level-3 text {
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .graph-node text.small {

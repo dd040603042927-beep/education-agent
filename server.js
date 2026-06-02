@@ -13,9 +13,11 @@ const DATA_DIR = path.join(ROOT, "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const MAX_BODY_SIZE = 30 * 1024 * 1024;
-const MAX_UPLOAD_SIZE = 512 * 1024 * 1024;
+const MAX_UPLOAD_SIZE = Number(process.env.MAX_UPLOAD_SIZE_BYTES || Number.MAX_SAFE_INTEGER);
 const MAX_UPLOAD_CHUNK_SIZE = 12 * 1024 * 1024;
 const MAX_GRAPH_SOURCE_CHARS = 320000;
+const AI_UNLIMITED_EXTRACTOR = "ai-unlimited-pdf-graph-agent";
+const AI_AGENT_TIMEOUT_MS = Math.max(60 * 1000, Number(process.env.AI_PDF_AGENT_TIMEOUT_MS || 8 * 60 * 1000));
 const PDF_LIMITS = {
   maxFileBytes: 300 * 1024 * 1024,
   maxStreams: 1400,
@@ -284,6 +286,14 @@ function limitText(text, maxLength = MAX_GRAPH_SOURCE_CHARS) {
   const head = value.slice(0, Math.floor(maxLength * 0.72));
   const tail = value.slice(-Math.floor(maxLength * 0.28));
   return `${head}\n\n……中间超长内容已截断，保留开头和结尾用于生成图谱……\n\n${tail}`;
+}
+
+function isAiUnlimitedExtractor(extractor) {
+  return String(extractor || "") === AI_UNLIMITED_EXTRACTOR;
+}
+
+function hasConfiguredUploadLimit() {
+  return Number.isFinite(MAX_UPLOAD_SIZE) && MAX_UPLOAD_SIZE < Number.MAX_SAFE_INTEGER;
 }
 
 function createGraphJob(meta = {}) {
@@ -674,7 +684,7 @@ function resolvePythonCommand() {
   return "python";
 }
 
-function runAdvancedPdfAgent({ filePath, maxChars, jobId }, onProgress = () => {}) {
+function runAdvancedPdfAgent({ filePath, maxChars, jobId, envOverrides = {}, timeoutMs = PDF_AGENT_TIMEOUT_MS }, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     if (jobId) assertGraphJobActive(jobId);
     const scriptPath = path.join(ROOT, "scripts", "pdf_text_agent.py");
@@ -686,7 +696,8 @@ function runAdvancedPdfAgent({ filePath, maxChars, jobId }, onProgress = () => {
       env: {
         ...process.env,
         PYTHONUTF8: "1",
-        PYTHONIOENCODING: "utf-8"
+        PYTHONIOENCODING: "utf-8",
+        ...envOverrides
       }
     });
     let stdout = "";
@@ -704,7 +715,7 @@ function runAdvancedPdfAgent({ filePath, maxChars, jobId }, onProgress = () => {
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error("高级 PDF/OCR 智能体解析超时，请尝试拆分 PDF、减少 OCR 页数，或设置 PDF_AGENT_OCR_MAX_PAGES 后重试"));
-    }, PDF_AGENT_TIMEOUT_MS);
+    }, Math.max(60 * 1000, Number(timeoutMs || PDF_AGENT_TIMEOUT_MS)));
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -759,10 +770,79 @@ function runAdvancedPdfAgent({ filePath, maxChars, jobId }, onProgress = () => {
   });
 }
 
-async function extractUploadedBookFile({ name = "上传书本", type = "", filePath }, onProgress = () => {}, jobId = null) {
+async function extractUploadedBookFile({ name = "上传书本", type = "", filePath, extractor = "", subject = "", sourceText = "" }, onProgress = () => {}, jobId = null) {
   const size = fs.statSync(filePath).size;
   const lowerName = name.toLowerCase();
+  const aiUnlimited = isAiUnlimitedExtractor(extractor);
   if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
+    if (aiUnlimited) {
+      onProgress({
+        method: AI_UNLIMITED_EXTRACTOR,
+        stage: "ai-start",
+        pages: 0,
+        page: 0,
+        characters: 0,
+        message: "AI 自动图谱智能体正在分块读取 PDF 线索，优先融合文本层、目录、补充内容和文件名"
+      });
+      try {
+        const advanced = await runAdvancedPdfAgent({
+          filePath,
+          maxChars: Math.min(PDF_LIMITS.maxExtractedTextChars, 160000),
+          jobId,
+          timeoutMs: AI_AGENT_TIMEOUT_MS,
+          envOverrides: {
+            PDF_AGENT_OCR_MAX_PAGES: String(process.env.AI_PDF_AGENT_OCR_MAX_PAGES || 10),
+            PDF_AGENT_OCR_LEADING_PAGES: String(process.env.AI_PDF_AGENT_OCR_LEADING_PAGES || 10),
+            PDF_AGENT_OCR_SCALE: String(process.env.AI_PDF_AGENT_OCR_SCALE || 1.25)
+          }
+        }, onProgress);
+        return {
+          text: advanced.text,
+          meta: {
+            name,
+            type,
+            size,
+            method: AI_UNLIMITED_EXTRACTOR,
+            characters: advanced.text.length,
+            stats: {
+              ...advanced.meta,
+              extractor,
+              subject,
+              suppliedOutlineCharacters: String(sourceText || "").length,
+              fallbackReady: advanced.text.trim().length < 20
+            }
+          }
+        };
+      } catch (error) {
+        if (error.canceled) throw error;
+        onProgress({
+          method: AI_UNLIMITED_EXTRACTOR,
+          stage: "ai-fallback",
+          pages: 0,
+          page: 0,
+          characters: 0,
+          message: `AI 自动图谱智能体未取得稳定文本，改用目录/学科/文件名融合生成：${error.message}`
+        });
+        return {
+          text: "",
+          meta: {
+            name,
+            type,
+            size,
+            method: AI_UNLIMITED_EXTRACTOR,
+            characters: 0,
+            stats: {
+              extractor,
+              subject,
+              suppliedOutlineCharacters: String(sourceText || "").length,
+              fallbackReady: true,
+              errors: [error.message]
+            }
+          }
+        };
+      }
+    }
+
     try {
       const advanced = await runAdvancedPdfAgent({ filePath, maxChars: PDF_LIMITS.maxExtractedTextChars, jobId }, onProgress);
       if (advanced.text.trim().length >= 20 || advanced.meta?.ocrUsed) {
@@ -831,76 +911,233 @@ function extractKeywords(text, subject) {
 const COMPUTER_ORG_OUTLINE = [
   {
     label: "计算机系统概述",
-    points: ["计算机层次结构", "冯·诺依曼结构", "硬件与软件接口", "性能指标"],
-    details: "建立整门课程的系统视角，理解计算机由硬件、系统软件和应用软件协同完成信息处理。",
+    points: ["计算机发展历程", "系统层次结构", "硬件与软件接口", "性能指标"],
+    details: "对应目录第 1 章，建立计算机系统整体视角，理解硬件、软件、层次结构、工作原理和性能评价。",
     sections: [
-      ["层次结构", ["硬件层、操作系统层、语言处理层和应用层逐级抽象。", "ISA 是软件和硬件之间的重要接口。"]],
-      ["性能指标", ["主频、CPI、MIPS、FLOPS、吞吐率和响应时间需要结合场景解释。"]],
-      ["冯·诺依曼结构", ["运算器、控制器、存储器、输入设备、输出设备构成基本结构。"]]
+      {
+        label: "计算机发展历程",
+        points: ["理解硬件和软件的发展脉络，建立系统演进视角。"],
+        children: ["计算机硬件的发展", "计算机软件的发展"]
+      },
+      {
+        label: "计算机系统层次结构",
+        points: ["计算机系统由硬件系统和软件系统共同组成。", "ISA 是软件和硬件之间的重要接口。"],
+        children: ["计算机系统的组成", "计算机硬件", "计算机软件", "计算机系统的层次结构", "计算机系统的工作原理"]
+      },
+      {
+        label: "计算机的性能指标",
+        points: ["主频、时钟周期、CPI、MIPS、FLOPS、吞吐率和响应时间需要结合场景解释。"],
+        children: ["计算机的主要性能指标", "几个专业术语"]
+      },
+      {
+        label: "本章小结",
+        points: ["用系统组成、层次结构和性能指标串联本章。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   },
   {
-    label: "数据表示与运算",
-    points: ["进位计数制", "定点数与浮点数", "补码运算", "校验码"],
-    details: "解决数据如何在机器中编码、存储和参与算术逻辑运算的问题。",
+    label: "数据的表示和运算",
+    points: ["数制与编码", "定点数", "运算电路", "浮点数"],
+    details: "对应目录第 2 章，解决数据如何在机器中编码、存储和参与算术逻辑运算的问题。",
     sections: [
-      ["数制与编码", ["二进制、八进制、十六进制之间可按位分组转换。", "BCD、ASCII、汉字编码属于常见数据编码。"]],
-      ["定点数", ["原码、反码、补码和移码关注符号位、表示范围与加减运算规则。"]],
-      ["浮点数", ["阶码、尾数、规格化、舍入和溢出共同决定浮点数表示能力。"]],
-      ["校验码", ["奇偶校验、海明码和 CRC 用于发现或纠正传输与存储错误。"]]
+      {
+        label: "数制与编码",
+        points: ["二进制、八进制、十六进制之间可按位分组转换。", "整数类型转换需要关注位宽、符号扩展和截断。"],
+        children: ["进位计数制及其相互转换", "定点数的编码表示", "整数的表示", "C 语言中的整数类型及类型转换"]
+      },
+      {
+        label: "运算方法和运算电路",
+        points: ["基本运算部件、移位、加减、乘除共同构成定点运算基础。"],
+        children: ["基本运算部件", "定点数的移位运算", "定点数的加减运算", "定点数的乘除运算"]
+      },
+      {
+        label: "浮点数的表示与运算",
+        points: ["阶码、尾数、规格化、舍入和溢出共同决定浮点数表示能力。"],
+        children: ["浮点数的表示", "浮点数的加减运算", "C 语言中的浮点数类型", "数据的大小端和对齐存储"]
+      },
+      {
+        label: "本章小结",
+        points: ["从数制编码、定点运算、浮点运算和存储布局形成数据表示主线。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   },
   {
     label: "存储系统",
     points: ["存储层次", "主存储器", "Cache", "虚拟存储器"],
-    details: "围绕容量、速度、成本之间的矛盾建立多级存储层次。",
+    details: "对应目录第 3 章，围绕容量、速度、成本之间的矛盾建立多级存储层次。",
     sections: [
-      ["存储层次", ["寄存器、Cache、主存、辅存构成由快到慢、由小到大的层次。"]],
-      ["主存储器", ["SRAM、DRAM、ROM、地址译码和存储扩展是主存设计核心。"]],
-      ["Cache", ["局部性原理、映射方式、替换算法和写策略影响命中率。"]],
-      ["虚拟存储器", ["页式、段式、段页式管理通过地址变换扩展逻辑地址空间。"]]
+      {
+        label: "存储器概述",
+        points: ["寄存器、Cache、主存、辅存构成由快到慢、由小到大的层次。"],
+        children: ["存储器的分类", "存储器的性能指标", "多级层次的存储系统"]
+      },
+      {
+        label: "主存储器",
+        points: ["SRAM、DRAM、ROM、地址译码和多模块结构是主存设计核心。"],
+        children: ["SRAM 芯片和 DRAM 芯片", "只读存储器", "主存储器的基本组成", "多模块存储器"]
+      },
+      {
+        label: "主存储器与 CPU 的连接",
+        points: ["主存与 CPU 的连接要处理容量扩展、地址分配、片选和数据线连接。"],
+        children: ["连接原理", "主存容量的扩展", "存储芯片的地址分配和片选", "存储器与 CPU 的连接"]
+      },
+      {
+        label: "外部存储器",
+        points: ["外存关注非易失、大容量和较慢访问速度。"],
+        children: ["磁盘存储器", "固态硬盘"]
+      },
+      {
+        label: "高速缓冲存储器",
+        points: ["局部性原理、映射方式、替换算法和一致性问题影响 Cache 命中率。"],
+        children: ["程序访问的局部性原理", "Cache 的基本工作原理", "Cache 和主存的映射方式", "Cache 中主存块的替换算法", "Cache 的一致性问题"]
+      },
+      {
+        label: "虚拟存储器",
+        points: ["页式、段式、段页式管理通过地址变换扩展逻辑地址空间。"],
+        children: ["虚拟存储器的基本概念", "页式虚拟存储器", "段式虚拟存储器", "段页式虚拟存储器", "虚拟存储器与 Cache 的比较"]
+      },
+      {
+        label: "本章小结",
+        points: ["从存储层次、主存、Cache 和虚拟存储器串联访存路径。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   },
   {
     label: "指令系统",
-    points: ["指令格式", "寻址方式", "CISC 与 RISC", "程序执行"],
-    details: "说明机器指令如何描述操作、操作数位置以及处理器需要执行的动作。",
+    points: ["指令格式", "寻址方式", "机器级代码", "CISC 与 RISC"],
+    details: "对应目录第 4 章，说明机器指令如何描述操作、操作数位置以及处理器需要执行的动作。",
     sections: [
-      ["指令格式", ["操作码、地址码、寻址特征和指令长度共同决定指令表达能力。"]],
-      ["寻址方式", ["立即、直接、间接、寄存器、变址、基址和相对寻址影响访存过程。"]],
-      ["CISC/RISC", ["CISC 指令复杂且类型多，RISC 强调简单指令、流水线和寄存器利用。"]],
-      ["程序执行", ["取指、译码、执行、访存、写回构成典型指令执行过程。"]]
+      {
+        label: "指令系统",
+        points: ["操作码、地址码、寻址特征和指令长度共同决定指令表达能力。"],
+        children: ["指令集体系结构", "指令的基本格式", "定长操作码指令格式", "扩展操作码指令格式", "指令的操作类型"]
+      },
+      {
+        label: "指令的寻址方式",
+        points: ["指令寻址和数据寻址决定操作数定位与访存过程。"],
+        children: ["指令寻址和数据寻址", "常见的数据寻址方式"]
+      },
+      {
+        label: "程序的机器级代码表示",
+        points: ["汇编指令、选择语句、循环语句和过程调用对应机器级执行过程。"],
+        children: ["常用汇编指令介绍", "选择语句的机器级表示", "循环语句的机器级表示", "过程调用的机器级表示"]
+      },
+      {
+        label: "CISC 和 RISC 的基本概念",
+        points: ["CISC 指令复杂且类型多，RISC 强调简单指令、流水线和寄存器利用。"],
+        children: ["复杂指令系统计算机（CISC）", "精简指令系统计算机（RISC）", "CISC 和 RISC 的比较"]
+      },
+      {
+        label: "本章小结",
+        points: ["把指令格式、寻址、机器级程序和体系结构风格连接到 CPU 执行。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   },
   {
     label: "中央处理器",
-    points: ["运算器", "控制器", "数据通路", "指令流水线"],
-    details: "关注 CPU 内部如何组织数据流、控制流，并高效完成指令执行。",
+    points: ["CPU 结构", "指令执行", "数据通路", "控制器", "流水线"],
+    details: "对应目录第 5 章，关注 CPU 内部如何组织数据流、控制流，并高效完成指令执行。",
     sections: [
-      ["CPU 结构", ["ALU、寄存器组、控制器、内部总线和状态寄存器构成基本 CPU。"]],
-      ["数据通路", ["组合逻辑、时序逻辑、寄存器传送和多路选择器共同组织数据流。"]],
-      ["控制器", ["硬布线控制速度快，微程序控制灵活，二者适合不同设计目标。"]],
-      ["流水线", ["结构相关、数据相关和控制相关会影响流水线吞吐率。"]],
-      ["异常与中断", ["异常源于处理器执行过程，中断通常来自外设或外部事件。"]]
+      {
+        label: "CPU 的功能和基本结构",
+        points: ["ALU、寄存器组、控制器、内部总线和状态寄存器构成基本 CPU。"],
+        children: ["CPU 的功能", "CPU 的基本结构", "CPU 的寄存器"]
+      },
+      {
+        label: "指令执行过程",
+        points: ["取指、译码、执行、访存、写回构成典型指令周期。"],
+        children: ["指令周期", "指令周期的数据流", "执行方案"]
+      },
+      {
+        label: "数据通路的功能和基本结构",
+        points: ["组合逻辑、时序逻辑、寄存器传送和多路选择器共同组织数据流。"],
+        children: ["数据通路的功能", "数据通路的组成", "数据通路的基本结构", "数据通路的操作举例"]
+      },
+      {
+        label: "控制器的功能和工作原理",
+        points: ["硬布线控制速度快，微程序控制灵活，二者适合不同设计目标。"],
+        children: ["控制器的结构和功能", "硬布线控制器", "微程序控制器"]
+      },
+      {
+        label: "异常和中断机制",
+        points: ["异常源于处理器执行过程，中断通常来自外设或外部事件。"],
+        children: ["异常和中断的基本概念", "异常和中断的分类", "异常和中断的处理"]
+      },
+      {
+        label: "指令流水线",
+        points: ["结构冒险、数据冒险和控制冒险会影响流水线吞吐率。"],
+        children: ["指令流水线的基本概念", "流水线的基本实现", "流水线的冒险与处理", "流水线的性能指标", "高级流水线技术"]
+      },
+      {
+        label: "多处理器的基本概念",
+        points: ["多处理器通过并行结构提升吞吐能力。"],
+        children: ["SISD、SIMD、MIMD 的基本概念", "硬件多线程的基本概念", "多核处理器的基本概念", "共享内存多处理器的基本概念"]
+      },
+      {
+        label: "本章小结",
+        points: ["把 CPU 结构、控制、数据通路、流水线和并行处理串成执行主线。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   },
   {
-    label: "总线与输入输出",
-    points: ["总线结构", "I/O 接口", "中断", "DMA"],
-    details: "处理主机与外设、存储设备之间的数据传送和控制协调。",
+    label: "总线",
+    points: ["总线概念", "总线分类", "系统总线结构", "总线仲裁"],
+    details: "对应目录第 6 章，处理计算机各部件之间共享通信、仲裁、定时和性能评价。",
     sections: [
-      ["总线", ["数据总线、地址总线、控制总线通过仲裁和定时完成共享通信。"]],
-      ["I/O 接口", ["接口完成地址译码、数据缓冲、状态保存和控制命令交互。"]],
-      ["程序查询", ["CPU 主动轮询设备状态，实现简单但效率较低。"]],
-      ["中断方式", ["外设请求 CPU 响应，中断向量和优先级决定服务过程。"]],
-      ["DMA", ["DMA 控制器绕开 CPU 直接在外设与内存之间传送数据。"]]
+      {
+        label: "总线概述",
+        points: ["数据总线、地址总线、控制总线通过仲裁和定时完成共享通信。"],
+        children: ["总线的基本概念", "总线的分类", "系统总线的结构", "常见的总线标准", "总线的性能指标"]
+      },
+      {
+        label: "总线仲裁",
+        points: ["总线事务和总线定时决定共享总线的访问顺序和传输节拍。"],
+        children: ["总线事务", "总线定时"]
+      },
+      {
+        label: "本章小结",
+        points: ["用结构、标准、性能、仲裁和定时总结总线系统。"],
+        children: ["常见问题和易混淆知识点"]
+      }
+    ]
+  },
+  {
+    label: "输入/输出系统",
+    points: ["I/O 系统", "外部设备", "I/O 接口", "I/O 方式"],
+    details: "对应目录第 7 章，处理主机与外部设备之间的数据传送、接口编址、中断和 DMA。",
+    sections: [
+      {
+        label: "I/O 系统基本概念",
+        points: ["I/O 系统把外部设备、接口和控制方式纳入主机数据通路。"],
+        children: ["输入/输出系统", "外部设备", "I/O 控制方式"]
+      },
+      {
+        label: "I/O 接口",
+        points: ["接口完成地址译码、数据缓冲、状态保存和控制命令交互。"],
+        children: ["I/O 接口的功能", "I/O 接口的基本结构", "I/O 端口及其编址", "I/O 端口及其地址"]
+      },
+      {
+        label: "I/O 方式",
+        points: ["程序查询、中断和 DMA 分别代表不同 CPU 参与程度的数据传送方式。"],
+        children: ["程序查询方式", "程序中断方式", "DMA 方式"]
+      },
+      {
+        label: "本章小结",
+        points: ["用外设、接口、端口编址、查询、中断和 DMA 串联 I/O 系统。"],
+        children: ["常见问题和易混淆知识点"]
+      }
     ]
   }
 ];
 
 function looksLikeComputerOrganization(subject, text) {
   const source = `${subject} ${text}`.toLowerCase();
-  return /计算机组成|组成原理|computer organization|cpu|cache|指令系统|存储系统|总线|中央处理器/.test(source);
+  return /计算机组成|组成原理|computer organization|cpu|cache|指令系统|存储系统|总线|中央处理器|输入\/输出|i\/o/.test(source);
 }
 
 function makeGraphNode({ id, label, group, level, knowledgePoints = [], details = "" }) {
@@ -912,6 +1149,16 @@ function makeGraphNode({ id, label, group, level, knowledgePoints = [], details 
     details,
     knowledgePoints: knowledgePoints.filter(Boolean).map((point) => String(point).slice(0, 180))
   };
+}
+
+function fallbackOutlinePoints(label, parentLabel = "") {
+  const topic = String(label || "知识点");
+  const parent = String(parentLabel || "本模块");
+  return [
+    `掌握「${topic}」的基本概念、适用条件和常见考法。`,
+    `理解「${topic}」在「${parent}」中的位置，并能和相邻知识点建立联系。`,
+    `复习时关注定义、结构关系、计算规则或执行流程中的易混淆点。`
+  ];
 }
 
 function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, sourceText, extraction }) {
@@ -926,7 +1173,7 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
     knowledgePoints: [
       "围绕数据表示、存储系统、指令系统、CPU、总线与 I/O 建立计算机硬件系统知识主线。",
       "重点关注各部件之间的数据流、控制流、地址变换和性能影响。",
-      "适合用于计算机组成原理教材复习、章节串联和试题定位。"
+      "适合用于 26 王道《计算机组成原理》教材复习、章节串联和试题定位。"
     ]
   })];
   const links = [];
@@ -941,7 +1188,14 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
       knowledgePoints: chapter.points
     }));
     links.push({ source: rootId, target: chapterId, label: "一级章节" });
-    chapter.sections.forEach(([label, points], sectionIndex) => {
+    chapter.sections.forEach((rawSection, sectionIndex) => {
+      const section = Array.isArray(rawSection)
+        ? { label: rawSection[0], points: rawSection[1] || [], children: [] }
+        : rawSection;
+      const label = section.label;
+      const points = Array.isArray(section.points) && section.points.length
+        ? section.points
+        : fallbackOutlinePoints(label, chapter.label);
       const sectionId = `${chapterId}s${sectionIndex + 1}`;
       nodes.push(makeGraphNode({
         id: sectionId,
@@ -952,16 +1206,34 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
         knowledgePoints: points.length ? points : knowledgePointsForKeyword(sourceText, label)
       }));
       links.push({ source: chapterId, target: sectionId, label: "包含" });
+      (section.children || []).forEach((rawChild, childIndex) => {
+        const child = typeof rawChild === "string" ? { label: rawChild } : rawChild;
+        const childLabel = child.label || `知识点${childIndex + 1}`;
+        const childId = `${sectionId}k${childIndex + 1}`;
+        const childPoints = Array.isArray(child.points) && child.points.length
+          ? child.points
+          : fallbackOutlinePoints(childLabel, label);
+        nodes.push(makeGraphNode({
+          id: childId,
+          label: childLabel,
+          group: "detail",
+          level: 3,
+          details: `「${chapter.label} > ${label}」下的三级知识点：${childLabel}`,
+          knowledgePoints: childPoints
+        }));
+        links.push({ source: sectionId, target: childId, label: "细分" });
+      });
     });
   });
   [
-    ["c2s2", "c5s1", "支撑运算器"],
-    ["c2s3", "c5s2", "影响数据通路"],
-    ["c3s3", "c5s4", "提升流水线效率"],
-    ["c4s1", "c5s3", "驱动控制器"],
-    ["c4s2", "c3s4", "参与地址变换"],
-    ["c5s5", "c6s4", "响应外部事件"],
-    ["c6s5", "c3s2", "直接访问主存"],
+    ["c2s2", "c5s3", "支撑数据通路"],
+    ["c2s3", "c5s3", "进入数据通路"],
+    ["c3s5", "c5s6", "缓解访存瓶颈"],
+    ["c4s1", "c5s2", "驱动执行过程"],
+    ["c4s2", "c3s6", "参与地址变换"],
+    ["c5s5", "c7s3", "响应外部事件"],
+    ["c6s2", "c7s2", "连接 I/O 接口"],
+    ["c7s3", "c3s2", "直接访问主存"],
     ["c3s1", "c5s1", "服务 CPU 访存"]
   ].forEach(([source, target, label]) => links.push({ source, target, label }));
   return {
@@ -981,7 +1253,7 @@ function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, s
 
 function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction }) {
   const cleanSubject = normalizeSubject(subject);
-  const graphSourceText = limitText(sourceText || title || sourceName || "");
+  const graphSourceText = limitText([sourceText, title, sourceName].filter(Boolean).join("\n\n"));
   if (looksLikeComputerOrganization(cleanSubject, graphSourceText)) {
     return buildComputerOrganizationGraph({ ownerId, title, subject: cleanSubject, sourceName, sourceText: graphSourceText, extraction });
   }
@@ -1074,16 +1346,24 @@ function validateGraph(raw, fallback) {
 function processGraphGenerationJob(jobId, payload) {
   setImmediate(async () => {
     try {
+      const aiUnlimited = isAiUnlimitedExtractor(payload.extractor);
       assertGraphJobActive(jobId);
       updateGraphJob(jobId, {
         status: "running",
-        stage: "解析文件",
+        stage: aiUnlimited ? "AI 识别文件" : "解析文件",
         progress: 22,
-        message: payload.file?.filePath || payload.file?.buffer?.length ? "正在解析上传文件，扫描版 PDF 会自动尝试 OCR" : "正在读取输入内容"
+        message: payload.file?.filePath || payload.file?.buffer?.length
+          ? (aiUnlimited ? "AI 自动图谱智能体正在分块读取 PDF，扫描版会做有限 OCR 并融合目录线索" : "正在解析上传文件，扫描版 PDF 会自动尝试 OCR")
+          : "正在读取输入内容"
       });
 
       const uploaded = payload.file?.filePath
-        ? await extractUploadedBookFile(payload.file, (stats) => {
+        ? await extractUploadedBookFile({
+          ...payload.file,
+          extractor: payload.extractor,
+          subject: payload.subject,
+          sourceText: payload.sourceText
+        }, (stats) => {
           if (isGraphJobCanceled(jobId)) return;
           const totalPages = Number(stats.pages || 0);
           const currentPage = Number(stats.page || 0);
@@ -1115,14 +1395,22 @@ function processGraphGenerationJob(jobId, payload) {
         stage: "抽取知识点",
         progress: 66,
         message: uploaded.meta
-          ? `文本识别完成，识别 ${uploaded.meta.characters} 个字符`
+          ? (aiUnlimited && !uploaded.meta.characters
+            ? "AI 自动图谱智能体已进入目录、学科和文件名融合生成"
+            : `文本识别完成，识别 ${uploaded.meta.characters} 个字符`)
           : "正在根据补充内容抽取知识点",
         meta: { ...graphJobs.get(jobId).meta, extraction: uploaded.meta }
       });
 
-      const sourceText = limitText([uploaded.text, payload.sourceText].filter(Boolean).join("\n\n"));
+      const sourceText = limitText([
+        uploaded.text,
+        payload.sourceText,
+        aiUnlimited ? payload.subject : "",
+        aiUnlimited ? payload.title : "",
+        aiUnlimited ? payload.sourceName : ""
+      ].filter(Boolean).join("\n\n"));
       const isPdf = payload.file && (String(payload.file.type || "").includes("pdf") || String(payload.file.name || "").toLowerCase().endsWith(".pdf"));
-      if (isPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim()) {
+      if (isPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim() && !aiUnlimited) {
         throw new Error("PDF 文本层和 OCR 都未识别到可用于生成图谱的内容。请确认本机 PaddleOCR 可用，或在补充目录/知识点中粘贴章节信息后再生成。");
       }
 
@@ -1350,7 +1638,7 @@ async function handleApi(req, res, pathname, searchParams) {
     ensureUser(db, body.userId);
     const size = Number(body.size || 0);
     if (!Number.isFinite(size) || size <= 0) return sendError(res, 400, "文件大小不正确");
-    if (size > MAX_UPLOAD_SIZE) {
+    if (hasConfiguredUploadLimit() && size > MAX_UPLOAD_SIZE) {
       return sendError(res, 413, `上传文件过大，当前限制为 ${Math.round(MAX_UPLOAD_SIZE / 1024 / 1024)}MB`);
     }
     const session = createUploadSession({
@@ -1388,7 +1676,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const subject = normalizeSubject(body.subject);
     const title = body.title || `${subject}知识图谱`;
     const sourceName = body.sourceName || session.fileName;
-    const extractor = body.extractor || "advanced-python-pdf-agent";
+    const extractor = body.extractor || AI_UNLIMITED_EXTRACTOR;
     const job = createGraphJob({
       subject,
       title,
@@ -1437,7 +1725,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const title = searchParams.get("title") || `${subject}知识图谱`;
     const sourceText = searchParams.get("sourceText") || "";
     const sourceName = searchParams.get("sourceName") || "上传书本";
-    const extractor = searchParams.get("extractor") || "local-pdf-text-agent";
+    const extractor = searchParams.get("extractor") || AI_UNLIMITED_EXTRACTOR;
     assertRequired({ userId, subject }, ["userId", "subject"]);
     ensureUser(db, userId);
     const buffer = await readBinaryBody(req, MAX_UPLOAD_SIZE);

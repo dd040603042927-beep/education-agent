@@ -35,8 +35,8 @@ node server.js
 - 学生端：学科知识图谱、发起对话、历史对话、模型显示、聊天信息、作业提交、个人信息。
 - 知识图谱：生成、JSON 导入、SVG 渲染、导出、删除、上传总图谱。
 - 图谱交互：支持按钮/滚轮缩放、节点拖拽、双击节点查看该节点下的知识点。
-- 书本识别：教师端可输入任意学科名称；上传 PDF 时使用本地 PDF/OCR 智能体抽取文本层内容，扫描版图片 PDF 会自动调用本机 PaddleOCR，并和补充知识点一起生成图谱。
-- 大文件处理：PDF 上传改为 6MB 分块上传和后台任务，不再把文件转成 Base64 JSON；生成时显示上传、解析、抽取、生成、保存进度，并对过大文件、图片流、解压输出和文本量做限制。
+- 书本识别：教师端可输入任意学科名称；上传 PDF 时默认使用 AI 自动图谱智能体抽取文本层内容，扫描版图片 PDF 会做有限 OCR，并和目录、文件名、补充知识点一起生成图谱。
+- 大文件处理：PDF 上传改为 6MB 分块上传和后台任务，默认不再设置固定总上传大小，不把文件转成 Base64 JSON；生成时显示上传、解析、抽取、生成、保存进度，并对单个分块、图片流、解压输出和文本量做保护。
 - 高级 PDF/OCR 智能体：后端优先调用 Python 的 PyMuPDF 读取 PDF 文本层，失败时再尝试 pdfplumber、pypdf；如果文本层不足，会用 PyMuPDF 渲染页面并调用 PaddleOCR 识别扫描版内容，最后才回退到 Node 轻量解析器。
 - AI 对话：按讲解/出题/方案或学习方向生成回答，并保存历史。
 - 模型显示：拖拉组件构建学科模型，支持真实/理想状态、保存、下载、删除。
@@ -46,4 +46,4 @@ node server.js
 
 数据保存在 `data/db.json`，首次启动会自动生成演示数据。
 
-说明：默认上传上限为 512MB，项目已忽略 `*.pdf`，避免把教材文件误提交到 GitHub。扫描版 PDF 的 OCR 默认最多识别 80 页，其中优先识别前 40 页并抽样后续页面，可通过 `PDF_AGENT_OCR_MAX_PAGES`、`PDF_AGENT_OCR_LEADING_PAGES`、`PDF_AGENT_OCR_SCALE`、`PDF_AGENT_TIMEOUT_MS` 调整。
+说明：项目已忽略 `*.pdf`，避免把教材文件误提交到 GitHub。默认 AI 自动图谱智能体不限制总文件大小，但仍采用 6MB 分块上传和有限文本/OCR 处理来防止浏览器或后端崩溃；如需人为设置总上传上限，可配置 `MAX_UPLOAD_SIZE_BYTES`。扫描版 PDF 的高级 OCR 工具默认最多识别 80 页，其中优先识别前 40 页并抽样后续页面，可通过 `PDF_AGENT_OCR_MAX_PAGES`、`PDF_AGENT_OCR_LEADING_PAGES`、`PDF_AGENT_OCR_SCALE`、`PDF_AGENT_TIMEOUT_MS` 调整；AI 自动图谱智能体可通过 `AI_PDF_AGENT_OCR_MAX_PAGES`、`AI_PDF_AGENT_OCR_LEADING_PAGES`、`AI_PDF_AGENT_TIMEOUT_MS` 单独调节。

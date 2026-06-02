@@ -1,5 +1,6 @@
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
+const DEFAULT_GRAPH_EXTRACTOR = "ai-unlimited-pdf-graph-agent";
 
 const state = {
   user: null,
@@ -26,7 +27,7 @@ const state = {
     subject: "",
     title: "",
     sourceText: "",
-    extractor: "advanced-python-pdf-agent"
+    extractor: DEFAULT_GRAPH_EXTRACTOR
   },
   graphUploadAbort: null,
   graphGenerationCanceled: false,
@@ -34,8 +35,8 @@ const state = {
 };
 
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
-const GRAPH_WIDTH = 1180;
-const GRAPH_HEIGHT = 760;
+const GRAPH_WIDTH = 1340;
+const GRAPH_HEIGHT = 1180;
 
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
@@ -478,13 +479,14 @@ function renderTeacherGraphPage() {
           </div>
           <label>内容识别工具
             <select name="extractor">
-              <option value="advanced-python-pdf-agent" ${(draft.extractor || "advanced-python-pdf-agent") === "advanced-python-pdf-agent" ? "selected" : ""}>高级 PDF/OCR 智能体（PyMuPDF/PaddleOCR，推荐）</option>
+              <option value="ai-unlimited-pdf-graph-agent" ${(draft.extractor || DEFAULT_GRAPH_EXTRACTOR) === "ai-unlimited-pdf-graph-agent" ? "selected" : ""}>AI 自动图谱智能体（不限总文件大小，目录/OCR 融合）</option>
+              <option value="advanced-python-pdf-agent" ${draft.extractor === "advanced-python-pdf-agent" ? "selected" : ""}>高级 PDF/OCR 智能体（PyMuPDF/PaddleOCR）</option>
               <option value="local-pdf-text-agent" ${draft.extractor === "local-pdf-text-agent" ? "selected" : ""}>轻量 PDF 文本解析智能体</option>
               <option value="outline-fusion-agent" ${draft.extractor === "outline-fusion-agent" ? "selected" : ""}>目录与补充内容融合工具</option>
             </select>
           </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
-          <p class="hint">大 PDF 会自动分块上传；后端优先读取 PDF 文本层，扫描版图片 PDF 会自动调用本地 OCR，耗时会比普通 PDF 更长。</p>
+          <p class="hint">大 PDF 会自动分块上传；AI 自动图谱智能体不设固定总上传大小，优先读取文本层，扫描版会做有限 OCR 并融合目录/文件名/补充知识点防止崩溃。</p>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
             <button class="ghost" type="button" id="sampleGraphBtn">生成示例</button>
@@ -555,7 +557,14 @@ function graphNodeRadius(node, index) {
   const level = graphNodeLevel(node, index);
   if (level === 0 || node.group === "root") return 52;
   if (level === 1 || node.group === "chapter") return 42;
-  return 34;
+  if (level === 2) return 34;
+  return 28;
+}
+
+function graphSiblingSpacing(level) {
+  if (level === 1) return 140;
+  if (level === 2) return 58;
+  return 30;
 }
 
 function graphGroupClass(group) {
@@ -598,7 +607,7 @@ function getGraphView(graph) {
   const nodes = graph.nodes || [];
   const signature = nodes.map((node, index) => `${node.id}:${graphNodeLevel(node, index)}:${node.x || ""}:${node.y || ""}`).join("|");
   if (!state.graphViews[graph.id] || state.graphViews[graph.id].signature !== signature) {
-    state.graphViews[graph.id] = { scale: 0.88, offsetX: 0, offsetY: 0, positions: {}, signature };
+    state.graphViews[graph.id] = { scale: 0.72, offsetX: 0, offsetY: 0, positions: {}, signature };
   }
   const view = state.graphViews[graph.id];
   const parents = graphParentMap(graph);
@@ -627,10 +636,13 @@ function getGraphView(graph) {
     const parentPosition = parentId ? view.positions[parentId] : null;
     if (level === 0) {
       y = height / 2;
+    } else if (level === 1) {
+      const step = (height - 160) / Math.max(1, levelNodes.length - 1);
+      y = 80 + levelIndex * step;
     } else if (parentPosition) {
       const siblings = levelNodes.filter((item) => parents.get(item.node.id) === parentId);
       const siblingIndex = siblings.findIndex((item) => item.node.id === node.id);
-      y = parentPosition.y + (siblingIndex - (siblings.length - 1) / 2) * 34;
+      y = parentPosition.y + (siblingIndex - (siblings.length - 1) / 2) * graphSiblingSpacing(level);
     } else {
       const step = (height - 140) / Math.max(1, levelNodes.length - 1);
       y = 70 + levelIndex * step;
@@ -846,7 +858,7 @@ function emptyGraphDraft() {
     subject: "",
     title: "",
     sourceText: "",
-    extractor: "advanced-python-pdf-agent"
+    extractor: DEFAULT_GRAPH_EXTRACTOR
   };
 }
 
@@ -857,7 +869,7 @@ function captureGraphDraft(form) {
     subject: String(data.get("subject") || ""),
     title: String(data.get("title") || ""),
     sourceText: String(data.get("sourceText") || sourceTextControl?.value || ""),
-    extractor: String(data.get("extractor") || "advanced-python-pdf-agent")
+    extractor: String(data.get("extractor") || DEFAULT_GRAPH_EXTRACTOR)
   };
 }
 
@@ -1137,7 +1149,7 @@ function bindGraphPage() {
     const file = form.get("book");
     let sourceText = String(state.graphDraft.sourceText || "");
     let sourceName = "";
-    const extractor = String(form.get("extractor") || "local-pdf-text-agent");
+    const extractor = String(form.get("extractor") || DEFAULT_GRAPH_EXTRACTOR);
     if (file && file.name) {
       sourceName = file.name;
     }
