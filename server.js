@@ -3,18 +3,21 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
+const { spawn } = require("child_process");
 
 const PORT = Number(process.env.PORT || 5107);
 const HOST = "127.0.0.1";
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const MAX_BODY_SIZE = 30 * 1024 * 1024;
-const MAX_UPLOAD_SIZE = 120 * 1024 * 1024;
+const MAX_UPLOAD_SIZE = 512 * 1024 * 1024;
+const MAX_UPLOAD_CHUNK_SIZE = 12 * 1024 * 1024;
 const MAX_GRAPH_SOURCE_CHARS = 320000;
 const PDF_LIMITS = {
-  maxFileBytes: 100 * 1024 * 1024,
+  maxFileBytes: 300 * 1024 * 1024,
   maxStreams: 1400,
   maxCompressedStreamBytes: 12 * 1024 * 1024,
   maxInflatedStreamBytes: 5 * 1024 * 1024,
@@ -24,6 +27,7 @@ const PDF_LIMITS = {
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const graphJobs = new Map();
+const uploadSessions = new Map();
 
 function now() {
   return new Date().toISOString();
@@ -35,6 +39,7 @@ function uid(prefix) {
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
 function sampleGraph(ownerId, subject, title, global = false) {
@@ -327,6 +332,69 @@ function cleanupGraphJobs() {
   }
 }
 
+function sanitizeFileName(name) {
+  return String(name || "upload.pdf").replace(/[\\/:*?"<>|]/g, "_").slice(0, 160);
+}
+
+function createUploadSession({ userId, fileName, fileType, size }) {
+  ensureDataDir();
+  const uploadId = uid("upload");
+  const safeName = sanitizeFileName(fileName);
+  const filePath = path.join(UPLOAD_DIR, `${uploadId}_${safeName}`);
+  const session = {
+    id: uploadId,
+    userId,
+    fileName: safeName,
+    fileType: String(fileType || "application/octet-stream"),
+    size: Number(size || 0),
+    received: 0,
+    chunks: 0,
+    filePath,
+    createdAt: now(),
+    updatedAt: now()
+  };
+  fs.writeFileSync(filePath, Buffer.alloc(0));
+  uploadSessions.set(uploadId, session);
+  return session;
+}
+
+function getUploadSession(uploadId) {
+  const session = uploadSessions.get(uploadId);
+  if (!session) throw Object.assign(new Error("上传会话不存在或已过期"), { status: 404 });
+  return session;
+}
+
+function publicUploadSession(session) {
+  return {
+    id: session.id,
+    fileName: session.fileName,
+    fileType: session.fileType,
+    size: session.size,
+    received: session.received,
+    chunks: session.chunks,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt
+  };
+}
+
+function cleanupUploadSession(uploadId, removeFile = true) {
+  const session = uploadSessions.get(uploadId);
+  if (!session) return;
+  uploadSessions.delete(uploadId);
+  if (removeFile) {
+    try {
+      fs.unlinkSync(session.filePath);
+    } catch {}
+  }
+}
+
+function cleanupUploadSessions() {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, session] of uploadSessions.entries()) {
+    if (new Date(session.updatedAt).getTime() < cutoff) cleanupUploadSession(id, true);
+  }
+}
+
 function decodeDataUrl(dataUrl) {
   const raw = String(dataUrl || "");
   const commaIndex = raw.indexOf(",");
@@ -565,6 +633,109 @@ function extractUploadedBookBuffer({ name = "上传书本", type = "", buffer },
   return { text, meta: { name, type, method, characters: text.length, size: buffer.length, stats } };
 }
 
+function resolvePythonCommand() {
+  if (process.env.PDF_AGENT_PYTHON) return process.env.PDF_AGENT_PYTHON;
+  return "python";
+}
+
+function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = path.join(ROOT, "scripts", "pdf_text_agent.py");
+    const outputPath = path.join(UPLOAD_DIR, `${uid("pdftext")}.txt`);
+    const python = resolvePythonCommand();
+    const child = spawn(python, [scriptPath, filePath, outputPath, String(maxChars)], {
+      windowsHide: true,
+      cwd: ROOT
+    });
+    let stdout = "";
+    let stderrBuffer = "";
+    let stderrFull = "";
+    const startedAt = Date.now();
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error("高级 PDF 智能体解析超时，请尝试拆分 PDF 或减少页数后重试"));
+    }, 4 * 60 * 1000);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      stderrFull += text;
+      stderrBuffer += text;
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() || "";
+      lines.forEach((line) => {
+        if (!line.startsWith("PROGRESS ")) return;
+        try {
+          onProgress(JSON.parse(line.slice("PROGRESS ".length)));
+        } catch {}
+      });
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(stderrFull.trim() || `高级 PDF 智能体退出码：${code}`));
+        return;
+      }
+      try {
+        const meta = JSON.parse(stdout.trim() || "{}");
+        const text = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8") : "";
+        try {
+          fs.unlinkSync(outputPath);
+        } catch {}
+        resolve({
+          text: normalizeExtractedText(text).slice(0, maxChars),
+          meta: {
+            ...meta,
+            method: meta.method || "advanced-python-pdf-agent",
+            durationMs: Date.now() - startedAt
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function extractUploadedBookFile({ name = "上传书本", type = "", filePath }, onProgress = () => {}) {
+  const size = fs.statSync(filePath).size;
+  const lowerName = name.toLowerCase();
+  if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
+    try {
+      const advanced = await runAdvancedPdfAgent({ filePath, maxChars: PDF_LIMITS.maxExtractedTextChars }, onProgress);
+      if (advanced.text.trim().length >= 20) {
+        return {
+          text: advanced.text,
+          meta: {
+            name,
+            type,
+            size,
+            method: advanced.meta.method,
+            characters: advanced.text.length,
+            stats: advanced.meta
+          }
+        };
+      }
+    } catch (error) {
+      onProgress({ message: `高级解析失败，切换轻量解析：${error.message}` });
+    }
+
+    if (size > PDF_LIMITS.maxFileBytes) {
+      throw new Error("高级 PDF 智能体未能识别文本，且文件过大，无法使用轻量解析兜底。请确认 PDF 是否为扫描版，或接入 OCR 后再处理。");
+    }
+    const buffer = fs.readFileSync(filePath);
+    return extractUploadedBookBuffer({ name, type, buffer }, onProgress);
+  }
+  const text = fs.readFileSync(filePath, "utf8").slice(0, PDF_LIMITS.maxExtractedTextChars);
+  return { text, meta: { name, type, size, method: "text-reader", characters: text.length, stats: null } };
+}
+
 function splitKnowledgeSentences(text) {
   return String(text || "")
     .split(/(?<=[。！？!?；;])|\n+/)
@@ -670,22 +841,33 @@ function validateGraph(raw, fallback) {
 }
 
 function processGraphGenerationJob(jobId, payload) {
-  setImmediate(() => {
+  setImmediate(async () => {
     try {
       updateGraphJob(jobId, {
         status: "running",
         stage: "解析文件",
         progress: 22,
-        message: payload.file?.buffer?.length ? "正在解析上传文件文本层" : "正在读取输入内容"
+        message: payload.file?.filePath || payload.file?.buffer?.length ? "正在解析上传文件文本层" : "正在读取输入内容"
       });
 
-      const uploaded = payload.file?.buffer?.length
-        ? extractUploadedBookBuffer(payload.file, (stats) => {
+      const uploaded = payload.file?.filePath
+        ? await extractUploadedBookFile(payload.file, (stats) => {
           updateGraphJob(jobId, {
-            progress: Math.min(58, 26 + Math.floor(stats.scannedStreams / 30)),
-            message: `已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
+            progress: stats.pages
+              ? Math.min(62, 24 + Math.floor((Number(stats.page || 0) / Math.max(1, Number(stats.pages))) * 38))
+              : Math.min(58, 26 + Math.floor(Number(stats.scannedStreams || 0) / 30)),
+            message: stats.pages
+              ? `${stats.method || "PDF 智能体"} 正在解析第 ${stats.page}/${stats.pages} 页，已识别 ${stats.characters || 0} 字符`
+              : (stats.message || `已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`)
           });
         })
+        : payload.file?.buffer?.length
+          ? extractUploadedBookBuffer(payload.file, (stats) => {
+            updateGraphJob(jobId, {
+              progress: Math.min(58, 26 + Math.floor(stats.scannedStreams / 30)),
+              message: `已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
+            });
+          })
         : { text: "", meta: null };
 
       updateGraphJob(jobId, {
@@ -734,6 +916,13 @@ function processGraphGenerationJob(jobId, payload) {
         message: error.message || "生成失败",
         error: error.message || "生成失败"
       });
+    } finally {
+      if (payload.uploadId) cleanupUploadSession(payload.uploadId, true);
+      else if (payload.file?.filePath) {
+        try {
+          fs.unlinkSync(payload.file.filePath);
+        } catch {}
+      }
     }
   });
 }
@@ -899,6 +1088,78 @@ async function handleApi(req, res, pathname, searchParams) {
     let graphs = db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global);
     if (subject) graphs = graphs.filter((graph) => graph.subject === subject);
     return send(res, 200, { ok: true, graphs });
+  }
+
+  if (method === "POST" && pathname === "/api/uploads/start") {
+    cleanupUploadSessions();
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "fileName", "size"]);
+    ensureUser(db, body.userId);
+    const size = Number(body.size || 0);
+    if (!Number.isFinite(size) || size <= 0) return sendError(res, 400, "文件大小不正确");
+    if (size > MAX_UPLOAD_SIZE) {
+      return sendError(res, 413, `上传文件过大，当前限制为 ${Math.round(MAX_UPLOAD_SIZE / 1024 / 1024)}MB`);
+    }
+    const session = createUploadSession({
+      userId: body.userId,
+      fileName: body.fileName,
+      fileType: body.fileType,
+      size
+    });
+    return send(res, 201, { ok: true, upload: publicUploadSession(session) });
+  }
+
+  params = routePattern(pathname, "/api/uploads/:id/chunk");
+  if (method === "POST" && params) {
+    const session = getUploadSession(params.id);
+    const index = Number(searchParams.get("index") || session.chunks);
+    const offset = Number(searchParams.get("offset") || session.received);
+    if (offset !== session.received) return sendError(res, 409, "上传分块顺序不一致，请重新上传");
+    const chunk = await readBinaryBody(req, MAX_UPLOAD_CHUNK_SIZE);
+    if (!chunk.length) return sendError(res, 400, "上传分块为空");
+    if (session.received + chunk.length > session.size) return sendError(res, 400, "上传内容超过声明文件大小");
+    fs.appendFileSync(session.filePath, chunk);
+    session.received += chunk.length;
+    session.chunks = Math.max(session.chunks, index + 1);
+    session.updatedAt = now();
+    return send(res, 200, { ok: true, upload: publicUploadSession(session) });
+  }
+
+  if (method === "POST" && pathname === "/api/graphs/generate-upload") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "uploadId", "subject"]);
+    ensureUser(db, body.userId);
+    const session = getUploadSession(body.uploadId);
+    if (session.userId !== body.userId) return sendError(res, 403, "不能使用其他账号的上传文件");
+    if (session.received !== session.size) return sendError(res, 400, "文件尚未上传完成");
+    const subject = normalizeSubject(body.subject);
+    const title = body.title || `${subject}知识图谱`;
+    const sourceName = body.sourceName || session.fileName;
+    const extractor = body.extractor || "advanced-python-pdf-agent";
+    const job = createGraphJob({
+      subject,
+      title,
+      sourceName,
+      fileSize: session.size,
+      extractor,
+      uploadId: session.id
+    });
+    send(res, 202, { ok: true, job: publicGraphJob(job) });
+    processGraphGenerationJob(job.id, {
+      userId: body.userId,
+      subject,
+      title,
+      sourceName,
+      sourceText: body.sourceText || "",
+      extractor,
+      uploadId: session.id,
+      file: {
+        name: session.fileName,
+        type: session.fileType,
+        filePath: session.filePath
+      }
+    });
+    return;
   }
 
   params = routePattern(pathname, "/api/graphs/jobs/:id");

@@ -4,5 +4,6 @@ logs/
 .env
 .env.*
 *.log
+*.pdf
 .DS_Store
 Thumbs.db

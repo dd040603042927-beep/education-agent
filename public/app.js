@@ -458,12 +458,13 @@ function renderTeacherGraphPage() {
           </div>
           <label>内容识别工具
             <select name="extractor">
-              <option value="local-pdf-text-agent">PDF 文本解析智能体（推荐）</option>
+              <option value="advanced-python-pdf-agent">高级 PDF 智能体（PyMuPDF/pypdf，推荐）</option>
+              <option value="local-pdf-text-agent">轻量 PDF 文本解析智能体</option>
               <option value="outline-fusion-agent">目录与补充内容融合工具</option>
             </select>
           </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
-          <p class="hint">PDF 会由后端本地解析文本层后参与生成图谱；扫描版图片 PDF 需要后续接入 OCR。</p>
+          <p class="hint">大 PDF 会自动分块上传；后端优先使用高级 PDF 智能体读取文本层，再生成图谱。扫描版图片 PDF 需要后续接入 OCR。</p>
           <label>补充目录或知识点<textarea name="sourceText" rows="5" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系"></textarea></label>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
@@ -777,30 +778,71 @@ async function pollGraphJob(jobId) {
 }
 
 async function generateGraphFromUploadedFile({ file, subject, title, sourceText, sourceName, extractor }) {
+  const chunkSize = 6 * 1024 * 1024;
   state.graphJob = {
     status: "running",
     stage: "上传文件",
-    progress: 12,
-    message: `正在上传 ${file.name}（${formatBytes(file.size)}），大文件请保持页面打开。`,
+    progress: 4,
+    message: `准备分块上传 ${file.name}（${formatBytes(file.size)}），大文件请保持页面打开。`,
     meta: { sourceName: file.name, fileSize: file.size, extractor }
   };
   renderContent();
-  const params = new URLSearchParams({
-    userId: state.user.id,
-    subject,
-    title,
-    sourceText,
-    sourceName,
-    fileType: file.type || "application/octet-stream",
-    extractor
-  });
-  const response = await fetch(`/api/graphs/generate-file?${params.toString()}`, {
+
+  const started = await api("/api/uploads/start", {
     method: "POST",
-    headers: { "content-type": file.type || "application/octet-stream" },
-    body: file
+    body: {
+      userId: state.user.id,
+      fileName: file.name,
+      fileType: file.type || "application/octet-stream",
+      size: file.size
+    }
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.ok === false) throw new Error(payload.error || `上传失败：${response.status}`);
+
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  let uploadedBytes = 0;
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    const chunk = file.slice(start, end);
+    const response = await fetch(`/api/uploads/${started.upload.id}/chunk?index=${index}&offset=${uploadedBytes}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: chunk
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
+    uploadedBytes = payload.upload.received;
+    state.graphJob = {
+      status: "running",
+      stage: "上传文件",
+      progress: Math.min(32, 4 + Math.floor((uploadedBytes / file.size) * 28)),
+      message: `已上传 ${index + 1}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}。`,
+      meta: { sourceName: file.name, fileSize: file.size, extractor }
+    };
+    refreshGraphProgress();
+  }
+
+  state.graphJob = {
+    status: "queued",
+    stage: "等待解析",
+    progress: 34,
+    message: "文件上传完成，正在启动 PDF 智能体解析任务。",
+    meta: { sourceName: file.name, fileSize: file.size, extractor }
+  };
+  renderContent();
+
+  const payload = await api("/api/graphs/generate-upload", {
+    method: "POST",
+    body: {
+      userId: state.user.id,
+      uploadId: started.upload.id,
+      subject,
+      title,
+      sourceText,
+      sourceName,
+      extractor
+    }
+  });
   state.graphJob = payload.job;
   renderContent();
   await pollGraphJob(payload.job.id);
