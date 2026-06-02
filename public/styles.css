@@ -614,11 +614,7 @@ p {
   min-height: 700px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background:
-    linear-gradient(#f7fafc 1px, transparent 1px),
-    linear-gradient(90deg, #f7fafc 1px, transparent 1px),
-    #ffffff;
-  background-size: 28px 28px;
+  background: #ffffff;
   overflow: hidden;
 }
 
@@ -653,6 +649,7 @@ p {
   width: 100%;
   height: 100%;
   min-height: 700px;
+  background: #ffffff;
   cursor: grab;
   user-select: none;
   touch-action: none;
@@ -664,38 +661,47 @@ p {
 
 .graph-link {
   fill: none;
-  stroke: #91a8ba;
-  stroke-width: 2.2;
-  opacity: 0.78;
-  paint-order: stroke;
+  stroke: #2b84b8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.65;
+  opacity: 0.58;
+  vector-effect: non-scaling-stroke;
 }
 
 .graph-link.tree {
-  stroke: #789bb2;
-  stroke-width: 2.1;
-  opacity: 0.7;
+  stroke: #2f8fc6;
+  stroke-width: 1.55;
+  opacity: 0.54;
 }
 
 .graph-link.cross {
-  stroke: #d1792b;
-  stroke-width: 3;
-  opacity: 0.92;
-  stroke-dasharray: 10 7;
+  stroke: #237fb5;
+  stroke-width: 2;
+  opacity: 0.7;
+}
+
+.graph-link.halo {
+  stroke: #ffffff;
+  stroke-width: 6;
+  opacity: 0.95;
+  marker-end: none;
 }
 
 .graph-link-label {
-  fill: #8291a3;
+  fill: #536f83;
   font-size: 12px;
   text-anchor: middle;
   paint-order: stroke;
   stroke: white;
-  stroke-width: 4px;
+  stroke-width: 4.5px;
 }
 
 .graph-node circle {
-  fill: #fff;
-  stroke: var(--primary);
-  stroke-width: 3px;
+  fill: #2f88c8;
+  stroke: #ffffff;
+  stroke-width: 2.5px;
+  vector-effect: non-scaling-stroke;
 }
 
 .graph-node rect {
@@ -705,25 +711,25 @@ p {
 }
 
 .graph-node circle.chapter {
-  fill: #f3f8fc;
-  stroke: #226f9b;
+  fill: #f0a33a;
+  stroke: #ffffff;
 }
 
 .graph-node circle.concept,
 .graph-node rect.concept {
-  fill: #f1fbf7;
-  stroke: #2d967d;
+  fill: #4fb879;
+  stroke: #ffffff;
 }
 
 .graph-node circle.topic,
 .graph-node rect.topic {
-  fill: #fff8ed;
-  stroke: #c98a32;
+  fill: #2f88c8;
+  stroke: #ffffff;
 }
 
 .graph-node circle.detail {
-  fill: #f6f4fb;
-  stroke: #7467a8;
+  fill: #2d73b8;
+  stroke: #ffffff;
 }
 
 .graph-node rect.detail {
@@ -742,6 +748,7 @@ p {
 .graph-node circle.root {
   fill: url(#nodeGrad);
   stroke: #fff;
+  stroke-width: 3px;
 }
 
 .graph-node text {
@@ -749,18 +756,49 @@ p {
   text-anchor: middle;
   dominant-baseline: middle;
   font-weight: 800;
-  font-size: 12px;
+  font-size: 11px;
   pointer-events: none;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 3.5px;
 }
 
 .graph-node text.root {
   fill: #fff;
   font-size: 13px;
+  stroke: rgba(16, 73, 95, 0.42);
+  stroke-width: 2px;
 }
 
 .graph-node.level-3 text {
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 700;
+}
+
+.graph-node text.inside {
+  fill: #ffffff;
+  stroke: rgba(24, 70, 102, 0.36);
+  stroke-width: 2.4px;
+}
+
+.graph-node text.outside {
+  fill: #20394a;
+  font-size: 11px;
+  font-weight: 800;
+  stroke: rgba(255, 255, 255, 0.96);
+  stroke-width: 4px;
+}
+
+.graph-node text.label-left {
+  text-anchor: end;
+}
+
+.graph-node text.label-right {
+  text-anchor: start;
+}
+
+.graph-node text.label-center {
+  text-anchor: middle;
 }
 
 .graph-node text.small {
