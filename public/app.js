@@ -22,10 +22,20 @@ const state = {
   graphNodeModal: null,
   graphJob: null,
   graphJobTimer: null,
+  graphDraft: {
+    subject: "",
+    title: "",
+    sourceText: "",
+    extractor: "advanced-python-pdf-agent"
+  },
+  graphUploadAbort: null,
+  graphGenerationCanceled: false,
   searchResults: []
 };
 
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
+const GRAPH_WIDTH = 1180;
+const GRAPH_HEIGHT = 760;
 
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
@@ -415,17 +425,22 @@ function renderGraphProgress() {
     queued: "排队中",
     running: "处理中",
     complete: "已完成",
-    failed: "失败"
+    failed: "失败",
+    canceled: "已终止"
   }[job.status] || job.status;
   const extraction = job.meta?.extraction;
   const ocrInfo = extraction?.stats?.ocrUsed
     ? `；OCR 页数：${extraction.stats.ocrPages || 0}/${extraction.stats.ocrPlannedPages || extraction.stats.ocrTotalPdfPages || 0}`
     : "";
+  const canCancel = ["queued", "running"].includes(job.status);
   return `
     <section class="progress-card ${job.status}">
       <div class="split-head">
         <h3>生成进度</h3>
-        <span>${statusText}</span>
+        <div class="actions compact-actions">
+          <span>${statusText}</span>
+          ${canCancel ? `<button class="mini danger" type="button" id="cancelGraphJobBtn">终止生成</button>` : ""}
+        </div>
       </div>
       <div class="progress-track"><span style="width:${clamp(Number(job.progress || 0), 0, 100)}%"></span></div>
       <div class="progress-meta">
@@ -441,6 +456,7 @@ function renderGraphProgress() {
 function renderTeacherGraphPage() {
   const graphs = graphListForCurrentRole();
   const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || graphs[0];
+  const draft = state.graphDraft || {};
   return `
     <div class="page-head">
       <div>
@@ -457,29 +473,28 @@ function renderTeacherGraphPage() {
         <h3>生成图谱</h3>
         <form id="generateGraphForm" class="stack">
           <div class="form-grid">
-            <label>学科<input name="subject" value="${escapeHtml(state.user.subject || "")}" placeholder="例如：数学、物理、人工智能导论" required /></label>
-            <label>图谱名称<input name="title" placeholder="例如：高一数学选择性必修一知识图谱" /></label>
+            <label>学科<input name="subject" value="${escapeHtml(draft.subject || "")}" placeholder="例如：数学、物理、人工智能导论" required /></label>
+            <label>图谱名称<input name="title" value="${escapeHtml(draft.title || "")}" placeholder="例如：高一数学选择性必修一知识图谱" /></label>
           </div>
           <label>内容识别工具
             <select name="extractor">
-              <option value="advanced-python-pdf-agent">高级 PDF/OCR 智能体（PyMuPDF/PaddleOCR，推荐）</option>
-              <option value="local-pdf-text-agent">轻量 PDF 文本解析智能体</option>
-              <option value="outline-fusion-agent">目录与补充内容融合工具</option>
+              <option value="advanced-python-pdf-agent" ${(draft.extractor || "advanced-python-pdf-agent") === "advanced-python-pdf-agent" ? "selected" : ""}>高级 PDF/OCR 智能体（PyMuPDF/PaddleOCR，推荐）</option>
+              <option value="local-pdf-text-agent" ${draft.extractor === "local-pdf-text-agent" ? "selected" : ""}>轻量 PDF 文本解析智能体</option>
+              <option value="outline-fusion-agent" ${draft.extractor === "outline-fusion-agent" ? "selected" : ""}>目录与补充内容融合工具</option>
             </select>
           </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
           <p class="hint">大 PDF 会自动分块上传；后端优先读取 PDF 文本层，扫描版图片 PDF 会自动调用本地 OCR，耗时会比普通 PDF 更长。</p>
-          <label>补充目录或知识点<textarea name="sourceText" rows="5" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系"></textarea></label>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
             <button class="ghost" type="button" id="sampleGraphBtn">生成示例</button>
           </div>
         </form>
-        ${renderGraphProgress()}
+        <div id="graphProgressMount">${renderGraphProgress()}</div>
       </section>
-      <section class="panel">
+      <section class="panel import-graph-panel">
         <h3>直接导入图谱</h3>
-        <form id="importGraphForm" class="stack">
+        <form id="importGraphForm" class="stack import-graph-form">
           <div class="form-grid">
             <label>学科<input name="subject" placeholder="例如：物理、线性代数、机器学习" /></label>
             <label>图谱名称<input name="title" placeholder="导入图谱名称" /></label>
@@ -488,6 +503,9 @@ function renderTeacherGraphPage() {
           <p class="hint">JSON 需要包含 nodes 与 links，例如：{"nodes":[{"id":"n1","label":"力学"}],"links":[]}。</p>
           <button class="primary" type="submit">✅ 确认导入</button>
         </form>
+        <label class="supplement-field">补充目录或知识点
+          <textarea name="sourceText" form="generateGraphForm" rows="6" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系">${escapeHtml(draft.sourceText || "")}</textarea>
+        </label>
       </section>
     </div>
     <section class="panel">
@@ -525,29 +543,99 @@ function renderStudentGraphPage() {
   `;
 }
 
+function graphNodeLevel(node, index = 0) {
+  if (Number.isFinite(Number(node.level))) return Number(node.level);
+  if (index === 0 || node.group === "root") return 0;
+  if (node.group === "chapter") return 1;
+  if (node.group === "concept" || node.group === "topic") return 2;
+  return 3;
+}
+
+function graphNodeRadius(node, index) {
+  const level = graphNodeLevel(node, index);
+  if (level === 0 || node.group === "root") return 52;
+  if (level === 1 || node.group === "chapter") return 42;
+  return 34;
+}
+
+function graphGroupClass(group) {
+  return String(group || "topic").replace(/[^a-zA-Z0-9_-]/g, "") || "topic";
+}
+
+function graphLinkPath(source, target) {
+  const dx = Math.max(80, Math.abs(target.x - source.x) * 0.45);
+  const c1x = source.x + dx;
+  const c2x = target.x - dx;
+  return `M ${source.x} ${source.y} C ${c1x} ${source.y}, ${c2x} ${target.y}, ${target.x} ${target.y}`;
+}
+
+function graphLabelLines(label, maxChars = 7, maxLines = 2) {
+  const text = String(label || "");
+  const lines = [];
+  for (let index = 0; index < text.length && lines.length < maxLines; index += maxChars) {
+    lines.push(text.slice(index, index + maxChars));
+  }
+  return lines.length ? lines : [""];
+}
+
+function graphParentMap(graph) {
+  const nodesById = new Map((graph.nodes || []).map((node, index) => [node.id, { node, index }]));
+  const parents = new Map();
+  (graph.links || []).forEach((link) => {
+    const source = nodesById.get(link.source);
+    const target = nodesById.get(link.target);
+    if (!source || !target) return;
+    if (graphNodeLevel(source.node, source.index) < graphNodeLevel(target.node, target.index) && !parents.has(link.target)) {
+      parents.set(link.target, link.source);
+    }
+  });
+  return parents;
+}
+
 function getGraphView(graph) {
-  const width = 920;
-  const height = 540;
-  const cx = width / 2;
-  const cy = height / 2;
-  const radius = Math.min(width, height) * 0.35;
+  const width = GRAPH_WIDTH;
+  const height = GRAPH_HEIGHT;
   const nodes = graph.nodes || [];
-  if (!state.graphViews[graph.id]) {
-    state.graphViews[graph.id] = { scale: 1, offsetX: 0, offsetY: 0, positions: {} };
+  const signature = nodes.map((node, index) => `${node.id}:${graphNodeLevel(node, index)}:${node.x || ""}:${node.y || ""}`).join("|");
+  if (!state.graphViews[graph.id] || state.graphViews[graph.id].signature !== signature) {
+    state.graphViews[graph.id] = { scale: 0.88, offsetX: 0, offsetY: 0, positions: {}, signature };
   }
   const view = state.graphViews[graph.id];
+  const parents = graphParentMap(graph);
+  const byLevel = new Map();
+  nodes.forEach((node, index) => {
+    const level = graphNodeLevel(node, index);
+    if (!byLevel.has(level)) byLevel.set(level, []);
+    byLevel.get(level).push({ node, index });
+  });
+  const maxLevel = Math.max(1, ...Array.from(byLevel.keys()));
+
   nodes.forEach((node, index) => {
     if (view.positions[node.id]) return;
     if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
       view.positions[node.id] = { x: node.x, y: node.y };
       return;
     }
-    if (index === 0 || node.group === "root") view.positions[node.id] = { x: cx, y: cy };
-    else {
-      const angle = ((index - 1) / Math.max(1, nodes.length - 1)) * Math.PI * 2 - Math.PI / 2;
-      const ring = radius + (index % 3) * 28;
-      view.positions[node.id] = { x: cx + Math.cos(angle) * ring, y: cy + Math.sin(angle) * ring };
+    const level = graphNodeLevel(node, index);
+    const levelNodes = byLevel.get(level) || [];
+    const levelIndex = levelNodes.findIndex((item) => item.node.id === node.id);
+    const columnX = level === 0
+      ? 96
+      : 260 + ((width - 360) / Math.max(1, maxLevel - 1)) * (level - 1);
+    let y = height / 2;
+    const parentId = parents.get(node.id);
+    const parentPosition = parentId ? view.positions[parentId] : null;
+    if (level === 0) {
+      y = height / 2;
+    } else if (parentPosition) {
+      const siblings = levelNodes.filter((item) => parents.get(item.node.id) === parentId);
+      const siblingIndex = siblings.findIndex((item) => item.node.id === node.id);
+      y = parentPosition.y + (siblingIndex - (siblings.length - 1) / 2) * 34;
+    } else {
+      const step = (height - 140) / Math.max(1, levelNodes.length - 1);
+      y = 70 + levelIndex * step;
     }
+    view.positions[node.id] = { x: columnX, y: clamp(y, 54, height - 54) };
   });
   return view;
 }
@@ -567,8 +655,8 @@ function renderGraphViewer(graph) {
 }
 
 function renderGraphSvg(graph) {
-  const width = 920;
-  const height = 540;
+  const width = GRAPH_WIDTH;
+  const height = GRAPH_HEIGHT;
   const links = graph.links || [];
   const nodes = graph.nodes || [];
   const view = getGraphView(graph);
@@ -580,6 +668,9 @@ function renderGraphSvg(graph) {
           <stop offset="0%" stop-color="#247db2"></stop>
           <stop offset="100%" stop-color="#37a38b"></stop>
         </linearGradient>
+        <marker id="arrowHead" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M 0 0 L 12 4 L 0 8 z" fill="#8ba2b4"></path>
+        </marker>
         <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
           <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#13506f" flood-opacity="0.16"></feDropShadow>
         </filter>
@@ -592,21 +683,24 @@ function renderGraphSvg(graph) {
           const mx = (s.x + t.x) / 2;
           const my = (s.y + t.y) / 2;
           return `
-            <line data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" class="graph-link"></line>
+            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${graphLinkPath(s, t)}" class="graph-link" marker-end="url(#arrowHead)"></path>
             <text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(link.label || "关联")}</text>
           `;
         }).join("")}
         ${nodes.map((node, index) => {
           const p = positions[node.id] || { x: width / 2, y: height / 2 };
           const root = index === 0 || node.group === "root";
+          const level = graphNodeLevel(node, index);
+          const radius = graphNodeRadius(node, index);
+          const groupClass = graphGroupClass(node.group);
           const label = String(node.label || "");
+          const labelLines = graphLabelLines(label, root ? 7 : 6, 2);
           const pointCount = Array.isArray(node.knowledgePoints) ? node.knowledgePoints.length : 0;
           return `
-            <g class="graph-node" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
-              <circle r="${root ? 46 : 34}" class="${root ? "root" : ""}"></circle>
-              <text y="${label.length > 6 ? -4 : 4}" class="${root ? "root" : ""}">${escapeHtml(label.slice(0, 8))}</text>
-              ${label.length > 8 ? `<text y="16" class="small ${root ? "root" : ""}">${escapeHtml(label.slice(8, 14))}</text>` : ""}
-              ${pointCount ? `<text y="${root ? 34 : 29}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
+            <g class="graph-node level-${level} ${groupClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" filter="url(#softShadow)">
+              <circle r="${radius}" class="${root ? "root" : groupClass}"></circle>
+              ${labelLines.map((line, lineIndex) => `<text y="${labelLines.length === 1 ? -3 : -10 + lineIndex * 16}" class="${root ? "root" : ""}">${escapeHtml(line)}</text>`).join("")}
+              ${pointCount ? `<text y="${radius - 11}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
             </g>
           `;
         }).join("")}
@@ -657,10 +751,7 @@ function updateGraphDom(svg, graphId) {
     const source = view.positions[line.dataset.linkSource];
     const target = view.positions[line.dataset.linkTarget];
     if (!source || !target) return;
-    line.setAttribute("x1", source.x);
-    line.setAttribute("y1", source.y);
-    line.setAttribute("x2", target.x);
-    line.setAttribute("y2", target.y);
+    line.setAttribute("d", graphLinkPath(source, target));
   });
   svg.querySelectorAll(".graph-link-label").forEach((label) => {
     const source = view.positions[label.dataset.linkSource];
@@ -729,11 +820,11 @@ function bindInteractiveGraph() {
   window.addEventListener("pointermove", (event) => {
     if (!dragged) return;
     const view = state.graphViews[graphId];
-    const dx = ((event.clientX - dragged.x) * 920) / dragged.width / view.scale;
-    const dy = ((event.clientY - dragged.y) * 540) / dragged.height / view.scale;
+    const dx = ((event.clientX - dragged.x) * GRAPH_WIDTH) / dragged.width / view.scale;
+    const dy = ((event.clientY - dragged.y) * GRAPH_HEIGHT) / dragged.height / view.scale;
     view.positions[dragged.nodeId] = {
-      x: clamp(dragged.startX + dx, 20, 900),
-      y: clamp(dragged.startY + dy, 20, 520)
+      x: clamp(dragged.startX + dx, 30, GRAPH_WIDTH - 30),
+      y: clamp(dragged.startY + dy, 30, GRAPH_HEIGHT - 30)
     };
     updateGraphDom(svg, graphId);
   });
@@ -750,8 +841,84 @@ function stopGraphJobPolling() {
   state.graphJobTimer = null;
 }
 
+function emptyGraphDraft() {
+  return {
+    subject: "",
+    title: "",
+    sourceText: "",
+    extractor: "advanced-python-pdf-agent"
+  };
+}
+
+function captureGraphDraft(form) {
+  const data = new FormData(form);
+  const sourceTextControl = document.querySelector('textarea[name="sourceText"][form="generateGraphForm"]');
+  state.graphDraft = {
+    subject: String(data.get("subject") || ""),
+    title: String(data.get("title") || ""),
+    sourceText: String(data.get("sourceText") || sourceTextControl?.value || ""),
+    extractor: String(data.get("extractor") || "advanced-python-pdf-agent")
+  };
+}
+
+function clearGraphForms() {
+  state.graphDraft = emptyGraphDraft();
+  document.getElementById("generateGraphForm")?.reset();
+  document.getElementById("importGraphForm")?.reset();
+  const sourceText = document.querySelector('textarea[name="sourceText"][form="generateGraphForm"]');
+  if (sourceText) sourceText.value = "";
+}
+
+function bindGraphProgressControls() {
+  document.getElementById("cancelGraphJobBtn")?.addEventListener("click", cancelCurrentGraphGeneration);
+}
+
 function refreshGraphProgress() {
-  if (state.page === "graph") renderContent();
+  if (state.page !== "graph") return;
+  const mount = document.getElementById("graphProgressMount");
+  if (!mount) {
+    renderContent();
+    return;
+  }
+  mount.innerHTML = renderGraphProgress();
+  bindGraphProgressControls();
+}
+
+function graphCancelError() {
+  return Object.assign(new Error("图谱生成已终止"), { canceled: true });
+}
+
+async function cancelCurrentGraphGeneration() {
+  state.graphGenerationCanceled = true;
+  stopGraphJobPolling();
+  if (state.graphUploadAbort) state.graphUploadAbort.abort();
+  const jobId = state.graphJob?.id;
+  if (jobId && ["queued", "running"].includes(state.graphJob.status)) {
+    try {
+      const payload = await api(`/api/graphs/jobs/${jobId}/cancel`, { method: "POST", body: { userId: state.user.id } });
+      state.graphJob = payload.job;
+    } catch (error) {
+      state.graphJob = {
+        ...(state.graphJob || {}),
+        status: "canceled",
+        stage: "已终止",
+        progress: Number(state.graphJob?.progress || 0),
+        message: "已终止生成，当前表单内容已清空"
+      };
+    }
+  } else {
+    state.graphJob = {
+      ...(state.graphJob || {}),
+      status: "canceled",
+      stage: "已终止",
+      progress: Number(state.graphJob?.progress || 0),
+      message: "已终止生成，当前表单内容已清空"
+    };
+  }
+  state.graphUploadAbort = null;
+  clearGraphForms();
+  renderContent();
+  showToast("已终止图谱生成");
 }
 
 async function pollGraphJob(jobId) {
@@ -762,9 +929,16 @@ async function pollGraphJob(jobId) {
       state.graphJob = payload.job;
       if (payload.job.status === "complete") {
         state.selectedGraphId = payload.job.graphId;
+        clearGraphForms();
         await loadState();
         renderShell();
         showToast("知识图谱已生成");
+        return;
+      }
+      if (payload.job.status === "canceled") {
+        clearGraphForms();
+        refreshGraphProgress();
+        showToast("已终止图谱生成");
         return;
       }
       if (payload.job.status === "failed") {
@@ -783,6 +957,8 @@ async function pollGraphJob(jobId) {
 
 async function generateGraphFromUploadedFile({ file, subject, title, sourceText, sourceName, extractor }) {
   const chunkSize = 6 * 1024 * 1024;
+  state.graphGenerationCanceled = false;
+  state.graphUploadAbort = new AbortController();
   state.graphJob = {
     status: "running",
     stage: "上传文件",
@@ -790,70 +966,91 @@ async function generateGraphFromUploadedFile({ file, subject, title, sourceText,
     message: `准备分块上传 ${file.name}（${formatBytes(file.size)}），大文件请保持页面打开。`,
     meta: { sourceName: file.name, fileSize: file.size, extractor }
   };
-  renderContent();
+  refreshGraphProgress();
 
-  const started = await api("/api/uploads/start", {
-    method: "POST",
-    body: {
-      userId: state.user.id,
-      fileName: file.name,
-      fileType: file.type || "application/octet-stream",
-      size: file.size
-    }
-  });
-
-  const totalChunks = Math.ceil(file.size / chunkSize);
-  let uploadedBytes = 0;
-  for (let index = 0; index < totalChunks; index += 1) {
-    const start = index * chunkSize;
-    const end = Math.min(file.size, start + chunkSize);
-    const chunk = file.slice(start, end);
-    const response = await fetch(`/api/uploads/${started.upload.id}/chunk?index=${index}&offset=${uploadedBytes}`, {
+  let started = null;
+  try {
+    started = await api("/api/uploads/start", {
       method: "POST",
-      headers: { "content-type": "application/octet-stream" },
-      body: chunk
+      body: {
+        userId: state.user.id,
+        fileName: file.name,
+        fileType: file.type || "application/octet-stream",
+        size: file.size
+      }
     });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
-    uploadedBytes = payload.upload.received;
+
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    let uploadedBytes = 0;
+    for (let index = 0; index < totalChunks; index += 1) {
+      if (state.graphGenerationCanceled) throw graphCancelError();
+      const start = index * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
+      const chunk = file.slice(start, end);
+      const response = await fetch(`/api/uploads/${started.upload.id}/chunk?index=${index}&offset=${uploadedBytes}`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: chunk,
+        signal: state.graphUploadAbort.signal
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
+      uploadedBytes = payload.upload.received;
+      state.graphJob = {
+        status: "running",
+        stage: "上传文件",
+        progress: Math.min(32, 4 + Math.floor((uploadedBytes / file.size) * 28)),
+        message: `已上传 ${index + 1}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}。`,
+        meta: { sourceName: file.name, fileSize: file.size, extractor }
+      };
+      refreshGraphProgress();
+    }
+
+    if (state.graphGenerationCanceled) throw graphCancelError();
     state.graphJob = {
-      status: "running",
-      stage: "上传文件",
-      progress: Math.min(32, 4 + Math.floor((uploadedBytes / file.size) * 28)),
-      message: `已上传 ${index + 1}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}。`,
+      status: "queued",
+      stage: "等待解析",
+      progress: 34,
+      message: "文件上传完成，正在启动 PDF 智能体解析任务。",
       meta: { sourceName: file.name, fileSize: file.size, extractor }
     };
     refreshGraphProgress();
+
+    const payload = await api("/api/graphs/generate-upload", {
+      method: "POST",
+      body: {
+        userId: state.user.id,
+        uploadId: started.upload.id,
+        subject,
+        title,
+        sourceText,
+        sourceName,
+        extractor
+      }
+    });
+    state.graphJob = payload.job;
+    refreshGraphProgress();
+    await pollGraphJob(payload.job.id);
+  } catch (error) {
+    if (error.name === "AbortError" || error.canceled || state.graphGenerationCanceled) throw graphCancelError();
+    throw error;
+  } finally {
+    state.graphUploadAbort = null;
   }
-
-  state.graphJob = {
-    status: "queued",
-    stage: "等待解析",
-    progress: 34,
-    message: "文件上传完成，正在启动 PDF 智能体解析任务。",
-    meta: { sourceName: file.name, fileSize: file.size, extractor }
-  };
-  renderContent();
-
-  const payload = await api("/api/graphs/generate-upload", {
-    method: "POST",
-    body: {
-      userId: state.user.id,
-      uploadId: started.upload.id,
-      subject,
-      title,
-      sourceText,
-      sourceName,
-      extractor
-    }
-  });
-  state.graphJob = payload.job;
-  renderContent();
-  await pollGraphJob(payload.job.id);
 }
 
 function bindGraphPage() {
   bindInteractiveGraph();
+  bindGraphProgressControls();
+  const generateForm = document.getElementById("generateGraphForm");
+  if (generateForm) {
+    const syncDraft = () => captureGraphDraft(generateForm);
+    generateForm.querySelectorAll("input, select").forEach((control) => {
+      control.addEventListener("input", syncDraft);
+      control.addEventListener("change", syncDraft);
+    });
+    document.querySelector('textarea[name="sourceText"][form="generateGraphForm"]')?.addEventListener("input", syncDraft);
+  }
   document.getElementById("closeGraphNodeModal")?.addEventListener("click", () => {
     state.graphNodeModal = null;
     renderContent();
@@ -925,6 +1122,7 @@ function bindGraphPage() {
         }
       });
       await loadState();
+      clearGraphForms();
       renderShell();
       showToast("示例图谱已生成");
     } catch (error) {
@@ -934,9 +1132,10 @@ function bindGraphPage() {
 
   document.getElementById("generateGraphForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
+    captureGraphDraft(event.currentTarget);
     const form = new FormData(event.currentTarget);
     const file = form.get("book");
-    let sourceText = String(form.get("sourceText") || "");
+    let sourceText = String(state.graphDraft.sourceText || "");
     let sourceName = "";
     const extractor = String(form.get("extractor") || "local-pdf-text-agent");
     if (file && file.name) {
@@ -946,6 +1145,7 @@ function bindGraphPage() {
     if (!subject) return showToast("请先输入学科名称", "error");
     const title = String(form.get("title") || `${subject}知识图谱`).trim();
     try {
+      state.graphGenerationCanceled = false;
       if (file && file.name) {
         await generateGraphFromUploadedFile({
           file,
@@ -963,7 +1163,7 @@ function bindGraphPage() {
         progress: 45,
         message: "正在根据补充目录或知识点生成图谱"
       };
-      renderContent();
+      refreshGraphProgress();
       const payload = await api("/api/graphs/generate", {
         method: "POST",
         body: {
@@ -983,10 +1183,24 @@ function bindGraphPage() {
         graphId: payload.graph.id
       };
       state.selectedGraphId = payload.graph.id;
+      clearGraphForms();
       await loadState();
       renderShell();
       showToast("知识图谱已生成");
     } catch (error) {
+      if (error.canceled || state.graphGenerationCanceled) {
+        state.graphJob = {
+          ...(state.graphJob || {}),
+          status: "canceled",
+          stage: "已终止",
+          progress: Number(state.graphJob?.progress || 0),
+          message: "已终止生成，当前表单内容已清空"
+        };
+        clearGraphForms();
+        renderContent();
+        showToast("已终止图谱生成");
+        return;
+      }
       showToast(error.message, "error");
     }
   });
@@ -1010,6 +1224,7 @@ function bindGraphPage() {
         }
       });
       state.selectedGraphId = payload.graph.id;
+      clearGraphForms();
       await loadState();
       renderShell();
       showToast("图谱导入成功");

@@ -296,6 +296,8 @@ function createGraphJob(meta = {}) {
     graphId: null,
     error: null,
     meta,
+    cancelRequested: false,
+    abort: null,
     createdAt: now(),
     updatedAt: now()
   };
@@ -306,8 +308,41 @@ function createGraphJob(meta = {}) {
 function updateGraphJob(jobId, patch) {
   const job = graphJobs.get(jobId);
   if (!job) return null;
+  if (job.status === "canceled" && patch.status !== "canceled") return job;
   Object.assign(job, patch, { updatedAt: now() });
   return job;
+}
+
+function canceledGraphError() {
+  return Object.assign(new Error("图谱生成已终止"), { canceled: true });
+}
+
+function isGraphJobCanceled(jobId) {
+  const job = graphJobs.get(jobId);
+  return !job || job.cancelRequested || job.status === "canceled";
+}
+
+function assertGraphJobActive(jobId) {
+  if (isGraphJobCanceled(jobId)) throw canceledGraphError();
+}
+
+function cancelGraphJob(jobId) {
+  const job = graphJobs.get(jobId);
+  if (!job) return null;
+  if (["complete", "failed", "canceled"].includes(job.status)) return job;
+  job.cancelRequested = true;
+  if (typeof job.abort === "function") {
+    try {
+      job.abort();
+    } catch {}
+  }
+  return updateGraphJob(jobId, {
+    status: "canceled",
+    stage: "已终止",
+    progress: Math.max(0, Number(job.progress || 0)),
+    message: "已终止生成，当前表单内容已清空",
+    error: null
+  });
 }
 
 function publicGraphJob(job) {
@@ -639,8 +674,9 @@ function resolvePythonCommand() {
   return "python";
 }
 
-function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
+function runAdvancedPdfAgent({ filePath, maxChars, jobId }, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
+    if (jobId) assertGraphJobActive(jobId);
     const scriptPath = path.join(ROOT, "scripts", "pdf_text_agent.py");
     const outputPath = path.join(UPLOAD_DIR, `${uid("pdftext")}.txt`);
     const python = resolvePythonCommand();
@@ -656,7 +692,15 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
     let stdout = "";
     let stderrBuffer = "";
     let stderrFull = "";
+    let canceled = false;
     const startedAt = Date.now();
+    const job = jobId ? graphJobs.get(jobId) : null;
+    if (job) {
+      job.abort = () => {
+        canceled = true;
+        child.kill();
+      };
+    }
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error("高级 PDF/OCR 智能体解析超时，请尝试拆分 PDF、减少 OCR 页数，或设置 PDF_AGENT_OCR_MAX_PAGES 后重试"));
@@ -674,6 +718,7 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
       lines.forEach((line) => {
         if (!line.startsWith("PROGRESS ")) return;
         try {
+          if (jobId) assertGraphJobActive(jobId);
           onProgress(JSON.parse(line.slice("PROGRESS ".length)));
         } catch {}
       });
@@ -684,6 +729,11 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
     });
     child.on("close", (code) => {
       clearTimeout(timeout);
+      if (job && job.abort) job.abort = null;
+      if (canceled || (jobId && isGraphJobCanceled(jobId))) {
+        reject(canceledGraphError());
+        return;
+      }
       if (code !== 0) {
         reject(new Error(stderrFull.trim() || `高级 PDF 智能体退出码：${code}`));
         return;
@@ -709,12 +759,12 @@ function runAdvancedPdfAgent({ filePath, maxChars }, onProgress = () => {}) {
   });
 }
 
-async function extractUploadedBookFile({ name = "上传书本", type = "", filePath }, onProgress = () => {}) {
+async function extractUploadedBookFile({ name = "上传书本", type = "", filePath }, onProgress = () => {}, jobId = null) {
   const size = fs.statSync(filePath).size;
   const lowerName = name.toLowerCase();
   if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
     try {
-      const advanced = await runAdvancedPdfAgent({ filePath, maxChars: PDF_LIMITS.maxExtractedTextChars }, onProgress);
+      const advanced = await runAdvancedPdfAgent({ filePath, maxChars: PDF_LIMITS.maxExtractedTextChars, jobId }, onProgress);
       if (advanced.text.trim().length >= 20 || advanced.meta?.ocrUsed) {
         return {
           text: advanced.text,
@@ -729,6 +779,7 @@ async function extractUploadedBookFile({ name = "上传书本", type = "", fileP
         };
       }
     } catch (error) {
+      if (error.canceled) throw error;
       onProgress({ message: `高级解析失败，切换轻量解析：${error.message}` });
     }
 
@@ -777,29 +828,200 @@ function extractKeywords(text, subject) {
   return Array.from(new Set(merged.concat(fallback[subject] || fallback.物理))).slice(0, 10);
 }
 
+const COMPUTER_ORG_OUTLINE = [
+  {
+    label: "计算机系统概述",
+    points: ["计算机层次结构", "冯·诺依曼结构", "硬件与软件接口", "性能指标"],
+    details: "建立整门课程的系统视角，理解计算机由硬件、系统软件和应用软件协同完成信息处理。",
+    sections: [
+      ["层次结构", ["硬件层、操作系统层、语言处理层和应用层逐级抽象。", "ISA 是软件和硬件之间的重要接口。"]],
+      ["性能指标", ["主频、CPI、MIPS、FLOPS、吞吐率和响应时间需要结合场景解释。"]],
+      ["冯·诺依曼结构", ["运算器、控制器、存储器、输入设备、输出设备构成基本结构。"]]
+    ]
+  },
+  {
+    label: "数据表示与运算",
+    points: ["进位计数制", "定点数与浮点数", "补码运算", "校验码"],
+    details: "解决数据如何在机器中编码、存储和参与算术逻辑运算的问题。",
+    sections: [
+      ["数制与编码", ["二进制、八进制、十六进制之间可按位分组转换。", "BCD、ASCII、汉字编码属于常见数据编码。"]],
+      ["定点数", ["原码、反码、补码和移码关注符号位、表示范围与加减运算规则。"]],
+      ["浮点数", ["阶码、尾数、规格化、舍入和溢出共同决定浮点数表示能力。"]],
+      ["校验码", ["奇偶校验、海明码和 CRC 用于发现或纠正传输与存储错误。"]]
+    ]
+  },
+  {
+    label: "存储系统",
+    points: ["存储层次", "主存储器", "Cache", "虚拟存储器"],
+    details: "围绕容量、速度、成本之间的矛盾建立多级存储层次。",
+    sections: [
+      ["存储层次", ["寄存器、Cache、主存、辅存构成由快到慢、由小到大的层次。"]],
+      ["主存储器", ["SRAM、DRAM、ROM、地址译码和存储扩展是主存设计核心。"]],
+      ["Cache", ["局部性原理、映射方式、替换算法和写策略影响命中率。"]],
+      ["虚拟存储器", ["页式、段式、段页式管理通过地址变换扩展逻辑地址空间。"]]
+    ]
+  },
+  {
+    label: "指令系统",
+    points: ["指令格式", "寻址方式", "CISC 与 RISC", "程序执行"],
+    details: "说明机器指令如何描述操作、操作数位置以及处理器需要执行的动作。",
+    sections: [
+      ["指令格式", ["操作码、地址码、寻址特征和指令长度共同决定指令表达能力。"]],
+      ["寻址方式", ["立即、直接、间接、寄存器、变址、基址和相对寻址影响访存过程。"]],
+      ["CISC/RISC", ["CISC 指令复杂且类型多，RISC 强调简单指令、流水线和寄存器利用。"]],
+      ["程序执行", ["取指、译码、执行、访存、写回构成典型指令执行过程。"]]
+    ]
+  },
+  {
+    label: "中央处理器",
+    points: ["运算器", "控制器", "数据通路", "指令流水线"],
+    details: "关注 CPU 内部如何组织数据流、控制流，并高效完成指令执行。",
+    sections: [
+      ["CPU 结构", ["ALU、寄存器组、控制器、内部总线和状态寄存器构成基本 CPU。"]],
+      ["数据通路", ["组合逻辑、时序逻辑、寄存器传送和多路选择器共同组织数据流。"]],
+      ["控制器", ["硬布线控制速度快，微程序控制灵活，二者适合不同设计目标。"]],
+      ["流水线", ["结构相关、数据相关和控制相关会影响流水线吞吐率。"]],
+      ["异常与中断", ["异常源于处理器执行过程，中断通常来自外设或外部事件。"]]
+    ]
+  },
+  {
+    label: "总线与输入输出",
+    points: ["总线结构", "I/O 接口", "中断", "DMA"],
+    details: "处理主机与外设、存储设备之间的数据传送和控制协调。",
+    sections: [
+      ["总线", ["数据总线、地址总线、控制总线通过仲裁和定时完成共享通信。"]],
+      ["I/O 接口", ["接口完成地址译码、数据缓冲、状态保存和控制命令交互。"]],
+      ["程序查询", ["CPU 主动轮询设备状态，实现简单但效率较低。"]],
+      ["中断方式", ["外设请求 CPU 响应，中断向量和优先级决定服务过程。"]],
+      ["DMA", ["DMA 控制器绕开 CPU 直接在外设与内存之间传送数据。"]]
+    ]
+  }
+];
+
+function looksLikeComputerOrganization(subject, text) {
+  const source = `${subject} ${text}`.toLowerCase();
+  return /计算机组成|组成原理|computer organization|cpu|cache|指令系统|存储系统|总线|中央处理器/.test(source);
+}
+
+function makeGraphNode({ id, label, group, level, knowledgePoints = [], details = "" }) {
+  return {
+    id,
+    label,
+    group,
+    level,
+    details,
+    knowledgePoints: knowledgePoints.filter(Boolean).map((point) => String(point).slice(0, 180))
+  };
+}
+
+function buildComputerOrganizationGraph({ ownerId, title, subject, sourceName, sourceText, extraction }) {
+  const cleanSubject = normalizeSubject(subject || "计算机组成原理");
+  const rootId = "n0";
+  const nodes = [makeGraphNode({
+    id: rootId,
+    label: "计算机组成原理",
+    group: "root",
+    level: 0,
+    details: `由${sourceName || "教材内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`,
+    knowledgePoints: [
+      "围绕数据表示、存储系统、指令系统、CPU、总线与 I/O 建立计算机硬件系统知识主线。",
+      "重点关注各部件之间的数据流、控制流、地址变换和性能影响。",
+      "适合用于计算机组成原理教材复习、章节串联和试题定位。"
+    ]
+  })];
+  const links = [];
+  COMPUTER_ORG_OUTLINE.forEach((chapter, chapterIndex) => {
+    const chapterId = `c${chapterIndex + 1}`;
+    nodes.push(makeGraphNode({
+      id: chapterId,
+      label: chapter.label,
+      group: "chapter",
+      level: 1,
+      details: chapter.details,
+      knowledgePoints: chapter.points
+    }));
+    links.push({ source: rootId, target: chapterId, label: "一级章节" });
+    chapter.sections.forEach(([label, points], sectionIndex) => {
+      const sectionId = `${chapterId}s${sectionIndex + 1}`;
+      nodes.push(makeGraphNode({
+        id: sectionId,
+        label,
+        group: sectionIndex % 2 === 0 ? "concept" : "topic",
+        level: 2,
+        details: `「${chapter.label}」下的核心知识点：${label}`,
+        knowledgePoints: points.length ? points : knowledgePointsForKeyword(sourceText, label)
+      }));
+      links.push({ source: chapterId, target: sectionId, label: "包含" });
+    });
+  });
+  [
+    ["c2s2", "c5s1", "支撑运算器"],
+    ["c2s3", "c5s2", "影响数据通路"],
+    ["c3s3", "c5s4", "提升流水线效率"],
+    ["c4s1", "c5s3", "驱动控制器"],
+    ["c4s2", "c3s4", "参与地址变换"],
+    ["c5s5", "c6s4", "响应外部事件"],
+    ["c6s5", "c3s2", "直接访问主存"],
+    ["c3s1", "c5s1", "服务 CPU 访存"]
+  ].forEach(([source, target, label]) => links.push({ source, target, label }));
+  return {
+    id: uid("graph"),
+    ownerId,
+    subject: cleanSubject,
+    title: title || "计算机组成原理知识图谱",
+    sourceName: sourceName || "26王道《计算机组成原理》.pdf",
+    extraction: extraction || null,
+    nodes,
+    links,
+    global: false,
+    createdAt: now(),
+    updatedAt: now()
+  };
+}
+
 function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction }) {
   const cleanSubject = normalizeSubject(subject);
   const graphSourceText = limitText(sourceText || title || sourceName || "");
+  if (looksLikeComputerOrganization(cleanSubject, graphSourceText)) {
+    return buildComputerOrganizationGraph({ ownerId, title, subject: cleanSubject, sourceName, sourceText: graphSourceText, extraction });
+  }
   const keywords = extractKeywords(graphSourceText, cleanSubject);
   const nodes = [{
     id: "n0",
     label: `${cleanSubject}知识主线`,
     group: "root",
+    level: 0,
     knowledgePoints: splitKnowledgeSentences(graphSourceText).slice(0, 6),
     details: `由${sourceName || "输入内容"}生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`
   }];
   const links = [];
-  keywords.forEach((keyword, index) => {
-    const nodeId = `n${index + 1}`;
+  const groups = [];
+  for (let i = 0; i < keywords.length; i += 3) groups.push(keywords.slice(i, i + 3));
+  groups.forEach((group, groupIndex) => {
+    const chapterId = `g${groupIndex + 1}`;
+    const chapterLabel = group[0] || `模块${groupIndex + 1}`;
     nodes.push({
-      id: nodeId,
-      label: keyword,
-      group: index % 3 === 0 ? "concept" : "topic",
-      knowledgePoints: knowledgePointsForKeyword(graphSourceText, keyword),
-      details: `从书本内容和补充知识点中抽取的「${keyword}」相关知识。`
+      id: chapterId,
+      label: chapterLabel,
+      group: "chapter",
+      level: 1,
+      knowledgePoints: knowledgePointsForKeyword(graphSourceText, chapterLabel),
+      details: `从书本内容中抽取的一级模块：「${chapterLabel}」。`
     });
-    links.push({ source: "n0", target: nodeId, label: index % 2 === 0 ? "包含" : "关联" });
-    if (index > 1 && index % 2 === 0) links.push({ source: `n${index}`, target: nodeId, label: "递进" });
+    links.push({ source: "n0", target: chapterId, label: "一级模块" });
+    group.slice(1).forEach((keyword, sectionIndex) => {
+      const nodeId = `${chapterId}s${sectionIndex + 1}`;
+      nodes.push({
+        id: nodeId,
+        label: keyword,
+        group: sectionIndex % 2 === 0 ? "concept" : "topic",
+        level: 2,
+        knowledgePoints: knowledgePointsForKeyword(graphSourceText, keyword),
+        details: `从书本内容和补充知识点中抽取的「${keyword}」相关知识。`
+      });
+      links.push({ source: chapterId, target: nodeId, label: "包含" });
+    });
+    if (groupIndex > 0) links.push({ source: `g${groupIndex}`, target: chapterId, label: "递进" });
   });
   return {
     id: uid("graph"),
@@ -832,6 +1054,9 @@ function validateGraph(raw, fallback) {
       id: String(node.id || `n${index}`),
       label: String(node.label || node.name || `节点${index + 1}`),
       group: String(node.group || "topic"),
+      level: Number.isFinite(Number(node.level)) ? Number(node.level) : undefined,
+      x: Number.isFinite(Number(node.x)) ? Number(node.x) : undefined,
+      y: Number.isFinite(Number(node.y)) ? Number(node.y) : undefined,
       details: String(node.details || ""),
       knowledgePoints: Array.isArray(node.knowledgePoints) ? node.knowledgePoints.map(String) : []
     })),
@@ -849,6 +1074,7 @@ function validateGraph(raw, fallback) {
 function processGraphGenerationJob(jobId, payload) {
   setImmediate(async () => {
     try {
+      assertGraphJobActive(jobId);
       updateGraphJob(jobId, {
         status: "running",
         stage: "解析文件",
@@ -858,6 +1084,7 @@ function processGraphGenerationJob(jobId, payload) {
 
       const uploaded = payload.file?.filePath
         ? await extractUploadedBookFile(payload.file, (stats) => {
+          if (isGraphJobCanceled(jobId)) return;
           const totalPages = Number(stats.pages || 0);
           const currentPage = Number(stats.page || 0);
           const isOcrStage = String(stats.stage || "").startsWith("ocr") || /OCR/i.test(String(stats.method || ""));
@@ -872,9 +1099,10 @@ function processGraphGenerationJob(jobId, payload) {
               ? `${stats.method || "PDF 智能体"} 正在${isOcrStage ? "OCR" : "解析"}第 ${currentPage}/${totalPages} 页${pdfPageInfo}，已识别 ${stats.characters || 0} 字符`
               : (stats.message || `已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`))
           });
-        })
+        }, jobId)
         : payload.file?.buffer?.length
           ? extractUploadedBookBuffer(payload.file, (stats) => {
+            if (isGraphJobCanceled(jobId)) return;
             updateGraphJob(jobId, {
               progress: Math.min(58, 26 + Math.floor(stats.scannedStreams / 30)),
               message: `已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
@@ -882,6 +1110,7 @@ function processGraphGenerationJob(jobId, payload) {
           })
         : { text: "", meta: null };
 
+      assertGraphJobActive(jobId);
       updateGraphJob(jobId, {
         stage: "抽取知识点",
         progress: 66,
@@ -897,6 +1126,7 @@ function processGraphGenerationJob(jobId, payload) {
         throw new Error("PDF 文本层和 OCR 都未识别到可用于生成图谱的内容。请确认本机 PaddleOCR 可用，或在补充目录/知识点中粘贴章节信息后再生成。");
       }
 
+      assertGraphJobActive(jobId);
       updateGraphJob(jobId, { stage: "构建图谱", progress: 82, message: "正在生成节点、关系和节点知识点" });
       const graph = buildGraphFromText({
         ownerId: payload.userId,
@@ -907,6 +1137,7 @@ function processGraphGenerationJob(jobId, payload) {
         extraction: uploaded.meta ? { ...uploaded.meta, agent: payload.extractor || "local-pdf-text-agent" } : null
       });
 
+      assertGraphJobActive(jobId);
       updateGraphJob(jobId, { stage: "保存图谱", progress: 94, message: "正在写入当前账号图谱库" });
       const db = readDb();
       ensureUser(db, payload.userId);
@@ -921,6 +1152,16 @@ function processGraphGenerationJob(jobId, payload) {
         meta: { ...graphJobs.get(jobId).meta, extraction: graph.extraction }
       });
     } catch (error) {
+      if (error.canceled || isGraphJobCanceled(jobId)) {
+        updateGraphJob(jobId, {
+          status: "canceled",
+          stage: "已终止",
+          progress: Math.max(0, Number(graphJobs.get(jobId)?.progress || 0)),
+          message: "已终止生成，当前表单内容已清空",
+          error: null
+        });
+        return;
+      }
       updateGraphJob(jobId, {
         status: "failed",
         stage: "生成失败",
@@ -1180,6 +1421,14 @@ async function handleApi(req, res, pathname, searchParams) {
     const job = graphJobs.get(params.id);
     if (!job) return notFound(res);
     return send(res, 200, { ok: true, job: publicGraphJob(job) });
+  }
+
+  params = routePattern(pathname, "/api/graphs/jobs/:id/cancel");
+  if (method === "POST" && params) {
+    const job = graphJobs.get(params.id);
+    if (!job) return notFound(res);
+    const canceled = cancelGraphJob(params.id);
+    return send(res, 200, { ok: true, job: publicGraphJob(canceled) });
   }
 
   if (method === "POST" && pathname === "/api/graphs/generate-file") {
