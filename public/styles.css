@@ -667,18 +667,20 @@ p {
   stroke: #91a8ba;
   stroke-width: 2.2;
   opacity: 0.78;
+  paint-order: stroke;
 }
 
 .graph-link.tree {
-  stroke: #b7c7d4;
-  stroke-width: 1.7;
-  opacity: 0.5;
+  stroke: #789bb2;
+  stroke-width: 2.1;
+  opacity: 0.7;
 }
 
 .graph-link.cross {
-  stroke: #6f91ad;
-  stroke-width: 2.4;
-  opacity: 0.78;
+  stroke: #d1792b;
+  stroke-width: 3;
+  opacity: 0.92;
+  stroke-dasharray: 10 7;
 }
 
 .graph-link-label {
@@ -779,6 +781,44 @@ p {
 .graph-node-modal {
   display: grid;
   gap: 14px;
+  width: min(920px, calc(100vw - 34px));
+  max-height: min(86vh, 900px);
+  overflow: auto;
+}
+
+.node-context-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.node-context-grid article,
+.node-relations {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+  padding: 12px;
+}
+
+.node-context-grid strong,
+.node-relations h3,
+.graph-node-modal > h3 {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.node-context-grid p,
+.node-relations p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.node-relations {
+  display: grid;
+  gap: 6px;
 }
 
 .knowledge-point-list {

@@ -1154,10 +1154,19 @@ function makeGraphNode({ id, label, group, level, knowledgePoints = [], details 
 function fallbackOutlinePoints(label, parentLabel = "") {
   const topic = String(label || "知识点");
   const parent = String(parentLabel || "本模块");
+  const focused = [];
+  if (/Cache|缓存|高速缓冲/.test(topic)) focused.push("重点区分命中率、映射方式、替换算法、写策略和一致性问题。");
+  if (/CPU|处理器|控制器|数据通路|流水线/.test(topic)) focused.push("重点沿取指、译码、执行、访存、写回分析数据流和控制信号。");
+  if (/存储|主存|虚拟|页式|段式|磁盘|固态/.test(topic)) focused.push("重点比较容量、速度、成本、地址变换和访存路径。");
+  if (/指令|寻址|机器级|汇编|CISC|RISC/.test(topic)) focused.push("重点说明操作码、操作数位置、寻址过程和机器级执行结果。");
+  if (/总线|I\/O|接口|DMA|中断|外部设备/.test(topic)) focused.push("重点关注主机与外设之间的数据传送路径、控制方式和 CPU 参与程度。");
+  if (/数制|编码|定点|浮点|运算|移位|加减|乘除|整数/.test(topic)) focused.push("重点写清表示范围、符号位规则、溢出判断和运算步骤。");
   return [
-    `掌握「${topic}」的基本概念、适用条件和常见考法。`,
-    `理解「${topic}」在「${parent}」中的位置，并能和相邻知识点建立联系。`,
-    `复习时关注定义、结构关系、计算规则或执行流程中的易混淆点。`
+    `核心定位：「${topic}」是「${parent}」中的关键节点，先明确它解决的硬件组织或机器级执行问题。`,
+    `学习任务：能解释「${topic}」的定义、组成、工作流程和适用条件，并能画出简化关系图。`,
+    focused[0] || `复习重点：围绕「${topic}」整理概念边界、结构关系、典型公式或执行步骤。`,
+    `考查方式：常结合选择题、综合题或流程分析题，要求判断条件、比较差异并说明原因。`,
+    `易错提醒：不要孤立背诵「${topic}」，要说明它与「${parent}」及相邻节点之间的数据流、控制流或层次关系。`
   ];
 }
 

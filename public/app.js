@@ -37,7 +37,7 @@ const state = {
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
-const GRAPH_LAYOUT_VERSION = "graph-layout-v4";
+const GRAPH_LAYOUT_VERSION = "graph-layout-v5";
 const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细分"]);
 
 const teacherMenus = [
@@ -590,6 +590,33 @@ function graphLinkPath(source, target) {
   return `M ${source.x} ${source.y} C ${c1x} ${source.y}, ${c2x} ${target.y}, ${target.x} ${target.y}`;
 }
 
+function graphNodeHorizontalPad(node, index = 0) {
+  const level = graphNodeLevel(node || {}, index);
+  if (!node || level >= 2 || node.group === "detail") return 96;
+  return graphNodeRadius(node, index) + 8;
+}
+
+function graphRoutedLinkPath(source, target, link, index = 0, sourceNode = null, targetNode = null) {
+  const label = String(link?.label || "");
+  const treeLink = isTreeLink(link);
+  const sourcePad = graphNodeHorizontalPad(sourceNode, 0);
+  const targetPad = graphNodeHorizontalPad(targetNode, 0);
+  const startX = source.x + (source.x <= target.x ? sourcePad : -sourcePad);
+  const endX = target.x + (source.x <= target.x ? -targetPad : targetPad);
+  if (treeLink) {
+    const midX = (startX + endX) / 2;
+    return `M ${startX} ${source.y} C ${midX} ${source.y}, ${midX} ${target.y}, ${endX} ${target.y}`;
+  }
+  const direction = index % 2 === 0 ? 1 : -1;
+  const lift = 70 + (index % 5) * 18;
+  const midX = (startX + endX) / 2;
+  const midY = Math.min(source.y, target.y) - lift * direction;
+  if (/直接访问|响应|缓解|参与|连接/.test(label)) {
+    return `M ${startX} ${source.y} Q ${midX} ${midY} ${endX} ${target.y}`;
+  }
+  return `M ${startX} ${source.y} C ${midX} ${source.y - lift}, ${midX} ${target.y + lift}, ${endX} ${target.y}`;
+}
+
 function graphLabelLines(label, maxChars = 7, maxLines = 2) {
   const text = String(label || "");
   const lines = [];
@@ -628,30 +655,10 @@ function graphCanvasSize(graph) {
   if (!isComplexGraph(graph)) {
     return { width: GRAPH_WIDTH, height: GRAPH_HEIGHT, pixelHeight: 700, complex: false };
   }
-  const parents = graphParentMap(graph);
-  const children = graphChildrenMap(parents);
-  const root = nodes.find((node, index) => graphNodeLevel(node, index) === 0 || node.group === "root") || nodes[0];
-  const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]));
-  const childNodes = (id) => (children.get(id) || [])
-    .map((childId) => nodes.find((node) => node.id === childId))
-    .filter(Boolean);
-  const chapters = root
-    ? childNodes(root.id).filter((node) => graphNodeLevel(node, nodeIndex.get(node.id) || 0) <= 1)
-    : [];
-  const fallbackChapters = nodes.filter((node, index) => graphNodeLevel(node, index) === 1);
-  const chapterNodes = chapters.length ? chapters : fallbackChapters;
-  const sectionSpacing = 52;
-  const chapterGap = 58;
-  const totalRows = chapterNodes.reduce((sum, chapter) => {
-    const sections = childNodes(chapter.id).filter((node) => graphNodeLevel(node, nodeIndex.get(node.id) || 0) === 2);
-    const rowCount = Math.max(1, sections.length || childNodes(chapter.id).length);
-    return sum + rowCount;
-  }, 0);
-  const height = Math.max(980, 160 + totalRows * sectionSpacing + Math.max(0, chapterNodes.length - 1) * chapterGap);
   return {
-    width: 1900,
-    height,
-    pixelHeight: Math.min(1500, Math.max(780, Math.round(height * 0.64))),
+    width: 3060,
+    height: 1160,
+    pixelHeight: 820,
     complex: true
   };
 }
@@ -672,54 +679,60 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
   const chapterEntries = chapters.length
     ? chapters
     : nodes.map((node, index) => ({ node, index })).filter((entry) => graphNodeLevel(entry.node, entry.index) === 1);
-  const sectionSpacing = 52;
-  const chapterGap = 58;
-  const rootX = 92;
-  const chapterX = 260;
-  const sectionX = 520;
-  const detailStartX = 790;
-  const detailColumnGap = 220;
-  const detailRowGap = 42;
-  let cursorY = 96;
+  const rootX = 116;
+  const cellStartX = 340;
+  const cellStartY = 92;
+  const cellWidth = 650;
+  const cellHeight = 470;
+  const cellGapX = 30;
+  const cellGapY = 72;
+  const chapterOffsetX = 48;
+  const sectionOffsetX = 220;
+  const detailStartOffsetX = 385;
+  const detailColumnGap = 150;
+  const detailRowGap = 34;
   const chapterCenters = [];
 
-  chapterEntries.forEach((chapterEntry) => {
+  chapterEntries.forEach((chapterEntry, chapterIndex) => {
+    const column = chapterIndex % 4;
+    const row = Math.floor(chapterIndex / 4);
+    const cellLeft = cellStartX + column * (cellWidth + cellGapX);
+    const cellTop = cellStartY + row * (cellHeight + cellGapY);
     const sections = childEntries(chapterEntry.node.id).filter((entry) => graphNodeLevel(entry.node, entry.index) === 2);
     const effectiveSections = sections.length ? sections : childEntries(chapterEntry.node.id);
     const rowHeights = effectiveSections.map((sectionEntry) => {
       const detailCount = childEntries(sectionEntry.node.id).length;
-      return Math.max(sectionSpacing, Math.ceil(Math.max(1, detailCount) / 5) * detailRowGap + 12);
+      return Math.max(46, Math.ceil(Math.max(1, detailCount) / 3) * detailRowGap + 10);
     });
-    const laneHeight = Math.max(132, rowHeights.reduce((sum, rowHeight) => sum + rowHeight, 0));
-    const laneTop = cursorY;
-    const laneCenter = laneTop + laneHeight / 2;
-    positions[chapterEntry.node.id] = { x: chapterX, y: laneCenter };
+    const contentHeight = rowHeights.reduce((sum, rowHeight) => sum + rowHeight, 0);
+    const laneTop = cellTop + Math.max(70, (cellHeight - contentHeight) / 2);
+    const laneCenter = cellTop + cellHeight / 2;
+    positions[chapterEntry.node.id] = { x: cellLeft + chapterOffsetX, y: laneCenter };
     chapterCenters.push(laneCenter);
 
     let rowY = laneTop;
     effectiveSections.forEach((sectionEntry, sectionIndex) => {
-      const rowHeight = rowHeights[sectionIndex] || sectionSpacing;
+      const rowHeight = rowHeights[sectionIndex] || 46;
       const sectionY = rowY + rowHeight / 2;
-      positions[sectionEntry.node.id] = { x: sectionX, y: sectionY };
+      positions[sectionEntry.node.id] = { x: cellLeft + sectionOffsetX, y: sectionY };
       const details = childEntries(sectionEntry.node.id);
       details.forEach((detailEntry, detailIndex) => {
-        const column = detailIndex % 5;
-        const row = Math.floor(detailIndex / 5);
-        const rowCount = Math.max(1, Math.ceil(details.length / 5));
+        const detailColumn = detailIndex % 3;
+        const detailRow = Math.floor(detailIndex / 3);
+        const rowCount = Math.max(1, Math.ceil(details.length / 3));
         positions[detailEntry.node.id] = {
-          x: detailStartX + column * detailColumnGap,
-          y: sectionY + (row - (rowCount - 1) / 2) * detailRowGap
+          x: cellLeft + detailStartOffsetX + detailColumn * detailColumnGap,
+          y: sectionY + (detailRow - (rowCount - 1) / 2) * detailRowGap
         };
       });
       rowY += rowHeight;
     });
-    cursorY += laneHeight + chapterGap;
   });
 
   if (rootEntry.node) {
     positions[rootEntry.node.id] = {
       x: rootX,
-      y: chapterCenters.length ? (chapterCenters[0] + chapterCenters[chapterCenters.length - 1]) / 2 : height / 2
+      y: height / 2
     };
   }
 
@@ -728,8 +741,8 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
     if (positions[node.id]) return;
     const level = graphNodeLevel(node, index);
     positions[node.id] = {
-      x: level <= 1 ? chapterX : level === 2 ? sectionX : detailStartX + (orphanIndex % 5) * detailColumnGap,
-      y: Math.min(height - 70, 80 + orphanIndex * 48)
+      x: level <= 1 ? cellStartX : level === 2 ? cellStartX + sectionOffsetX : cellStartX + detailStartOffsetX + (orphanIndex % 3) * detailColumnGap,
+      y: Math.min(height - 70, 80 + orphanIndex * 42)
     };
     orphanIndex += 1;
   });
@@ -823,6 +836,10 @@ function renderGraphSvg(graph) {
   const nodes = graph.nodes || [];
   const view = getGraphView(graph);
   const positions = view.positions;
+  const nodeEntriesById = new Map(nodes.map((node, index) => [node.id, { node, index }]));
+  const renderedLinks = links
+    .map((link, index) => ({ link, index }))
+    .sort((a, b) => Number(!isTreeLink(a.link)) - Number(!isTreeLink(b.link)));
   return `
     <svg class="graph-svg" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" style="height:${size.pixelHeight}px; min-height:${size.pixelHeight}px" role="img" aria-label="${escapeHtml(graph.title)}">
       <defs>
@@ -838,17 +855,19 @@ function renderGraphSvg(graph) {
         </filter>
       </defs>
       <g class="graph-viewport" transform="translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})">
-        ${links.map((link, index) => {
+        ${renderedLinks.map(({ link, index }) => {
           const s = positions[link.source];
           const t = positions[link.target];
           if (!s || !t) return "";
+          const sourceEntry = nodeEntriesById.get(link.source);
+          const targetEntry = nodeEntriesById.get(link.target);
           const mx = (s.x + t.x) / 2;
           const my = (s.y + t.y) / 2;
           const label = String(link.label || "关联");
           const treeLink = isTreeLink(link);
           const showLabel = !size.complex || !treeLink;
           return `
-            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${graphLinkPath(s, t)}" class="graph-link ${treeLink ? "tree" : "cross"}" marker-end="url(#arrowHead)"></path>
+            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${graphRoutedLinkPath(s, t, link, index, sourceEntry?.node, targetEntry?.node)}" class="graph-link ${treeLink ? "tree" : "cross"}" marker-end="url(#arrowHead)"></path>
             ${showLabel ? `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(label)}</text>` : ""}
           `;
         }).join("")}
@@ -884,7 +903,10 @@ function renderGraphNodeModal() {
   const graph = state.data?.knowledgeGraphs?.find((item) => item.id === state.graphNodeModal.graphId);
   const node = graph?.nodes?.find((item) => item.id === state.graphNodeModal.nodeId);
   if (!graph || !node) return "";
-  const points = Array.isArray(node.knowledgePoints) && node.knowledgePoints.length ? node.knowledgePoints : ["该节点暂无更细知识点，可在生成时补充更多目录或正文内容。"];
+  const context = graphNodeContext(graph, node);
+  const points = enrichedNodePoints(graph, node, context);
+  const childLabels = context.children.map((item) => item.label).slice(0, 12);
+  const relationLines = context.relationLines.slice(0, 10);
   return `
     <div class="modal-backdrop">
       <section class="modal graph-node-modal">
@@ -892,6 +914,31 @@ function renderGraphNodeModal() {
         <h2>${escapeHtml(node.label)}</h2>
         <p class="hint">${escapeHtml(graph.title)} · ${escapeHtml(graph.subject)}</p>
         ${node.details ? `<p class="answer-box">${escapeHtml(node.details)}</p>` : ""}
+        <div class="node-context-grid">
+          <article>
+            <strong>知识路径</strong>
+            <p>${escapeHtml(context.path.map((item) => item.label).join(" / ") || node.label)}</p>
+          </article>
+          <article>
+            <strong>上级节点</strong>
+            <p>${escapeHtml(context.parent?.label || "当前为根节点")}</p>
+          </article>
+          <article>
+            <strong>下级节点</strong>
+            <p>${escapeHtml(childLabels.length ? childLabels.join("、") : "暂无下级节点，可结合本节点知识点复习。")}</p>
+          </article>
+          <article>
+            <strong>关联数量</strong>
+            <p>入边 ${context.incoming.length} 条，出边 ${context.outgoing.length} 条，跨章节 ${context.crossRelations.length} 条。</p>
+          </article>
+        </div>
+        ${relationLines.length ? `
+          <div class="node-relations">
+            <h3>关系线说明</h3>
+            ${relationLines.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}
+          </div>
+        ` : ""}
+        <h3>知识点详情</h3>
         <div class="knowledge-point-list">
           ${points.map((point, index) => `<article><strong>${index + 1}</strong><p>${escapeHtml(point)}</p></article>`).join("")}
         </div>
@@ -913,6 +960,8 @@ function applyGraphTransform(svg, graphId) {
 function updateGraphDom(svg, graphId) {
   const view = state.graphViews[graphId];
   if (!view) return;
+  const graph = state.data?.knowledgeGraphs?.find((item) => item.id === graphId);
+  const nodeEntriesById = new Map((graph?.nodes || []).map((node, index) => [node.id, { node, index }]));
   svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
     const position = view.positions[nodeEl.dataset.nodeId];
     if (position) nodeEl.setAttribute("transform", `translate(${position.x},${position.y})`);
@@ -921,7 +970,11 @@ function updateGraphDom(svg, graphId) {
     const source = view.positions[line.dataset.linkSource];
     const target = view.positions[line.dataset.linkTarget];
     if (!source || !target) return;
-    line.setAttribute("d", graphLinkPath(source, target));
+    const index = Number(line.dataset.linkIndex || 0);
+    const link = graph?.links?.[index] || { label: line.dataset.linkLabel || "" };
+    const sourceEntry = nodeEntriesById.get(line.dataset.linkSource);
+    const targetEntry = nodeEntriesById.get(line.dataset.linkTarget);
+    line.setAttribute("d", graphRoutedLinkPath(source, target, link, index, sourceEntry?.node, targetEntry?.node));
   });
   svg.querySelectorAll(".graph-link-label").forEach((label) => {
     const source = view.positions[label.dataset.linkSource];
@@ -930,6 +983,66 @@ function updateGraphDom(svg, graphId) {
     label.setAttribute("x", (source.x + target.x) / 2);
     label.setAttribute("y", (source.y + target.y) / 2);
   });
+}
+
+function uniqueTexts(items) {
+  const seen = new Set();
+  return items
+    .map((item) => String(item || "").trim())
+    .filter((item) => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+function graphNodeContext(graph, node) {
+  const nodesById = new Map((graph.nodes || []).map((item) => [item.id, item]));
+  const parents = graphParentMap(graph);
+  const children = graphChildrenMap(parents);
+  const path = [];
+  let currentId = node.id;
+  const guard = new Set();
+  while (currentId && !guard.has(currentId)) {
+    guard.add(currentId);
+    const current = nodesById.get(currentId);
+    if (current) path.unshift(current);
+    currentId = parents.get(currentId);
+  }
+  const childNodes = (children.get(node.id) || []).map((id) => nodesById.get(id)).filter(Boolean);
+  const incoming = (graph.links || []).filter((link) => link.target === node.id);
+  const outgoing = (graph.links || []).filter((link) => link.source === node.id);
+  const crossRelations = incoming.concat(outgoing).filter((link) => !isTreeLink(link));
+  const relationLines = incoming.concat(outgoing).map((link) => {
+    const source = nodesById.get(link.source)?.label || link.source;
+    const target = nodesById.get(link.target)?.label || link.target;
+    return `${source} -> ${target}：${link.label || "关联"}`;
+  });
+  return {
+    path,
+    parent: path.length > 1 ? path[path.length - 2] : null,
+    children: childNodes,
+    incoming,
+    outgoing,
+    crossRelations,
+    relationLines
+  };
+}
+
+function enrichedNodePoints(graph, node, context) {
+  const label = String(node.label || "该节点");
+  const parentLabel = context.parent?.label || graph.subject || "当前图谱";
+  const childLabels = context.children.map((item) => item.label).slice(0, 8);
+  const relationSummary = context.relationLines.slice(0, 5).join("；");
+  const generated = [
+    context.path.length ? `知识路径：${context.path.map((item) => item.label).join(" / ")}。` : "",
+    `学习定位：「${label}」属于「${parentLabel}」模块，复习时先明确它解决的问题，再看它与相邻节点的关系。`,
+    childLabels.length ? `下级知识点：${childLabels.join("、")}。这些节点可作为展开复习和出题的直接入口。` : `该节点是当前分支的末级知识点，适合用定义、步骤、适用条件和典型题型四个角度复习。`,
+    relationSummary ? `图谱关系：${relationSummary}。` : "",
+    `掌握要求：能用自己的话解释「${label}」，能说明它和「${parentLabel}」的联系，并能举出一个教材或试题中的应用场景。`,
+    `易错提醒：不要只记节点名称，要同时记录前提条件、数据流或控制流方向，以及它对性能、存储或执行过程的影响。`
+  ];
+  return uniqueTexts(generated.concat(node.knowledgePoints || [])).slice(0, 12);
 }
 
 function bindInteractiveGraph() {
