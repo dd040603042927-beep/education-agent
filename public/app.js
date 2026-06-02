@@ -37,7 +37,7 @@ const state = {
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
-const GRAPH_LAYOUT_VERSION = "graph-layout-v7-network";
+const GRAPH_LAYOUT_VERSION = "graph-layout-v8-elastic-network";
 const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细分"]);
 
 const teacherMenus = [
@@ -617,14 +617,14 @@ function graphRoutedLinkPath(source, target, link, index = 0, sourceNode = null,
   return `M ${startX} ${source.y} C ${midX} ${source.y - lift}, ${midX} ${target.y + lift}, ${endX} ${target.y}`;
 }
 
-function graphNetworkLinkPath(source, target, link, index = 0, sourceNode = null, targetNode = null) {
+function graphNetworkLinkPath(source, target, link, index = 0, sourceNode = null, targetNode = null, totalNodes = 0) {
   const dx = target.x - source.x;
   const dy = target.y - source.y;
   const distance = Math.max(1, Math.hypot(dx, dy));
   const unitX = dx / distance;
   const unitY = dy / distance;
-  const sourceRadius = graphNetworkRadius(sourceNode || {}, 0) + 6;
-  const targetRadius = graphNetworkRadius(targetNode || {}, 0) + 7;
+  const sourceRadius = graphNetworkRadius(sourceNode || {}, 0, totalNodes) + 8;
+  const targetRadius = graphNetworkRadius(targetNode || {}, 0, totalNodes) + 9;
   const startX = source.x + unitX * sourceRadius;
   const startY = source.y + unitY * sourceRadius;
   const endX = target.x - unitX * targetRadius;
@@ -638,11 +638,43 @@ function graphNetworkLinkPath(source, target, link, index = 0, sourceNode = null
   return `M ${startX} ${startY} Q ${midX} ${midY} ${endX} ${endY}`;
 }
 
+function graphLinkLabelPoint(source, target, index = 0, treeLink = false) {
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const distance = Math.max(1, Math.hypot(dx, dy));
+  const ratio = treeLink ? 0.58 : 0.5;
+  const normalX = -dy / distance;
+  const normalY = dx / distance;
+  const offset = treeLink ? ((index % 3) - 1) * 10 : ((index % 5) - 2) * 9;
+  return {
+    x: source.x + dx * ratio + normalX * offset,
+    y: source.y + dy * ratio + normalY * offset
+  };
+}
+
+function graphVisibleLinkLabel(label) {
+  const text = String(label || "关联").trim();
+  return text.length > 10 ? `${text.slice(0, 9)}…` : text;
+}
+
 function graphLabelLines(label, maxChars = 7, maxLines = 2) {
   const text = String(label || "");
   const lines = [];
   for (let index = 0; index < text.length && lines.length < maxLines; index += maxChars) {
     lines.push(text.slice(index, index + maxChars));
+  }
+  return lines.length ? lines : [""];
+}
+
+function graphInnerLabelLines(label, radius, root = false) {
+  const text = String(label || "").replace(/\s+/g, "");
+  const maxChars = root ? 6 : radius >= 44 ? 5 : radius >= 36 ? 4 : 3;
+  const maxLines = root ? 3 : radius >= 36 ? 3 : 2;
+  const capacity = maxChars * maxLines;
+  const visible = text.length > capacity ? `${text.slice(0, Math.max(1, capacity - 1))}…` : text;
+  const lines = [];
+  for (let index = 0; index < visible.length && lines.length < maxLines; index += maxChars) {
+    lines.push(visible.slice(index, index + maxChars));
   }
   return lines.length ? lines : [""];
 }
@@ -676,11 +708,39 @@ function graphCanvasSize(graph) {
   if (!nodes.length) {
     return { width: GRAPH_WIDTH, height: GRAPH_HEIGHT, pixelHeight: 700, complex: false };
   }
+  if (nodes.length > 220) {
+    return {
+      width: 3400,
+      height: 2200,
+      pixelHeight: 880,
+      complex: true,
+      nodeCount: nodes.length
+    };
+  }
+  if (nodes.length > 90) {
+    return {
+      width: 2800,
+      height: 1800,
+      pixelHeight: 860,
+      complex: true,
+      nodeCount: nodes.length
+    };
+  }
+  if (nodes.length > 40) {
+    return {
+      width: 2200,
+      height: 1400,
+      pixelHeight: 820,
+      complex: true,
+      nodeCount: nodes.length
+    };
+  }
   return {
     width: 1680,
-    height: 920,
+    height: 980,
     pixelHeight: 790,
-    complex: true
+    complex: true,
+    nodeCount: nodes.length
   };
 }
 
@@ -694,12 +754,14 @@ function hashText(value) {
   return Math.abs(hash >>> 0);
 }
 
-function graphNetworkRadius(node, index = 0) {
+function graphNetworkRadius(node, index = 0, totalNodes = 0) {
   const level = graphNodeLevel(node, index);
-  if (level === 0 || node.group === "root") return 38;
-  if (level === 1 || node.group === "chapter") return 25;
-  if (level === 2 || node.group === "concept" || node.group === "topic") return 18;
-  return 14;
+  const dense = totalNodes > 220;
+  const medium = totalNodes > 90;
+  if (level === 0 || node.group === "root") return dense ? 58 : medium ? 62 : 66;
+  if (level === 1 || node.group === "chapter") return dense ? 42 : medium ? 46 : 50;
+  if (level === 2 || node.group === "concept" || node.group === "topic") return dense ? 34 : medium ? 38 : 42;
+  return dense ? 30 : medium ? 34 : 36;
 }
 
 function clampGraphPoint(point, width, height, padding = 50) {
@@ -708,7 +770,11 @@ function clampGraphPoint(point, width, height, padding = 50) {
 }
 
 function defaultGraphScale(size) {
-  return size.complex ? 1.24 : 0.72;
+  if (!size.complex) return 0.72;
+  if ((size.nodeCount || 0) > 220) return 0.82;
+  if ((size.nodeCount || 0) > 90) return 0.9;
+  if ((size.nodeCount || 0) > 40) return 0.98;
+  return 1.08;
 }
 
 function defaultGraphOffset(size, scale) {
@@ -721,7 +787,11 @@ function defaultGraphOffset(size, scale) {
 
 function getComplexGraphPositions(graph, width, height, parents, children) {
   const nodes = graph.nodes || [];
+  const totalNodes = nodes.length;
   const byId = new Map(nodes.map((node, index) => [node.id, { node, index }]));
+  const linkEntries = (graph.links || [])
+    .map((link, index) => ({ link, index, source: byId.get(link.source), target: byId.get(link.target) }))
+    .filter((entry) => entry.source && entry.target);
   const positions = {};
   const anchors = {};
   const rootEntry = nodes
@@ -737,10 +807,10 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
     ? chapters
     : nodes.map((node, index) => ({ node, index })).filter((entry) => graphNodeLevel(entry.node, entry.index) === 1);
   const center = { x: width / 2, y: height / 2 + 8 };
-  const chapterRadiusX = 360;
-  const chapterRadiusY = 245;
-  const sectionRadius = 116;
-  const detailRadius = 58;
+  const chapterRadiusX = Math.max(430, width * 0.34);
+  const chapterRadiusY = Math.max(310, height * 0.28);
+  const sectionRadius = totalNodes > 90 ? 240 : 175;
+  const detailRadius = totalNodes > 90 ? 118 : 88;
 
   if (rootEntry.node) {
     positions[rootEntry.node.id] = { ...center };
@@ -770,8 +840,11 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
       const details = childEntries(sectionEntry.node.id);
       details.forEach((detailEntry, detailIndex) => {
         const seed = hashText(detailEntry.node.id);
-        const detailAngle = localAngle + (detailIndex / Math.max(1, details.length)) * Math.PI * 2 + (seed % 17) * 0.015;
-        const radius = detailRadius + (detailIndex % 3) * 18;
+        const ringCapacity = totalNodes > 90 ? 8 : 7;
+        const ring = Math.floor(detailIndex / ringCapacity);
+        const ringIndex = detailIndex % ringCapacity;
+        const detailAngle = localAngle + (ringIndex / ringCapacity) * Math.PI * 2 + (seed % 29) * 0.018 + ring * 0.23;
+        const radius = detailRadius + ring * (totalNodes > 90 ? 66 : 52);
         positions[detailEntry.node.id] = {
           x: sectionAnchor.x + Math.cos(detailAngle) * radius,
           y: sectionAnchor.y + Math.sin(detailAngle) * radius
@@ -786,7 +859,7 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
     if (positions[node.id]) return;
     const seed = hashText(node.id);
     const angle = (orphanIndex / Math.max(1, nodes.length)) * Math.PI * 2 + (seed % 360) * Math.PI / 180;
-    const radius = 340 + (seed % 160);
+    const radius = Math.max(width, height) * 0.28 + (seed % 220);
     positions[node.id] = {
       x: center.x + Math.cos(angle) * radius,
       y: center.y + Math.sin(angle) * radius * 0.72
@@ -797,7 +870,7 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
 
   nodes.forEach((node) => clampGraphPoint(positions[node.id], width, height));
 
-  const relaxationIterations = nodes.length > 260 ? 32 : nodes.length > 140 ? 58 : 90;
+  const relaxationIterations = totalNodes > 260 ? 70 : totalNodes > 140 ? 110 : 140;
   for (let iteration = 0; iteration < relaxationIterations; iteration += 1) {
     for (let i = 0; i < nodes.length; i += 1) {
       const a = nodes[i];
@@ -810,26 +883,53 @@ function getComplexGraphPositions(graph, width, height, parents, children) {
         const dx = pb.x - pa.x;
         const dy = pb.y - pa.y;
         const distance = Math.max(0.1, Math.hypot(dx, dy));
-        const minDistance = graphNetworkRadius(a, i) + graphNetworkRadius(b, j) + 14;
-        if (distance >= minDistance) continue;
-        const push = (minDistance - distance) * 0.28;
+        const minDistance = graphNetworkRadius(a, i, totalNodes) + graphNetworkRadius(b, j, totalNodes) + (totalNodes > 90 ? 38 : 30);
         const ux = dx / distance;
         const uy = dy / distance;
+        let push = 0;
+        if (distance < minDistance) {
+          push = (minDistance - distance) * 0.48;
+        } else if (distance < minDistance * 1.45) {
+          push = (minDistance * 1.45 - distance) * 0.035;
+        }
+        if (!push) continue;
         pb.x += ux * push;
         pb.y += uy * push;
         pa.x -= ux * push;
         pa.y -= uy * push;
       }
     }
+    linkEntries.forEach(({ link, source, target }) => {
+      const sourcePosition = positions[source.node.id];
+      const targetPosition = positions[target.node.id];
+      if (!sourcePosition || !targetPosition) return;
+      const dx = targetPosition.x - sourcePosition.x;
+      const dy = targetPosition.y - sourcePosition.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const desired = graphNetworkRadius(source.node, source.index, totalNodes)
+        + graphNetworkRadius(target.node, target.index, totalNodes)
+        + (isTreeLink(link) ? (totalNodes > 90 ? 210 : 155) : (totalNodes > 90 ? 290 : 220));
+      const move = clamp((distance - desired) * 0.018, -8, 8);
+      const ux = dx / distance;
+      const uy = dy / distance;
+      const sourceLevel = graphNodeLevel(source.node, source.index);
+      const targetLevel = graphNodeLevel(target.node, target.index);
+      const sourceWeight = sourceLevel === 0 ? 0.22 : 0.5;
+      const targetWeight = targetLevel === 0 ? 0.22 : 0.5;
+      sourcePosition.x += ux * move * sourceWeight;
+      sourcePosition.y += uy * move * sourceWeight;
+      targetPosition.x -= ux * move * targetWeight;
+      targetPosition.y -= uy * move * targetWeight;
+    });
     nodes.forEach((node) => {
       const position = positions[node.id];
       const anchor = anchors[node.id];
       if (!position || !anchor) return;
       const level = graphNodeLevel(node, byId.get(node.id)?.index || 0);
-      const attraction = level === 0 ? 0.09 : level === 1 ? 0.055 : 0.03;
+      const attraction = level === 0 ? 0.08 : level === 1 ? 0.035 : 0.014;
       position.x += (anchor.x - position.x) * attraction;
       position.y += (anchor.y - position.y) * attraction;
-      clampGraphPoint(position, width, height, 42);
+      clampGraphPoint(position, width, height, 90);
     });
   }
 
@@ -946,44 +1046,42 @@ function renderGraphSvg(graph) {
           if (!s || !t) return "";
           const sourceEntry = nodeEntriesById.get(link.source);
           const targetEntry = nodeEntriesById.get(link.target);
-          const mx = (s.x + t.x) / 2;
-          const my = (s.y + t.y) / 2;
-          const label = String(link.label || "关联");
           const treeLink = isTreeLink(link);
-          const showLabel = !size.complex && !treeLink;
-          const linkPath = graphNetworkLinkPath(s, t, link, index, sourceEntry?.node, targetEntry?.node);
+          const linkPath = graphNetworkLinkPath(s, t, link, index, sourceEntry?.node, targetEntry?.node, nodes.length);
           return `
             <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link halo ${treeLink ? "tree" : "cross"}"></path>
             <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link ${treeLink ? "tree" : "cross"}"></path>
-            ${showLabel ? `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${mx}" y="${my}" class="graph-link-label">${escapeHtml(label)}</text>` : ""}
           `;
         }).join("")}
         ${nodes.map((node, index) => {
           const p = positions[node.id] || { x: width / 2, y: height / 2 };
           const root = index === 0 || node.group === "root";
           const level = graphNodeLevel(node, index);
-          const radius = size.complex ? graphNetworkRadius(node, index) : graphNodeRadius(node, index);
+          const radius = size.complex ? graphNetworkRadius(node, index, nodes.length) : graphNodeRadius(node, index);
           const groupClass = graphGroupClass(node.group);
           const label = String(node.label || "");
-          const outsideLabel = size.complex && !root;
-          const labelLeft = p.x < width / 2;
-          const labelX = outsideLabel ? (labelLeft ? -radius - 10 : radius + 10) : 0;
-          const labelClass = `${root ? "root inside" : outsideLabel ? `outside ${labelLeft ? "label-left" : "label-right"}` : "inside label-center"}`;
-          const labelLines = graphLabelLines(label, outsideLabel ? (level <= 1 ? 12 : 9) : root ? 7 : 6, outsideLabel ? 2 : 2);
-          const pointCount = Array.isArray(node.knowledgePoints) ? node.knowledgePoints.length : 0;
+          const labelLines = graphInnerLabelLines(label, radius, root);
+          const lineHeight = root ? 15 : radius >= 42 ? 13 : radius >= 34 ? 11 : 10;
           return `
             <g class="graph-node level-${level} ${groupClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
               <title>${escapeHtml(label)}</title>
               <circle r="${radius}" class="${root ? "root" : groupClass}"></circle>
               ${labelLines.map((line, lineIndex) => {
-                const labelY = outsideLabel
-                  ? (labelLines.length === 1 ? 0 : -7 + lineIndex * 14)
-                  : (labelLines.length === 1 ? -3 : -8 + lineIndex * 15);
-                return `<text x="${labelX}" y="${labelY}" class="${labelClass}">${escapeHtml(line)}</text>`;
+                const labelY = (lineIndex - (labelLines.length - 1) / 2) * lineHeight;
+                return `<text x="0" y="${labelY}" class="inside label-center ${root ? "root" : ""}">${escapeHtml(line)}</text>`;
               }).join("")}
-              ${pointCount && !outsideLabel ? `<text y="${radius - 11}" class="count ${root ? "root" : ""}">${pointCount} 个知识点</text>` : ""}
             </g>
           `;
+        }).join("")}
+        ${renderedLinks.map(({ link, index }) => {
+          const s = positions[link.source];
+          const t = positions[link.target];
+          if (!s || !t) return "";
+          const label = String(link.label || "关联");
+          const treeLink = isTreeLink(link);
+          const labelPoint = graphLinkLabelPoint(s, t, index, treeLink);
+          const visibleLabel = graphVisibleLinkLabel(label);
+          return `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${labelPoint.x}" y="${labelPoint.y}" class="graph-link-label ${treeLink ? "tree" : "cross"}">${escapeHtml(visibleLabel)}</text>`;
         }).join("")}
       </g>
     </svg>
@@ -1053,7 +1151,8 @@ function updateGraphDom(svg, graphId) {
   const view = state.graphViews[graphId];
   if (!view) return;
   const graph = state.data?.knowledgeGraphs?.find((item) => item.id === graphId);
-  const nodeEntriesById = new Map((graph?.nodes || []).map((node, index) => [node.id, { node, index }]));
+  const graphNodes = graph?.nodes || [];
+  const nodeEntriesById = new Map(graphNodes.map((node, index) => [node.id, { node, index }]));
   svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
     const position = view.positions[nodeEl.dataset.nodeId];
     if (position) nodeEl.setAttribute("transform", `translate(${position.x},${position.y})`);
@@ -1066,14 +1165,17 @@ function updateGraphDom(svg, graphId) {
     const link = graph?.links?.[index] || { label: line.dataset.linkLabel || "" };
     const sourceEntry = nodeEntriesById.get(line.dataset.linkSource);
     const targetEntry = nodeEntriesById.get(line.dataset.linkTarget);
-    line.setAttribute("d", graphNetworkLinkPath(source, target, link, index, sourceEntry?.node, targetEntry?.node));
+    line.setAttribute("d", graphNetworkLinkPath(source, target, link, index, sourceEntry?.node, targetEntry?.node, graphNodes.length));
   });
   svg.querySelectorAll(".graph-link-label").forEach((label) => {
     const source = view.positions[label.dataset.linkSource];
     const target = view.positions[label.dataset.linkTarget];
     if (!source || !target) return;
-    label.setAttribute("x", (source.x + target.x) / 2);
-    label.setAttribute("y", (source.y + target.y) / 2);
+    const index = Number(label.dataset.linkLabel || 0);
+    const link = graph?.links?.[index] || {};
+    const point = graphLinkLabelPoint(source, target, index, isTreeLink(link));
+    label.setAttribute("x", point.x);
+    label.setAttribute("y", point.y);
   });
 }
 
@@ -1230,8 +1332,8 @@ function bindInteractiveGraph() {
     const dx = ((event.clientX - dragged.x) * size.width) / dragged.width / view.scale;
     const dy = ((event.clientY - dragged.y) * size.height) / dragged.height / view.scale;
     view.positions[dragged.nodeId] = {
-      x: clamp(dragged.startX + dx, 30, size.width - 30),
-      y: clamp(dragged.startY + dy, 30, size.height - 30)
+      x: clamp(dragged.startX + dx, 90, size.width - 90),
+      y: clamp(dragged.startY + dy, 90, size.height - 90)
     };
     updateGraphDom(svg, graphId);
   });

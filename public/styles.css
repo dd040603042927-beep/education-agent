@@ -664,15 +664,15 @@ p {
   stroke: #2b84b8;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.65;
-  opacity: 0.58;
+  stroke-width: 1.8;
+  opacity: 0.6;
   vector-effect: non-scaling-stroke;
 }
 
 .graph-link.tree {
   stroke: #2f8fc6;
-  stroke-width: 1.55;
-  opacity: 0.54;
+  stroke-width: 1.65;
+  opacity: 0.56;
 }
 
 .graph-link.cross {
@@ -683,24 +683,37 @@ p {
 
 .graph-link.halo {
   stroke: #ffffff;
-  stroke-width: 6;
+  stroke-width: 7;
   opacity: 0.95;
   marker-end: none;
 }
 
 .graph-link-label {
-  fill: #536f83;
-  font-size: 12px;
+  fill: #2f5f82;
+  font-size: 10px;
   text-anchor: middle;
+  dominant-baseline: middle;
+  font-weight: 800;
   paint-order: stroke;
-  stroke: white;
-  stroke-width: 4.5px;
+  stroke: rgba(255, 255, 255, 0.96);
+  stroke-width: 5px;
+  pointer-events: none;
+}
+
+.graph-link-label.tree {
+  fill: #41718e;
+  font-size: 9.5px;
+}
+
+.graph-link-label.cross {
+  fill: #1f638c;
+  font-size: 10.5px;
 }
 
 .graph-node circle {
   fill: #2f88c8;
   stroke: #ffffff;
-  stroke-width: 2.5px;
+  stroke-width: 3px;
   vector-effect: non-scaling-stroke;
 }
 
@@ -756,29 +769,37 @@ p {
   text-anchor: middle;
   dominant-baseline: middle;
   font-weight: 800;
-  font-size: 11px;
+  font-size: 10px;
   pointer-events: none;
   paint-order: stroke;
-  stroke: rgba(255, 255, 255, 0.92);
-  stroke-width: 3.5px;
+  stroke: rgba(20, 79, 112, 0.32);
+  stroke-width: 2.3px;
 }
 
 .graph-node text.root {
   fill: #fff;
-  font-size: 13px;
+  font-size: 12px;
   stroke: rgba(16, 73, 95, 0.42);
   stroke-width: 2px;
 }
 
 .graph-node.level-3 text {
-  font-size: 10.5px;
+  font-size: 8.8px;
   font-weight: 700;
 }
 
 .graph-node text.inside {
   fill: #ffffff;
-  stroke: rgba(24, 70, 102, 0.36);
-  stroke-width: 2.4px;
+  stroke: rgba(23, 67, 96, 0.45);
+  stroke-width: 2.1px;
+}
+
+.graph-node.level-1 text.inside {
+  font-size: 10.8px;
+}
+
+.graph-node.level-2 text.inside {
+  font-size: 9.5px;
 }
 
 .graph-node text.outside {
