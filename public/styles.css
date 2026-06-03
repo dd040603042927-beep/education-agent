@@ -1660,6 +1660,18 @@ p {
   gap: 8px;
 }
 
+.model-code-head .model-code-tools {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.model-code-head .model-code-tools button {
+  width: auto;
+}
+
 .model-code-panel textarea {
   min-height: 0;
   height: 100%;
@@ -1729,12 +1741,14 @@ p {
 
 .run-result-panel strong {
   color: var(--text);
+  font-size: 17px;
 }
 
 .run-result-panel p {
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.6;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.7;
 }
 
 .property-grid {

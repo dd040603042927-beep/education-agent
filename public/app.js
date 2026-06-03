@@ -385,33 +385,9 @@ print("accuracy:", round(model.score(X_test, y_test), 3))`
   },
   "ml-cnn": {
     title: "卷积神经网络 CNN",
-    chapter: "深度学习 · 卷积、池化与分类",
-    result: "测试结果：演示网络可完成一次前向传播，输出 batch_size=4 的 10 类 logits。",
-    code: `import torch
-import torch.nn as nn
-
-class TinyCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(8, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(16, 10)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-model = TinyCNN()
-x = torch.randn(4, 1, 28, 28)
-logits = model(x)
-print("logits_shape:", tuple(logits.shape))
-print("prediction:", logits.argmax(dim=1).tolist())`
+    chapter: "深度学习 · 自定义卷积网络",
+    result: "运行结果：请先输入自定义 CNN 或其他深度学习算法代码，再点击运行测试。",
+    code: ""
   }
 };
 
@@ -2897,10 +2873,11 @@ function modelCodeDefinition() {
   const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
   if (component?.props?.code !== undefined || component?.kind === "customAlgorithm") {
     const base = mlAlgorithmForType(component.type);
+    const hasSavedCode = component?.props && Object.prototype.hasOwnProperty.call(component.props, "code");
     return {
       title: component.label || base?.title || "自定义算法模型",
       chapter: component.props?.chapter || base?.chapter || "自定义机器学习模型",
-      code: component.props?.code || base?.code || "",
+      code: hasSavedCode ? component.props.code : base?.code || "",
       result: component.props?.expectedResult || component.props?.runResult || base?.result || "模拟运行完成：代码已载入，可继续接入 Python 执行环境返回真实指标。"
     };
   }
@@ -2911,16 +2888,17 @@ function modelCodeDefinition() {
 
 function openModelCode(type, componentId = null) {
   const component = state.modelComponents.find((item) => item.id === componentId);
+  const hasSavedCode = component?.props && Object.prototype.hasOwnProperty.call(component.props, "code");
   const algorithm = component?.props?.code !== undefined || component?.kind === "customAlgorithm"
     ? {
-      code: component.props?.code || "",
+      code: hasSavedCode ? component.props.code : "",
       result: component.props?.runResult || component.props?.expectedResult || ""
     }
     : mlAlgorithmForType(type);
   if (!algorithm && !component) return;
   state.modelCodeType = type;
   state.modelCodeComponentId = componentId;
-  state.modelCodeDraft = component?.props?.code || algorithm?.code || "";
+  state.modelCodeDraft = hasSavedCode ? component.props.code : algorithm?.code || "";
   state.modelRunResult = component?.props?.runResult || "";
   state.modelCodeRan = Boolean(component?.props?.runResult);
 }
@@ -3330,6 +3308,13 @@ function bindModelPage() {
       state.selectedComponentId = state.modelComponents[0]?.id || null;
       state.modelRunResult = state.modelComponents[0]?.props?.runResult || "";
       resetModelCodeState();
+      if (model.subject === "机器学习") {
+        const codeComponent = state.modelComponents.find((component) => componentSupportsCode(component));
+        if (codeComponent) {
+          state.selectedComponentId = codeComponent.id;
+          openModelCode(codeComponent.type, codeComponent.id);
+        }
+      }
       renderContent();
     });
   });
