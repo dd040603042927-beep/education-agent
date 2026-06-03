@@ -46,6 +46,11 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
 input,
 select,
 textarea {
@@ -1323,6 +1328,30 @@ p {
   margin-top: 4px;
 }
 
+.compact-citations {
+  display: grid;
+  gap: 4px;
+  margin-top: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compact-citations strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.compact-citations span,
+.compact-citations small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .bubble .citation-list {
   gap: 6px;
 }
@@ -1339,7 +1368,7 @@ p {
 }
 
 .composer.rich-composer {
-  grid-template-columns: 220px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .ai-side-card,
@@ -1416,6 +1445,19 @@ p {
   align-content: start;
 }
 
+.lab-head {
+  display: grid;
+  gap: 12px;
+}
+
+.lab-head h3 {
+  font-size: 18px;
+}
+
+.lab-head .compact-label {
+  width: 100%;
+}
+
 .palette {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1441,6 +1483,25 @@ p {
 .palette-item span {
   font-size: 22px;
   color: var(--primary);
+}
+
+.custom-algorithm-form {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfdff;
+}
+
+.custom-algorithm-form h4 {
+  font-size: 15px;
+}
+
+.custom-algorithm-form textarea {
+  min-height: 116px;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 13px;
 }
 
 .model-canvas {
@@ -1561,17 +1622,25 @@ p {
   font-size: 13px;
 }
 
-.model-code-panel pre {
+.model-code-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-code-panel textarea {
   min-height: 0;
-  margin: 0;
+  height: 100%;
   overflow: auto;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #0f172a;
   color: #e5eef9;
+  font-family: Consolas, "SFMono-Regular", monospace;
   font-size: 13px;
   line-height: 1.55;
+  resize: none;
 }
 
 .model-code-actions {
@@ -1595,6 +1664,25 @@ p {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #f8fbfd;
+}
+
+.run-result-panel {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.run-result-panel strong {
+  color: var(--text);
+}
+
+.run-result-panel p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .property-grid {

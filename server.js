@@ -2844,10 +2844,15 @@ function addWrongNote(db, userId, note) {
 
 function formatCitations(citations) {
   if (!citations.length) return "暂无课程资料引用。";
-  return citations.map((citation) => {
+  const shown = citations.slice(0, 2);
+  const lines = shown.map((citation) => {
     const location = citation.page ? `${citation.chapter || "课程片段"}，第 ${citation.page} 页` : (citation.chapter || "知识图谱节点");
-    return `[${citation.id}] ${citation.sourceName || citation.title} · ${location}`;
-  }).join("\n");
+    const source = String(citation.sourceName || citation.title || "课程资料").replace(/\s+/g, " ").slice(0, 28);
+    const compactLocation = String(location || "").replace(/\s+/g, " ").slice(0, 36);
+    return `[${citation.id}] ${source} · ${compactLocation}`;
+  });
+  if (citations.length > shown.length) lines.push(`还有 ${citations.length - shown.length} 条引用，已放在右侧“引用来源”栏。`);
+  return lines.join("\n");
 }
 
 function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {

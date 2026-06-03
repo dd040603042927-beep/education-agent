@@ -16,7 +16,10 @@ const state = {
   selectedComponentId: null,
   loadedModelId: null,
   modelCodeType: null,
+  modelCodeComponentId: null,
+  modelCodeDraft: "",
   modelCodeRan: false,
+  modelRunResult: "",
   activeThreadId: null,
   selectedMessages: new Set(),
   selectedClassId: null,
@@ -440,6 +443,11 @@ function escapeHtml(value) {
 
 function escapeMultiline(value) {
   return escapeHtml(value).replace(/\n/g, "<br />");
+}
+
+function compactText(value, maxLength = 90) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 function fmtTime(value) {
@@ -2530,26 +2538,54 @@ function renderCitationList(citations = []) {
   if (!citations.length) return `<p class="hint">本轮回答暂无明确引用。上传课程资料后，系统会显示 PDF/讲义来源、章节和页码。</p>`;
   return `
     <div class="citation-list">
-      ${citations.map((citation) => `
+      ${citations.slice(0, 5).map((citation) => `
         <article>
           <strong>[${escapeHtml(citation.id)}] ${escapeHtml(citation.sourceName || citation.title || "课程资料")}</strong>
           <span>${escapeHtml(citation.chapter || "课程片段")}${citation.page ? ` · 第 ${citation.page} 页` : ""}</span>
-          <p>${escapeHtml(citation.quote || "")}</p>
+          <p>${escapeHtml(compactText(citation.quote || "", 120))}</p>
         </article>
       `).join("")}
     </div>
   `;
 }
 
+function renderCompactCitationList(citations = []) {
+  if (!citations.length) return "";
+  const shown = citations.slice(0, 2);
+  return `
+    <div class="compact-citations">
+      <strong>引用来源</strong>
+      ${shown.map((citation) => `
+        <span>[${escapeHtml(citation.id)}] ${escapeHtml(compactText(citation.sourceName || citation.title || "课程资料", 26))}${citation.page ? ` · 第 ${citation.page} 页` : ""}</span>
+      `).join("")}
+      ${citations.length > shown.length ? `<small>还有 ${citations.length - shown.length} 条引用，可在右侧栏查看。</small>` : ""}
+    </div>
+  `;
+}
+
+function compactAnswerContent(content) {
+  const text = String(content || "");
+  const marker = "【引用来源】";
+  const index = text.lastIndexOf(marker);
+  if (index < 0) return text;
+  const before = text.slice(0, index).trimEnd();
+  const lines = text.slice(index + marker.length).split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return text;
+  const shown = lines.slice(0, 2).map((line) => compactText(line, 76));
+  if (lines.length > shown.length) shown.push(`还有 ${lines.length - shown.length} 条引用，可在右侧栏查看。`);
+  return `${before}\n\n${marker}\n${shown.join("\n")}`;
+}
+
 function renderAiMessage(message) {
   const citations = Array.isArray(message.citations) ? message.citations : [];
   const confidence = message.confidence ? `<small class="answer-source">可靠性：${escapeHtml(message.confidence)}${citations.length ? ` · 引用 ${citations.length} 条` : ""}</small>` : "";
+  const content = message.role === "assistant" ? compactAnswerContent(message.content) : message.content;
   return `
     <div class="bubble ${message.role}">
       <span>${message.role === "assistant" ? "AI" : "我"}</span>
-      <p>${escapeMultiline(message.content)}</p>
+      <p>${escapeMultiline(content)}</p>
       ${confidence}
-      ${message.role === "assistant" && citations.length ? `<div class="bubble-citations">${renderCitationList(citations.slice(0, 3))}</div>` : ""}
+      ${message.role === "assistant" && citations.length ? renderCompactCitationList(citations) : ""}
     </div>
   `;
 }
@@ -2790,7 +2826,6 @@ function renderAiPage() {
           ${(active?.messages || []).map(renderAiMessage).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "先上传课程资料，再输入教学目标或课堂问题，我会基于资料生成可追溯建议。" : "先上传或选择课程资料，再问我概念、章节总结或题目思路，我会给出引用来源。"}</p></div>`}
         </div>
         <form id="aiForm" class="composer rich-composer">
-          <input name="subject" placeholder="学科/课程，例如：操作系统" value="${escapeHtml(state.user.subject || "")}" />
           <input name="prompt" placeholder="${escapeHtml(aiPromptPlaceholder(isTeacher))}" />
           <button class="primary" type="submit">发送</button>
         </form>
@@ -2831,7 +2866,7 @@ function bindAiPage() {
           userId: state.user.id,
           conversationId: state.activeConversationId,
           mode: inferredMode,
-          subject: form.get("subject"),
+          subject: "通用",
           prompt
         }
       });
@@ -2844,28 +2879,130 @@ function bindAiPage() {
   });
 }
 
+function resetModelCodeState() {
+  state.modelCodeType = null;
+  state.modelCodeComponentId = null;
+  state.modelCodeDraft = "";
+  state.modelCodeRan = false;
+}
+
+function modelCodeDefinition() {
+  const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
+  if (component?.props?.code !== undefined || component?.kind === "customAlgorithm") {
+    const base = mlAlgorithmForType(component.type);
+    return {
+      title: component.label || base?.title || "自定义算法模型",
+      chapter: component.props?.chapter || base?.chapter || "自定义机器学习模型",
+      code: component.props?.code || base?.code || "",
+      result: component.props?.expectedResult || component.props?.runResult || base?.result || "模拟运行完成：代码已载入，可继续接入 Python 执行环境返回真实指标。"
+    };
+  }
+  const algorithm = mlAlgorithmForType(state.modelCodeType);
+  if (algorithm) return algorithm;
+  return null;
+}
+
+function openModelCode(type, componentId = null) {
+  const component = state.modelComponents.find((item) => item.id === componentId);
+  const algorithm = component?.props?.code !== undefined || component?.kind === "customAlgorithm"
+    ? {
+      code: component.props?.code || "",
+      result: component.props?.runResult || component.props?.expectedResult || ""
+    }
+    : mlAlgorithmForType(type);
+  if (!algorithm && !component) return;
+  state.modelCodeType = type;
+  state.modelCodeComponentId = componentId;
+  state.modelCodeDraft = component?.props?.code || algorithm?.code || "";
+  state.modelRunResult = component?.props?.runResult || "";
+  state.modelCodeRan = Boolean(component?.props?.runResult);
+}
+
+function persistOpenModelCodeDraft() {
+  const editor = document.getElementById("modelCodeEditor");
+  if (!editor) return;
+  state.modelCodeDraft = editor.value;
+  const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
+  if (component) {
+    component.props = component.props && typeof component.props === "object" ? component.props : {};
+    component.props.code = editor.value;
+  }
+}
+
+function hasCanvasModel() {
+  return state.modelComponents.length > 0;
+}
+
+function componentSupportsCode(component) {
+  return Boolean(component && (mlAlgorithmForType(component.type) || component.kind === "customAlgorithm" || component.props?.code !== undefined));
+}
+
+function normalizeLoadedModelComponents(model) {
+  const loaded = JSON.parse(JSON.stringify(model.components || []));
+  if (loaded.length) {
+    return loaded.map((component, index) => ({
+      ...component,
+      id: component.id || `cmp_${Date.now()}_${index}`,
+      x: Number.isFinite(Number(component.x)) ? Number(component.x) : 46 + index * 8,
+      y: Number.isFinite(Number(component.y)) ? Number(component.y) : 42 + index * 6,
+      props: component.props && typeof component.props === "object" ? component.props : {}
+    }));
+  }
+  const palette = paletteForSubject(model.subject || state.modelSubject);
+  const text = `${model.name || ""} ${model.notes || ""}`;
+  const meta = palette.find((item) => text.includes(item.label) || text.includes(mlAlgorithmForType(item.type)?.title || "")) || palette[0];
+  if (!meta) return [];
+  return [{
+    id: `cmp_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    type: meta.type,
+    icon: meta.icon,
+    label: meta.label,
+    kind: meta.kind || "component",
+    x: 50,
+    y: 45,
+    props: { ...meta.defaults }
+  }];
+}
+
+function renderCustomAlgorithmForm() {
+  if (state.modelSubject !== "机器学习") return "";
+  return `
+    <form id="customAlgorithmForm" class="custom-algorithm-form">
+      <h4>新增算法模型</h4>
+      <input name="label" placeholder="算法名称，例如：Transformer 分类器" autocomplete="off" />
+      <textarea name="code" rows="5" placeholder="在这里输入新的算法模型代码"></textarea>
+      <input name="result" placeholder="预期运行结果，例如：accuracy: 0.92" autocomplete="off" />
+      <button class="ghost" type="submit">添加到画布</button>
+    </form>
+  `;
+}
+
+function renderRunResultPanel() {
+  const result = state.modelRunResult || "";
+  return `
+    <div class="run-result-panel">
+      <strong>运行结果</strong>
+      <p>${result ? escapeHtml(result) : "暂无运行结果。双击机器学习算法节点，修改代码后点击运行测试。"}</p>
+    </div>
+  `;
+}
+
 function renderModelPage() {
   const models = (state.data.models || []).filter((model) => model.subject === state.modelSubject);
   const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
   const lab = labConfigForSubject(state.modelSubject);
   const palette = paletteForSubject(state.modelSubject);
+  const canSaveOrDownload = hasCanvasModel();
   return `
-    <div class="page-head">
-      <div>
-        <h2>🧠 模型显示</h2>
-        <p>${escapeHtml(lab.summary)}</p>
-      </div>
-      <div class="inline-controls">
-        <label>学科<select id="modelSubject">${subjectOptions(state.modelSubject)}</select></label>
-        <div class="segmented compact">
-          <button class="${state.modelMode === "ideal" ? "active" : ""}" data-model-mode="ideal">理想状态</button>
-          <button class="${state.modelMode === "real" ? "active" : ""}" data-model-mode="real">真实状态</button>
-        </div>
-      </div>
-    </div>
     <div class="model-layout">
       <section class="panel palette-panel">
-        <h3>${escapeHtml(lab.title)}</h3>
+        <div class="lab-head">
+          <div>
+            <h3>${escapeHtml(lab.title)}</h3>
+            <p class="hint">${escapeHtml(lab.summary)}</p>
+          </div>
+          <label class="compact-label">学科<select id="modelSubject">${subjectOptions(state.modelSubject)}</select></label>
+        </div>
         <p class="hint">${escapeHtml(lab.hint)}</p>
         <div class="palette">
           ${palette.map((item) => `
@@ -2874,18 +3011,26 @@ function renderModelPage() {
             </button>
           `).join("")}
         </div>
+        ${renderCustomAlgorithmForm()}
         <form id="saveModelForm" class="stack">
           <label>模型名称<input name="name" value="${escapeHtml(models.find((model) => model.id === state.loadedModelId)?.name || "")}" placeholder="例如：斜面小车运动模型" /></label>
           <label>说明<textarea name="notes" rows="3" placeholder="记录参数、题目来源或使用场景"></textarea></label>
-          <button class="primary" type="submit">保存模型</button>
-          <button class="ghost" type="button" id="downloadDraftModel">下载当前模型</button>
+          <button class="primary" type="submit" ${canSaveOrDownload ? "" : "disabled"}>保存模型</button>
+          <button class="ghost" type="button" id="downloadDraftModel" ${canSaveOrDownload ? "" : "disabled"}>下载当前模型</button>
           <button class="ghost" type="button" id="clearModelCanvas">清空画布</button>
+          ${canSaveOrDownload ? "" : `<p class="hint">请先把模型或算法节点拖入画布，再保存或下载。</p>`}
         </form>
       </section>
       <section class="panel model-canvas-panel">
         <div class="split-head">
-          <h3>${escapeHtml(lab.title)}画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
-          <span>${state.modelSubject === "机器学习" ? "双击算法节点查看代码并运行测试。" : "将左侧组件拖到画布中，可继续拖动调整位置。"}</span>
+          <div>
+            <h3>${escapeHtml(lab.title)}画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
+            <span>${state.modelSubject === "机器学习" ? "双击算法节点查看代码并运行测试。" : "将左侧组件拖到画布中，可继续拖动调整位置。"}</span>
+          </div>
+          <div class="segmented compact">
+            <button class="${state.modelMode === "ideal" ? "active" : ""}" data-model-mode="ideal">理想状态</button>
+            <button class="${state.modelMode === "real" ? "active" : ""}" data-model-mode="real">真实状态</button>
+          </div>
         </div>
         <div id="modelCanvas" class="model-canvas ${state.modelSubject === "机器学习" ? "ml-canvas" : ""}">
           ${lab.showAxes === false ? "" : `<div class="axis-line x"></div><div class="axis-line y"></div>`}
@@ -2900,9 +3045,10 @@ function renderModelPage() {
                 <label>${escapeHtml(key)}<input data-prop-key="${escapeHtml(key)}" value="${escapeHtml(value)}" /></label>
               `).join("")}
             </div>
-            ${mlAlgorithmForType(selected.type) ? `<button class="ghost" type="button" id="openAlgorithmCode">查看代码并测试</button>` : ""}
+            ${componentSupportsCode(selected) ? `<button class="ghost" type="button" id="openAlgorithmCode">查看代码并测试</button>` : ""}
             <button class="danger" id="deleteComponentBtn">删除组件</button>
-          ` : `<span>选中组件后可编辑参数。</span>`}
+          ` : ""}
+          ${renderRunResultPanel()}
         </div>
       </section>
       <section class="panel saved-models">
@@ -2929,7 +3075,7 @@ function renderModelPage() {
 }
 
 function renderModelComponent(item) {
-  const isAlgorithm = Boolean(mlAlgorithmForType(item.type));
+  const isAlgorithm = componentSupportsCode(item);
   return `
     <button class="model-node ${isAlgorithm ? "algorithm-node" : ""} ${state.selectedComponentId === item.id ? "active" : ""}" style="left:${item.x}%; top:${item.y}%;" data-node-id="${item.id}" title="${escapeHtml(item.label)}">
       <span>${escapeHtml(item.icon)}</span>
@@ -2939,8 +3085,9 @@ function renderModelComponent(item) {
 }
 
 function renderModelCodePanel() {
-  const algorithm = mlAlgorithmForType(state.modelCodeType);
+  const algorithm = modelCodeDefinition();
   if (!algorithm) return "";
+  const code = state.modelCodeDraft || algorithm.code || "";
   return `
     <div class="model-code-panel" role="dialog" aria-label="${escapeHtml(algorithm.title)}代码测试">
       <div class="model-code-head">
@@ -2948,13 +3095,13 @@ function renderModelCodePanel() {
           <strong>${escapeHtml(algorithm.title)}</strong>
           <span>${escapeHtml(algorithm.chapter)}</span>
         </div>
-        <button class="mini" type="button" id="closeModelCodeBtn">关闭</button>
+        <div class="model-code-tools">
+          <button class="primary" type="button" id="runModelCodeBtn">运行测试</button>
+          <button class="mini" type="button" id="closeModelCodeBtn">关闭</button>
+        </div>
       </div>
-      <pre><code>${escapeHtml(algorithm.code)}</code></pre>
-      <div class="model-code-actions">
-        <button class="primary" type="button" id="runModelCodeBtn">运行测试</button>
-        ${state.modelCodeRan ? `<p>${escapeHtml(algorithm.result)}</p>` : `<p class="hint">点击运行测试后显示该算法样例输出。</p>`}
-      </div>
+      <textarea id="modelCodeEditor" spellcheck="false">${escapeHtml(code)}</textarea>
+      <p class="hint">代码可直接修改；点击右上角“运行测试”后，结果会显示在画布下方“运行结果”区域。</p>
     </div>
   `;
 }
@@ -2965,8 +3112,8 @@ function bindModelPage() {
     state.modelComponents = [];
     state.selectedComponentId = null;
     state.loadedModelId = null;
-    state.modelCodeType = null;
-    state.modelCodeRan = false;
+    state.modelRunResult = "";
+    resetModelCodeState();
     renderContent();
   });
   document.querySelectorAll("[data-model-mode]").forEach((button) => {
@@ -2981,8 +3128,7 @@ function bindModelPage() {
     });
     button.addEventListener("dblclick", () => {
       if (!mlAlgorithmForType(button.dataset.componentType)) return;
-      state.modelCodeType = button.dataset.componentType;
-      state.modelCodeRan = false;
+      openModelCode(button.dataset.componentType);
       renderContent();
     });
   });
@@ -3008,15 +3154,15 @@ function bindModelPage() {
     };
     state.modelComponents.push(component);
     state.selectedComponentId = component.id;
+    if (componentSupportsCode(component)) openModelCode(component.type, component.id);
     renderContent();
   });
   document.querySelectorAll("[data-node-id]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const nodeId = node.dataset.nodeId;
       const target = state.modelComponents.find((item) => item.id === nodeId);
-      if (event.detail >= 2 && target && mlAlgorithmForType(target.type)) {
-        state.modelCodeType = target.type;
-        state.modelCodeRan = false;
+      if (event.detail >= 2 && componentSupportsCode(target)) {
+        openModelCode(target.type, target.id);
         renderContent();
         return;
       }
@@ -3029,9 +3175,8 @@ function bindModelPage() {
       event.preventDefault();
       event.stopPropagation();
       const target = state.modelComponents.find((item) => item.id === node.dataset.nodeId);
-      if (!target || !mlAlgorithmForType(target.type)) return;
-      state.modelCodeType = target.type;
-      state.modelCodeRan = false;
+      if (!componentSupportsCode(target)) return;
+      openModelCode(target.type, target.id);
       renderContent();
     });
     node.addEventListener("pointerdown", (event) => {
@@ -3071,29 +3216,68 @@ function bindModelPage() {
   });
   document.getElementById("openAlgorithmCode")?.addEventListener("click", () => {
     const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
-    if (!selected || !mlAlgorithmForType(selected.type)) return;
-    state.modelCodeType = selected.type;
-    state.modelCodeRan = false;
+    if (!componentSupportsCode(selected)) return;
+    openModelCode(selected.type, selected.id);
     renderContent();
   });
   document.getElementById("closeModelCodeBtn")?.addEventListener("click", () => {
-    state.modelCodeType = null;
-    state.modelCodeRan = false;
+    persistOpenModelCodeDraft();
+    resetModelCodeState();
     renderContent();
   });
   document.getElementById("runModelCodeBtn")?.addEventListener("click", () => {
+    const editor = document.getElementById("modelCodeEditor");
+    const draft = editor ? editor.value : state.modelCodeDraft;
+    state.modelCodeDraft = draft;
+    const definition = modelCodeDefinition();
+    const result = definition?.result || "模拟运行完成：代码已载入，可继续接入 Python 执行环境返回真实指标。";
     state.modelCodeRan = true;
+    state.modelRunResult = result;
+    const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
+    if (component) {
+      component.props = component.props && typeof component.props === "object" ? component.props : {};
+      component.props.code = draft;
+      component.props.runResult = result;
+    }
+    renderContent();
+  });
+  document.getElementById("customAlgorithmForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const label = String(form.get("label") || "").trim();
+    const code = String(form.get("code") || "").trim();
+    if (!label || !code) return showToast("请填写算法名称和代码", "error");
+    const component = {
+      id: `cmp_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      type: `custom-ml-${Date.now()}`,
+      icon: label.slice(0, 3).toUpperCase(),
+      label,
+      kind: "customAlgorithm",
+      x: 50,
+      y: 45,
+      props: {
+        task: "自定义算法",
+        chapter: "自定义机器学习模型",
+        code,
+        expectedResult: String(form.get("result") || "").trim() || "模拟运行完成：自定义算法代码已载入。"
+      }
+    };
+    state.modelComponents.push(component);
+    state.selectedComponentId = component.id;
+    openModelCode(component.type, component.id);
     renderContent();
   });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
     state.modelComponents = [];
     state.selectedComponentId = null;
     state.loadedModelId = null;
-    state.modelCodeType = null;
-    state.modelCodeRan = false;
+    state.modelRunResult = "";
+    resetModelCodeState();
     renderContent();
   });
   document.getElementById("downloadDraftModel")?.addEventListener("click", () => {
+    if (!hasCanvasModel()) return showToast("请先在画布中添加模型", "error");
+    persistOpenModelCodeDraft();
     downloadJson(`${state.modelSubject}-模型草稿.json`, {
       name: "未命名模型",
       subject: state.modelSubject,
@@ -3106,6 +3290,8 @@ function bindModelPage() {
     const form = new FormData(event.currentTarget);
     const name = String(form.get("name") || "").trim();
     if (!name) return showToast("请填写模型名称", "error");
+    if (!hasCanvasModel()) return showToast("请先在画布中添加模型", "error");
+    persistOpenModelCodeDraft();
     try {
       const payload = await api("/api/models", {
         method: "POST",
@@ -3134,10 +3320,10 @@ function bindModelPage() {
       state.loadedModelId = model.id;
       state.modelSubject = model.subject;
       state.modelMode = model.mode;
-      state.modelComponents = JSON.parse(JSON.stringify(model.components || []));
-      state.selectedComponentId = null;
-      state.modelCodeType = null;
-      state.modelCodeRan = false;
+      state.modelComponents = normalizeLoadedModelComponents(model);
+      state.selectedComponentId = state.modelComponents[0]?.id || null;
+      state.modelRunResult = state.modelComponents[0]?.props?.runResult || "";
+      resetModelCodeState();
       renderContent();
     });
   });
