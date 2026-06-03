@@ -1717,8 +1717,8 @@ p {
   background: #0f172a;
   color: #e5eef9;
   font-family: Consolas, "SFMono-Regular", monospace;
-  font-size: 15px;
-  line-height: 1.55;
+  font-size: 16px;
+  line-height: 1.6;
   resize: none;
 }
 
@@ -1738,8 +1738,8 @@ p {
 }
 
 .ml-model-content .model-code-panel textarea {
-  font-size: 16px;
-  line-height: 1.6;
+  font-size: 18px;
+  line-height: 1.65;
 }
 
 .model-code-actions {
@@ -1772,18 +1772,24 @@ p {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fff;
+  min-height: 0;
+  overflow-y: auto;
+  align-content: start;
 }
 
 .run-result-panel strong {
   color: var(--text);
-  font-size: 17px;
+  font-size: 19px;
 }
 
 .run-result-panel p {
+  margin: 0;
   color: var(--text);
-  font-size: 16px;
+  font-size: 19px;
   font-weight: 700;
-  line-height: 1.7;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .property-grid {
@@ -1807,8 +1813,13 @@ p {
   overflow: hidden;
 }
 
+.ml-model-content .inspector.result-only {
+  max-height: 164px;
+}
+
 .ml-model-content .run-result-panel {
-  min-height: 96px;
+  min-height: 110px;
+  max-height: 146px;
 }
 
 .ml-model-content .saved-models {

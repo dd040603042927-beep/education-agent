@@ -3033,18 +3033,20 @@ function renderModelPage() {
           ${state.modelComponents.map((item) => renderModelComponent(item)).join("")}
           ${renderModelCodePanel()}
         </div>
-        <div class="inspector">
-          ${selected ? `
-            <strong>当前组件：${escapeHtml(selected.label)}</strong>
-            <div class="property-grid">
-              ${Object.entries(selected.props || {}).map(([key, value]) => `
-                <label>${escapeHtml(key)}<input data-prop-key="${escapeHtml(key)}" value="${escapeHtml(value)}" /></label>
-              `).join("")}
-            </div>
-            ${componentSupportsCode(selected) ? `<button class="ghost" type="button" id="openAlgorithmCode">查看代码并测试</button>` : ""}
-            <button class="danger" id="deleteComponentBtn">删除组件</button>
-          ` : ""}
-          ${renderRunResultPanel()}
+        <div class="inspector ${isMachineLearning ? "result-only" : ""}">
+          ${isMachineLearning ? renderRunResultPanel() : `
+            ${selected ? `
+              <strong>当前组件：${escapeHtml(selected.label)}</strong>
+              <div class="property-grid">
+                ${Object.entries(selected.props || {}).map(([key, value]) => `
+                  <label>${escapeHtml(key)}<input data-prop-key="${escapeHtml(key)}" value="${escapeHtml(value)}" /></label>
+                `).join("")}
+              </div>
+              ${componentSupportsCode(selected) ? `<button class="ghost" type="button" id="openAlgorithmCode">查看代码并测试</button>` : ""}
+              <button class="danger" id="deleteComponentBtn">删除组件</button>
+            ` : ""}
+            ${renderRunResultPanel()}
+          `}
         </div>
       </section>
       <section class="panel saved-models">
