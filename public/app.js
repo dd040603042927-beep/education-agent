@@ -37,7 +37,8 @@ const state = {
 const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
-const GRAPH_LAYOUT_VERSION = "graph-layout-v10-education-kg";
+const GRAPH_LAYOUT_VERSION = "graph-layout-v11-outline-materials";
+const COURSE_MATERIAL_ACCEPT = ".pdf,.txt,.md,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.json,.epub,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细分"]);
 const EDUCATION_RELATION_LABELS = {
   contains: "层级包含",
@@ -54,6 +55,7 @@ const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
   { key: "ai", icon: "🎓", label: "教学指导（对话）" },
   { key: "history", icon: "💬", label: "历史对话" },
+  { key: "materials", icon: "📚", label: "课程资料" },
   { key: "models", icon: "🧠", label: "模型显示" },
   { key: "chat", icon: "☁️", label: "聊天信息" },
   { key: "classes", icon: "🏫", label: "班级管理" },
@@ -65,6 +67,7 @@ const studentMenus = [
   { key: "graph", icon: "📗", label: "知识图谱" },
   { key: "ai", icon: "☁️", label: "发起对话" },
   { key: "history", icon: "📜", label: "历史对话" },
+  { key: "materials", icon: "📚", label: "课程资料" },
   { key: "models", icon: "🧠", label: "模型显示" },
   { key: "chat", icon: "☁️", label: "聊天信息" },
   { key: "homework", icon: "📥", label: "作业提交" },
@@ -375,6 +378,7 @@ function renderContent() {
     graph: renderGraphPage,
     ai: renderAiPage,
     history: renderHistoryPage,
+    materials: renderMaterialsPage,
     models: renderModelPage,
     chat: renderChatPage,
     classes: renderClassPage,
@@ -391,6 +395,7 @@ function bindCurrentPage() {
     graph: bindGraphPage,
     ai: bindAiPage,
     history: bindHistoryPage,
+    materials: bindMaterialsPage,
     models: bindModelPage,
     chat: bindChatPage,
     classes: bindClassPage,
@@ -719,7 +724,7 @@ function graphLabelLines(label, maxChars = 7, maxLines = 2) {
 
 function graphInnerLabelLines(label, radius, root = false) {
   const text = String(label || "").replace(/\s+/g, "");
-  const maxChars = root ? 6 : radius >= 44 ? 5 : radius >= 36 ? 4 : 3;
+  const maxChars = root ? 6 : radius >= 58 ? 5 : radius >= 46 ? 4 : 3;
   const maxLines = root ? 3 : radius >= 36 ? 3 : 2;
   const capacity = maxChars * maxLines;
   const visible = text.length > capacity ? `${text.slice(0, Math.max(1, capacity - 1))}…` : text;
@@ -809,17 +814,17 @@ function graphNetworkRadius(node, index = 0, totalNodes = 0) {
   const level = graphNodeLevel(node, index);
   const dense = totalNodes > 220;
   const medium = totalNodes > 90;
-  if (level === 0 || node.group === "root") return dense ? 68 : medium ? 74 : 78;
-  if (level === 1 || node.group === "chapter") return dense ? 54 : medium ? 58 : 62;
-  if (level === 2 || node.group === "concept" || node.group === "topic") return dense ? 44 : medium ? 48 : 52;
-  return dense ? 40 : medium ? 44 : 46;
+  if (level === 0 || node.group === "root") return dense ? 74 : medium ? 80 : 86;
+  if (level === 1 || node.group === "chapter") return dense ? 60 : medium ? 66 : 70;
+  if (level === 2 || node.group === "concept" || node.group === "topic") return dense ? 50 : medium ? 56 : 60;
+  return dense ? 46 : medium ? 50 : 54;
 }
 
 function graphElasticGap(totalNodes = 0) {
-  if (totalNodes > 220) return 76;
-  if (totalNodes > 90) return 70;
-  if (totalNodes > 40) return 60;
-  return 48;
+  if (totalNodes > 220) return 88;
+  if (totalNodes > 90) return 82;
+  if (totalNodes > 40) return 72;
+  return 60;
 }
 
 function graphEdgePadding(totalNodes = 0) {
@@ -1134,7 +1139,7 @@ function renderGraphSvg(graph) {
           const masteryClass = graphMasteryClass(node);
           const label = String(node.label || "");
           const labelLines = graphInnerLabelLines(label, radius, root);
-          const lineHeight = root ? 15 : radius >= 42 ? 13 : radius >= 34 ? 11 : 10;
+          const lineHeight = root ? 18 : radius >= 58 ? 16 : radius >= 46 ? 14 : 13;
           return `
             <g class="graph-node level-${level} ${groupClass} ${masteryClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
               <title>${escapeHtml(label)}</title>
@@ -1826,8 +1831,38 @@ async function pollGraphJob(jobId) {
   state.graphJobTimer = setTimeout(tick, 500);
 }
 
-async function generateGraphFromUploadedFile({ file, subject, title, sourceText, sourceName, extractor }) {
+async function uploadFileInChunks(file, onProgress = () => {}, signal = null) {
   const chunkSize = 6 * 1024 * 1024;
+  const started = await api("/api/uploads/start", {
+    method: "POST",
+    body: {
+      userId: state.user.id,
+      fileName: file.name,
+      fileType: file.type || "application/octet-stream",
+      size: file.size
+    }
+  });
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  let uploadedBytes = 0;
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    const chunk = file.slice(start, end);
+    const response = await fetch(`/api/uploads/${started.upload.id}/chunk?index=${index}&offset=${uploadedBytes}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: chunk,
+      signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
+    uploadedBytes = payload.upload.received;
+    onProgress({ index: index + 1, totalChunks, uploadedBytes, upload: payload.upload });
+  }
+  return started.upload;
+}
+
+async function generateGraphFromUploadedFile({ file, subject, title, sourceText, sourceName, extractor }) {
   state.graphGenerationCanceled = false;
   state.graphUploadAbort = new AbortController();
   state.graphJob = {
@@ -1841,41 +1876,17 @@ async function generateGraphFromUploadedFile({ file, subject, title, sourceText,
 
   let started = null;
   try {
-    started = await api("/api/uploads/start", {
-      method: "POST",
-      body: {
-        userId: state.user.id,
-        fileName: file.name,
-        fileType: file.type || "application/octet-stream",
-        size: file.size
-      }
-    });
-
-    const totalChunks = Math.ceil(file.size / chunkSize);
-    let uploadedBytes = 0;
-    for (let index = 0; index < totalChunks; index += 1) {
+    started = { upload: await uploadFileInChunks(file, ({ index, totalChunks, uploadedBytes }) => {
       if (state.graphGenerationCanceled) throw graphCancelError();
-      const start = index * chunkSize;
-      const end = Math.min(file.size, start + chunkSize);
-      const chunk = file.slice(start, end);
-      const response = await fetch(`/api/uploads/${started.upload.id}/chunk?index=${index}&offset=${uploadedBytes}`, {
-        method: "POST",
-        headers: { "content-type": "application/octet-stream" },
-        body: chunk,
-        signal: state.graphUploadAbort.signal
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
-      uploadedBytes = payload.upload.received;
       state.graphJob = {
         status: "running",
         stage: "上传文件",
         progress: Math.min(32, 4 + Math.floor((uploadedBytes / file.size) * 28)),
-        message: `已上传 ${index + 1}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}。`,
+        message: `已上传 ${index}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}。`,
         meta: { sourceName: file.name, fileSize: file.size, extractor }
       };
       refreshGraphProgress();
-    }
+    }, state.graphUploadAbort.signal) };
 
     if (state.graphGenerationCanceled) throw graphCancelError();
     state.graphJob = {
@@ -2163,6 +2174,126 @@ function renderLearningProfilePanel() {
   `;
 }
 
+function renderMaterialsPage() {
+  const materials = state.data.courseMaterials || [];
+  return `
+    <div class="page-head">
+      <div>
+        <h2>📚 课程资料</h2>
+        <p>单独管理课程知识库，支持 PDF、扫描版 PDF、Word、PPTX、Excel、TXT 等资料入库，供智能体 RAG 问答和引用追溯使用。</p>
+      </div>
+      <div class="stat-strip">
+        <span>${materials.length}<small>可检索资料</small></span>
+        <span>${materials.reduce((sum, item) => sum + Number(item.chunkCount || 0), 0)}<small>检索片段</small></span>
+      </div>
+    </div>
+    <div class="grid two materials-grid">
+      <section class="panel material-panel">
+        <div class="split-head">
+          <h3>资料入库</h3>
+          <span>初始表单为空</span>
+        </div>
+        <form id="materialUploadForm" class="stack">
+          <div class="form-grid">
+            <label>学科<input name="subject" placeholder="例如：机器学习、操作系统、计算机组成原理" required autocomplete="off" /></label>
+            <label>资料标题<input name="title" placeholder="例如：第 3 章 监督学习讲义" autocomplete="off" /></label>
+          </div>
+          <label>上传资料<input name="file" type="file" accept="${COURSE_MATERIAL_ACCEPT}" /></label>
+          <label>或粘贴资料内容<textarea name="sourceText" rows="8" placeholder="可粘贴教材章节、讲义、习题解析、实验文档内容"></textarea></label>
+          ${state.user.role === "teacher" ? `<label class="check-line"><input name="global" type="checkbox" /> 学生可检索这份资料</label>` : ""}
+          <p class="hint">支持 PDF、扫描版图片 PDF、Word、PPTX、Excel、Markdown、TXT、CSV、JSON 等格式；大文件会分块上传，扫描版 PDF 会尝试 OCR。</p>
+          <button class="primary" type="submit">入库并建立 RAG 索引</button>
+          <p id="materialUploadStatus" class="hint"></p>
+        </form>
+      </section>
+      <section class="panel material-library-panel">
+        <div class="split-head">
+          <h3>课程资料库</h3>
+          <span>${materials.length} 份</span>
+        </div>
+        <div class="material-list">
+          ${materials.slice(0, 18).map((item) => `
+            <article>
+              <div>
+                <strong>${escapeHtml(item.title)}</strong>
+                <span>${escapeHtml(item.subject)} · ${item.chunkCount} 个片段 · ${item.characters} 字</span>
+                <small>${escapeHtml(item.sourceName || "课程资料")} · ${fmtTime(item.createdAt)}</small>
+              </div>
+              ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
+            </article>
+          `).join("") || emptyBlock("还没有课程资料。上传文件或粘贴内容后会在这里显示。")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindMaterialsPage() {
+  document.getElementById("materialUploadForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const file = form.get("file");
+    const status = document.getElementById("materialUploadStatus");
+    const subject = String(form.get("subject") || "").trim();
+    const sourceText = String(form.get("sourceText") || "");
+    if (!subject) return showToast("请先输入学科名称", "error");
+    if (!(file && file.name) && !sourceText.trim()) return showToast("请上传资料或粘贴资料内容", "error");
+    try {
+      let payload;
+      if (file && file.name) {
+        if (status) status.textContent = `正在上传 ${file.name}（${formatBytes(file.size)}）...`;
+        const upload = await uploadFileInChunks(file, ({ index, totalChunks, uploadedBytes }) => {
+          if (status) status.textContent = `已上传 ${index}/${totalChunks} 个分块，${formatBytes(uploadedBytes)} / ${formatBytes(file.size)}，请等待解析。`;
+        });
+        if (status) status.textContent = "文件上传完成，正在解析文本层/OCR/Office 文档并建立索引...";
+        payload = await api("/api/materials/from-upload", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            uploadId: upload.id,
+            subject,
+            title: form.get("title"),
+            sourceText,
+            global: form.get("global") === "on"
+          }
+        });
+      } else {
+        if (status) status.textContent = "正在根据粘贴内容建立索引...";
+        payload = await api("/api/materials", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            subject,
+            title: form.get("title"),
+            sourceText,
+            global: form.get("global") === "on"
+          }
+        });
+      }
+      await loadState();
+      renderShell();
+      showToast(`课程资料已入库：${payload.material.chunkCount} 个检索片段`);
+    } catch (error) {
+      if (status) status.textContent = "";
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-delete-material]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确认删除这份课程资料？")) return;
+      try {
+        await api(`/api/materials/${button.dataset.deleteMaterial}?userId=${state.user.id}`, { method: "DELETE" });
+        await loadState();
+        renderShell();
+        showToast("课程资料已删除");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+}
+
 function renderMaterialsPanel() {
   const materials = state.data.courseMaterials || [];
   return `
@@ -2171,26 +2302,15 @@ function renderMaterialsPanel() {
         <h3>课程资料库</h3>
         <span>${materials.length} 份</span>
       </div>
-      <form id="materialUploadForm" class="stack">
-        <div class="form-grid">
-          <label>学科<input name="subject" value="${escapeHtml(state.user.subject || "")}" placeholder="例如：操作系统、计算机组成原理" required /></label>
-          <label>资料标题<input name="title" placeholder="例如：第 3 章 存储系统课件" /></label>
-        </div>
-        <label>上传资料<input name="file" type="file" accept=".pdf,.txt,.md,.csv,.json,text/*,application/pdf" /></label>
-        <label>或粘贴资料内容<textarea name="sourceText" rows="4" placeholder="可粘贴教材章节、讲义、习题解析、实验文档内容"></textarea></label>
-        ${state.user.role === "teacher" ? `<label class="check-line"><input name="global" type="checkbox" checked /> 学生可检索这份资料</label>` : ""}
-        <button class="primary" type="submit">入库并建立 RAG 索引</button>
-      </form>
       <div class="material-list">
-        ${materials.slice(0, 8).map((item) => `
+        ${materials.slice(0, 5).map((item) => `
           <article>
             <div>
               <strong>${escapeHtml(item.title)}</strong>
               <span>${escapeHtml(item.subject)} · ${item.chunkCount} 个片段 · ${item.characters} 字</span>
             </div>
-            ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
           </article>
-        `).join("") || emptyBlock("还没有课程资料。先上传 PDF/TXT 或粘贴章节内容。")}
+        `).join("") || emptyBlock("还没有课程资料。请到左侧「课程资料」页面上传。")}
       </div>
     </section>
   `;
@@ -2245,7 +2365,6 @@ function renderAiPage() {
       </div>
       <button id="newConversationBtn" class="primary">新建对话</button>
     </div>
-    ${renderMaterialsPanel()}
     <div class="chat-layout wide ai-workbench">
       <aside class="conversation-list">
         ${conversations.map((conv) => `
@@ -2301,43 +2420,6 @@ function bindAiPage() {
     } catch (error) {
       showToast(error.message, "error");
     }
-  });
-  document.getElementById("materialUploadForm")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const file = form.get("file");
-    try {
-      const filePayload = file && file.name ? await fileToPayload(file) : null;
-      const payload = await api("/api/materials", {
-        method: "POST",
-        body: {
-          userId: state.user.id,
-          subject: form.get("subject"),
-          title: form.get("title"),
-          sourceText: form.get("sourceText"),
-          global: form.get("global") === "on",
-          file: filePayload
-        }
-      });
-      await loadState();
-      renderShell();
-      showToast(`课程资料已入库：${payload.material.chunkCount} 个检索片段`);
-    } catch (error) {
-      showToast(error.message, "error");
-    }
-  });
-  document.querySelectorAll("[data-delete-material]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (!confirm("确认删除这份课程资料？")) return;
-      try {
-        await api(`/api/materials/${button.dataset.deleteMaterial}?userId=${state.user.id}`, { method: "DELETE" });
-        await loadState();
-        renderShell();
-        showToast("课程资料已删除");
-      } catch (error) {
-        showToast(error.message, "error");
-      }
-    });
   });
   document.querySelectorAll("[data-quick-prompt]").forEach((button) => {
     button.addEventListener("click", () => {

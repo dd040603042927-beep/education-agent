@@ -822,7 +822,7 @@ p {
   text-anchor: middle;
   dominant-baseline: middle;
   font-weight: 800;
-  font-size: 11.2px;
+  font-size: 13px;
   pointer-events: none;
   paint-order: stroke;
   stroke: rgba(20, 79, 112, 0.32);
@@ -831,13 +831,13 @@ p {
 
 .graph-node text.root {
   fill: #fff;
-  font-size: 14px;
+  font-size: 16px;
   stroke: rgba(16, 73, 95, 0.42);
   stroke-width: 2px;
 }
 
 .graph-node.level-3 text {
-  font-size: 10.2px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -848,11 +848,11 @@ p {
 }
 
 .graph-node.level-1 text.inside {
-  font-size: 12.4px;
+  font-size: 14px;
 }
 
 .graph-node.level-2 text.inside {
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .graph-node text.outside {
@@ -1060,6 +1060,14 @@ p {
   margin-bottom: 18px;
 }
 
+.materials-grid {
+  align-items: start;
+}
+
+.material-library-panel {
+  min-height: 520px;
+}
+
 .material-list,
 .citation-list,
 .ai-side,
@@ -1093,6 +1101,13 @@ p {
   margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.material-list small {
+  display: block;
+  margin-top: 4px;
+  color: #728497;
+  font-size: 11px;
 }
 
 .check-line {

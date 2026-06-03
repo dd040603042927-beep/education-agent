@@ -446,6 +446,20 @@ function normalizeSubject(subject) {
   return String(subject || "通用").trim() || "通用";
 }
 
+function requestText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(requestText).filter(Boolean).join("\n");
+  if (typeof value === "object") {
+    for (const key of ["value", "text", "content", "sourceText"]) {
+      if (value[key] !== undefined) return requestText(value[key]);
+    }
+    return Object.values(value).map(requestText).filter(Boolean).join("\n");
+  }
+  return String(value);
+}
+
 function limitText(text, maxLength = MAX_GRAPH_SOURCE_CHARS) {
   const value = String(text || "");
   if (value.length <= maxLength) return value;
@@ -839,10 +853,109 @@ function extractUploadedBookBuffer({ name = "上传书本", type = "", buffer },
     const extracted = extractPdfTextFromBuffer(buffer, onProgress);
     text = extracted.text;
     stats = extracted.stats;
+  } else if (isOfficeOpenXmlFile(lowerName, type)) {
+    method = "office-openxml-agent";
+    text = extractOfficeOpenXmlText(buffer, lowerName);
+  } else if (/\.(doc|ppt)$/i.test(lowerName)) {
+    method = "binary-office-text-fallback";
+    text = extractBinaryOfficeText(buffer);
   } else {
     text = buffer.toString("utf8").slice(0, PDF_LIMITS.maxExtractedTextChars);
   }
   return { text, meta: { name, type, method, characters: text.length, size: buffer.length, stats } };
+}
+
+function isOfficeOpenXmlFile(lowerName, type = "") {
+  return /\.(docx|pptx|xlsx)$/i.test(lowerName)
+    || /officedocument|wordprocessingml|presentationml|spreadsheetml/.test(String(type || "").toLowerCase());
+}
+
+function decodeXmlEntities(text) {
+  return String(text || "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function xmlToPlainText(xml) {
+  return decodeXmlEntities(String(xml || "")
+    .replace(/<a:br\s*\/>|<w:br\s*\/>/g, "\n")
+    .replace(/<\/w:p>|<\/a:p>|<\/row>|<\/xdr:row>/g, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[ \t\u00a0]+/g, " ")
+    .replace(/\n\s+/g, "\n"))
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function readZipEntries(buffer) {
+  const entries = [];
+  const eocdSignature = 0x06054b50;
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 66000); offset -= 1) {
+    if (buffer.readUInt32LE(offset) === eocdSignature) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) return entries;
+  const totalEntries = buffer.readUInt16LE(eocd + 10);
+  let centralOffset = buffer.readUInt32LE(eocd + 16);
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (buffer.readUInt32LE(centralOffset) !== 0x02014b50) break;
+    const method = buffer.readUInt16LE(centralOffset + 10);
+    const compressedSize = buffer.readUInt32LE(centralOffset + 20);
+    const fileNameLength = buffer.readUInt16LE(centralOffset + 28);
+    const extraLength = buffer.readUInt16LE(centralOffset + 30);
+    const commentLength = buffer.readUInt16LE(centralOffset + 32);
+    const localOffset = buffer.readUInt32LE(centralOffset + 42);
+    const name = buffer.slice(centralOffset + 46, centralOffset + 46 + fileNameLength).toString("utf8");
+    if (buffer.readUInt32LE(localOffset) === 0x04034b50) {
+      const localNameLength = buffer.readUInt16LE(localOffset + 26);
+      const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+      const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+      const raw = buffer.slice(dataStart, dataStart + compressedSize);
+      try {
+        const data = method === 0 ? raw : method === 8 ? zlib.inflateRawSync(raw) : Buffer.alloc(0);
+        entries.push({ name, data });
+      } catch {}
+    }
+    centralOffset += 46 + fileNameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function extractOfficeOpenXmlText(buffer, lowerName = "") {
+  const entries = readZipEntries(buffer);
+  const wanted = entries
+    .filter((entry) => {
+      const name = entry.name.replace(/\\/g, "/");
+      if (lowerName.endsWith(".docx")) return /^word\/(document|header|footer|footnotes|endnotes).*\.xml$/i.test(name);
+      if (lowerName.endsWith(".pptx")) return /^ppt\/(slides|notesSlides)\/.*\.xml$/i.test(name);
+      if (lowerName.endsWith(".xlsx")) return /^xl\/(worksheets|sharedStrings)\/.*\.xml$/i.test(name);
+      return /^(word|ppt|xl)\/.*\.xml$/i.test(name);
+    })
+    .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  return wanted
+    .map((entry) => xmlToPlainText(entry.data.toString("utf8")))
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, PDF_LIMITS.maxExtractedTextChars);
+}
+
+function extractBinaryOfficeText(buffer) {
+  const utf8 = buffer.toString("utf8");
+  const utf16 = buffer.toString("utf16le");
+  const pick = utf16.replace(/[^\u4e00-\u9fa5A-Za-z0-9，。！？；：、,.!?;:()（）\s-]/g, " ").length
+    > utf8.replace(/[^\u4e00-\u9fa5A-Za-z0-9，。！？；：、,.!?;:()（）\s-]/g, " ").length
+    ? utf16
+    : utf8;
+  return normalizeExtractedText(pick.replace(/[^\u4e00-\u9fa5A-Za-z0-9，。！？；：、,.!?;:()（）\s-]/g, " "))
+    .slice(0, PDF_LIMITS.maxExtractedTextChars);
 }
 
 function resolvePythonCommand() {
@@ -1035,8 +1148,68 @@ async function extractUploadedBookFile({ name = "上传书本", type = "", fileP
     const buffer = fs.readFileSync(filePath);
     return extractUploadedBookBuffer({ name, type, buffer }, onProgress);
   }
-  const text = fs.readFileSync(filePath, "utf8").slice(0, PDF_LIMITS.maxExtractedTextChars);
-  return { text, meta: { name, type, size, method: "text-reader", characters: text.length, stats: null } };
+  const buffer = fs.readFileSync(filePath);
+  const extracted = extractUploadedBookBuffer({ name, type, buffer }, onProgress);
+  return {
+    text: extracted.text,
+    meta: {
+      ...(extracted.meta || {}),
+      name,
+      type,
+      size,
+      characters: extracted.text.length
+    }
+  };
+}
+
+function isPdfUpload(name = "", type = "") {
+  return String(type || "").toLowerCase().includes("pdf") || String(name || "").toLowerCase().endsWith(".pdf");
+}
+
+async function extractCourseMaterialUpload({ name = "课程资料", type = "", dataUrl = "", filePath = "" }) {
+  if (filePath) {
+    return extractUploadedBookFile({
+      name,
+      type,
+      filePath,
+      extractor: "advanced-python-pdf-agent",
+      subject: "课程资料"
+    }, () => {});
+  }
+  if (!dataUrl) return { text: "", meta: null };
+  const buffer = decodeDataUrl(dataUrl);
+  const local = extractUploadedBookBuffer({ name, type, buffer }, () => {});
+  if (!isPdfUpload(name, type) || local.text.trim().length >= 80) return local;
+
+  const tempPath = path.join(UPLOAD_DIR, `${uid("material")}_${sanitizeFileName(name || "scan.pdf")}`);
+  fs.writeFileSync(tempPath, buffer);
+  try {
+    const advanced = await runAdvancedPdfAgent({
+      filePath: tempPath,
+      maxChars: PDF_LIMITS.maxExtractedTextChars,
+      timeoutMs: PDF_AGENT_TIMEOUT_MS,
+      envOverrides: {
+        PDF_AGENT_OCR_MAX_PAGES: String(process.env.MATERIAL_PDF_OCR_MAX_PAGES || process.env.PDF_AGENT_OCR_MAX_PAGES || 80),
+        PDF_AGENT_OCR_LEADING_PAGES: String(process.env.MATERIAL_PDF_OCR_LEADING_PAGES || process.env.PDF_AGENT_OCR_LEADING_PAGES || 40),
+        PDF_AGENT_OCR_SCALE: String(process.env.MATERIAL_PDF_OCR_SCALE || process.env.PDF_AGENT_OCR_SCALE || 1.6)
+      }
+    }, () => {});
+    return {
+      text: advanced.text,
+      meta: {
+        name,
+        type,
+        size: buffer.length,
+        method: advanced.meta.method || "advanced-python-pdf-agent",
+        characters: advanced.text.length,
+        stats: advanced.meta
+      }
+    };
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {}
+  }
 }
 
 function splitKnowledgeSentences(text) {
@@ -1054,15 +1227,30 @@ function knowledgePointsForKeyword(text, keyword) {
   return sentences.slice(0, 3).map((sentence) => sentence.slice(0, 160));
 }
 
+function uniqueTexts(items) {
+  const seen = new Set();
+  return (items || [])
+    .map((item) => String(item || "").trim())
+    .filter((item) => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
 function extractKeywords(text, subject) {
   const source = `${subject} ${String(text || "")}`;
-  const stopWords = new Set(["这是", "一个", "可以", "进行", "知识", "图谱", "学生", "老师", "内容", "文件", "上传", "生成", "学习", "教学", "本节", "掌握", "理解"]);
-  const cnWords = (source.match(/[\u4e00-\u9fa5]{2,10}/g) || []).filter((word) => !stopWords.has(word));
+  const stopWords = new Set([
+    "这是", "一个", "可以", "进行", "知识", "图谱", "学生", "老师", "内容", "文件", "上传", "生成", "学习", "教学", "本节", "掌握", "理解",
+    "下面", "然后", "因此", "所以", "我们", "这里", "他们", "这些", "那些", "其中", "包括", "首先", "其次", "最后", "如果",
+    "为了", "通过", "使用", "需要", "已经", "没有", "方法", "问题", "相关", "主要", "一般", "一种", "一些", "以及", "能够"
+  ]);
+  const cnWords = (source.match(/[\u4e00-\u9fa5]{2,10}/g) || []).filter((word) => !stopWords.has(word) && isUsefulGraphLabel(word));
   const enWords = Array.from(new Set((source.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || []).map((word) => word.toLowerCase())));
   const rankedCn = Array.from(cnWords.reduce((map, word) => map.set(word, (map.get(word) || 0) + 1), new Map()).entries())
     .sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)
     .map(([word]) => word);
-  const merged = rankedCn.concat(enWords).slice(0, 12);
+  const merged = rankedCn.concat(enWords.filter(isUsefulGraphLabel)).slice(0, 12);
   if (merged.length >= 5) return merged;
   const fallback = {
     数学: ["函数", "方程", "导数", "图像", "概率", "数列"],
@@ -1072,6 +1260,500 @@ function extractKeywords(text, subject) {
     英语: ["vocabulary", "grammar", "reading", "writing", "listening"]
   };
   return Array.from(new Set(merged.concat(fallback[subject] || fallback.物理))).slice(0, 10);
+}
+
+const GENERIC_GRAPH_BAD_LABELS = new Set([
+  "目录", "前言", "序言", "附录", "参考文献", "索引", "版权", "声明", "致谢", "封面", "目录页",
+  "下面", "然后", "因此", "所以", "首先", "其次", "最后", "我们", "这里", "他们", "这些", "那些",
+  "其中", "包括", "如果", "为了", "通过", "使用", "需要", "已经", "没有", "问题", "方法", "内容",
+  "学习", "机器", "模型", "数据", "算法", "本章", "本节", "小结", "习题", "练习", "答案"
+]);
+
+const ML_TERM_PATTERNS = [
+  {
+    label: "训练集/验证集/测试集",
+    pattern: /训练集|验证集|测试集|train(?:ing)? set|validation set|test set/i,
+    points: ["训练集用于拟合模型参数，验证集用于调参和模型选择，测试集用于最终评估泛化能力。", "常见误区是把测试集用于反复调参，导致评估结果过于乐观。"]
+  },
+  {
+    label: "监督学习",
+    pattern: /监督学习|有标签|supervised/i,
+    points: ["监督学习利用带标签样本学习输入到输出的映射，典型任务包括分类和回归。", "复习时要能说明损失函数、训练数据、预测目标和泛化评估之间的关系。"]
+  },
+  {
+    label: "无监督学习",
+    pattern: /无监督学习|聚类|降维|unsupervised/i,
+    points: ["无监督学习不依赖人工标签，常用于发现数据结构、聚类模式或低维表示。", "需要区分聚类、降维、密度估计等任务的目标和评价方式。"]
+  },
+  {
+    label: "特征工程",
+    pattern: /特征工程|特征选择|特征提取|归一化|标准化|feature/i,
+    points: ["特征工程通过选择、变换和构造特征提升模型可学性与可解释性。", "不同模型对尺度、稀疏性、异常值和类别变量的敏感程度不同。"]
+  },
+  {
+    label: "损失函数",
+    pattern: /损失函数|目标函数|代价函数|loss|objective|cost/i,
+    points: ["损失函数度量预测结果与真实目标之间的差距，是优化算法更新参数的依据。", "不同任务常用不同损失，例如平方损失、交叉熵损失、合页损失。"]
+  },
+  {
+    label: "梯度下降",
+    pattern: /梯度下降|随机梯度|批量梯度|SGD|gradient/i,
+    points: ["梯度下降沿损失函数下降最快方向迭代更新参数，学习率决定每一步更新幅度。", "需要关注学习率过大震荡、过小收敛慢以及局部最优/鞍点问题。"]
+  },
+  {
+    label: "过拟合与欠拟合",
+    pattern: /过拟合|欠拟合|泛化|正则化|overfit|underfit|generalization/i,
+    points: ["过拟合表示模型记住训练集噪声而泛化差，欠拟合表示模型容量或训练不足。", "可通过正则化、交叉验证、早停、数据增强或调整模型复杂度改进。"]
+  },
+  {
+    label: "交叉验证",
+    pattern: /交叉验证|留出法|K\s*折|cross.?validation/i,
+    points: ["交叉验证通过多次划分训练/验证数据估计模型稳定性，适合样本量有限时做模型选择。", "需要避免数据泄漏，预处理流程也应在每个训练折内独立拟合。"]
+  },
+  {
+    label: "线性回归",
+    pattern: /线性回归|最小二乘|linear regression/i,
+    points: ["线性回归假设输出是输入特征的线性组合，常用平方损失和最小二乘估计参数。", "重点掌握模型形式、参数估计、残差含义和正则化扩展。"]
+  },
+  {
+    label: "逻辑回归",
+    pattern: /逻辑回归|logistic regression|sigmoid/i,
+    points: ["逻辑回归用 Sigmoid 或 Softmax 把线性得分转换为类别概率，常用于分类任务。", "它名字中有回归，但解决的是分类问题，这是常见易混点。"]
+  },
+  {
+    label: "K 近邻",
+    pattern: /KNN|K\s*近邻|最近邻|nearest neighbor/i,
+    points: ["K 近邻根据距离度量寻找相似样本并投票或平均，训练简单但预测开销较大。", "K 值、距离度量、特征尺度和样本分布会显著影响结果。"]
+  },
+  {
+    label: "朴素贝叶斯",
+    pattern: /朴素贝叶斯|naive bayes|贝叶斯/i,
+    points: ["朴素贝叶斯基于贝叶斯公式和条件独立假设估计类别后验概率。", "适合文本分类等高维稀疏特征场景，但独立性假设可能与真实数据不一致。"]
+  },
+  {
+    label: "决策树",
+    pattern: /决策树|ID3|C4\.5|CART|信息增益|基尼/i,
+    points: ["决策树通过递归划分特征空间形成可解释的判断规则。", "重点比较信息增益、增益率、基尼指数、剪枝和连续特征划分。"]
+  },
+  {
+    label: "集成学习",
+    pattern: /集成学习|随机森林|Boosting|Bagging|GBDT|AdaBoost|XGBoost/i,
+    points: ["集成学习组合多个基学习器降低方差或偏差，典型方法包括 Bagging、Boosting 和随机森林。", "需要理解基学习器差异性、投票/加权和迭代纠错思想。"]
+  },
+  {
+    label: "支持向量机",
+    pattern: /支持向量机|SVM|最大间隔|核函数|kernel/i,
+    points: ["支持向量机通过最大化分类间隔提升泛化能力，核函数可处理非线性可分问题。", "重点掌握支持向量、间隔、软间隔、惩罚参数和核技巧。"]
+  },
+  {
+    label: "K-means 聚类",
+    pattern: /K[-\s]?means|K均值|聚类中心|簇/i,
+    points: ["K-means 通过迭代分配样本和更新簇中心最小化簇内平方误差。", "它对初始中心、K 值、异常点和特征尺度敏感。"]
+  },
+  {
+    label: "主成分分析 PCA",
+    pattern: /PCA|主成分|方差最大|降维/i,
+    points: ["PCA 寻找能保留最大方差的正交方向，用于降维、去噪和可视化。", "需要区分无监督降维目标与分类目标，不能把方差大直接等同于类别可分。"]
+  },
+  {
+    label: "神经网络",
+    pattern: /神经网络|感知机|反向传播|深度学习|CNN|RNN|Transformer|neural|deep learning/i,
+    points: ["神经网络通过多层非线性变换学习复杂表示，反向传播负责高效计算梯度。", "重点关注激活函数、网络层、损失函数、优化器和过拟合控制。"]
+  }
+];
+
+function cleanOutlineLabel(label) {
+  return String(label || "")
+    .replace(/[\u0000-\u001f]/g, " ")
+    .replace(/[·•●▪□◆◇■]+/g, " ")
+    .replace(/\.{2,}|…{1,}|-{3,}|_{3,}/g, " ")
+    .replace(/\s*\(?第?\s*\d+\s*页\)?\s*$/i, "")
+    .replace(/\s+\d{1,4}\s*$/g, "")
+    .replace(/^[\s.．。:：、-]+|[\s.．。:：、-]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function outlineLabelCore(label) {
+  return cleanOutlineLabel(label)
+    .replace(/^第\s*[一二三四五六七八九十百零〇两\d]+\s*[章节篇]\s*/g, "")
+    .replace(/^\d{1,2}(?:[.．]\d{1,2}){0,3}\s*/g, "")
+    .replace(/^[（(]?\d+[)）]\s*/g, "")
+    .trim();
+}
+
+function isUsefulGraphLabel(label) {
+  const text = cleanOutlineLabel(label);
+  const core = outlineLabelCore(text);
+  if (!text || !core) return false;
+  if (GENERIC_GRAPH_BAD_LABELS.has(text) || GENERIC_GRAPH_BAD_LABELS.has(core)) return false;
+  if (core.length < 2 && !/[A-Za-z]{2,}|K|PCA|SVM/i.test(core)) return false;
+  if (core.length > 32) return false;
+  if (/^\d+([.．]\d+)*$/.test(core)) return false;
+  if (/^[,，.。;；:：!?！？、\s-]+$/.test(core)) return false;
+  if (/^(第?\d+页|page\s*\d+|chapter\s*\d*)$/i.test(core)) return false;
+  if (/版权|出版社|ISBN|作者|印刷|定价|http|www\.|公众号|扫描|下载|课后习题答案/.test(core)) return false;
+  return true;
+}
+
+function looksLikeMachineLearning(subject, text) {
+  const source = `${subject} ${text}`.toLowerCase();
+  return /机器学习|动手学机器学习|machine learning|监督学习|无监督学习|深度学习|神经网络|决策树|支持向量机|svm|knn|pca|k-means|梯度下降|过拟合|特征工程/.test(source);
+}
+
+function fallbackMachineLearningOutline() {
+  return [
+    { level: 1, number: "1", label: "第1章 机器学习概述" },
+    { level: 2, number: "1.1", label: "1.1 学习任务与数据集" },
+    { level: 2, number: "1.2", label: "1.2 监督学习、无监督学习与强化学习" },
+    { level: 2, number: "1.3", label: "1.3 训练流程与泛化能力" },
+    { level: 1, number: "2", label: "第2章 数据预处理与特征工程" },
+    { level: 2, number: "2.1", label: "2.1 数据清洗与缺失值处理" },
+    { level: 2, number: "2.2", label: "2.2 特征缩放、编码与选择" },
+    { level: 2, number: "2.3", label: "2.3 数据划分与数据泄漏防控" },
+    { level: 1, number: "3", label: "第3章 监督学习基础模型" },
+    { level: 2, number: "3.1", label: "3.1 K 近邻与距离度量" },
+    { level: 2, number: "3.2", label: "3.2 朴素贝叶斯与概率分类" },
+    { level: 2, number: "3.3", label: "3.3 线性回归与逻辑回归" },
+    { level: 1, number: "4", label: "第4章 模型评估与选择" },
+    { level: 2, number: "4.1", label: "4.1 损失函数与评价指标" },
+    { level: 2, number: "4.2", label: "4.2 交叉验证与超参数选择" },
+    { level: 2, number: "4.3", label: "4.3 偏差、方差、过拟合与欠拟合" },
+    { level: 1, number: "5", label: "第5章 优化方法与正则化" },
+    { level: 2, number: "5.1", label: "5.1 梯度下降与随机梯度下降" },
+    { level: 2, number: "5.2", label: "5.2 学习率、收敛与局部最优" },
+    { level: 2, number: "5.3", label: "5.3 L1/L2 正则化与早停" },
+    { level: 1, number: "6", label: "第6章 决策树与集成学习" },
+    { level: 2, number: "6.1", label: "6.1 决策树划分准则与剪枝" },
+    { level: 2, number: "6.2", label: "6.2 Bagging、随机森林与 Boosting" },
+    { level: 2, number: "6.3", label: "6.3 GBDT、XGBoost 与特征重要性" },
+    { level: 1, number: "7", label: "第7章 支持向量机与核方法" },
+    { level: 2, number: "7.1", label: "7.1 最大间隔与支持向量" },
+    { level: 2, number: "7.2", label: "7.2 软间隔、惩罚参数与核函数" },
+    { level: 2, number: "7.3", label: "7.3 SVM 分类与回归应用" },
+    { level: 1, number: "8", label: "第8章 无监督学习与降维" },
+    { level: 2, number: "8.1", label: "8.1 K-means 聚类与聚类评估" },
+    { level: 2, number: "8.2", label: "8.2 高斯混合模型与 EM 算法" },
+    { level: 2, number: "8.3", label: "8.3 PCA、流形学习与可视化" },
+    { level: 1, number: "9", label: "第9章 神经网络与深度学习" },
+    { level: 2, number: "9.1", label: "9.1 感知机、多层网络与激活函数" },
+    { level: 2, number: "9.2", label: "9.2 反向传播、优化器与正则化" },
+    { level: 2, number: "9.3", label: "9.3 CNN、RNN 与 Transformer 基础" },
+    { level: 1, number: "10", label: "第10章 机器学习应用实践" },
+    { level: 2, number: "10.1", label: "10.1 项目流程与实验设计" },
+    { level: 2, number: "10.2", label: "10.2 模型部署、监控与可解释性" },
+    { level: 2, number: "10.3", label: "10.3 推荐、文本与图像任务案例" }
+  ];
+}
+
+function parseOutlineLine(rawLine, options = {}) {
+  const allowBareChapter = Boolean(options.allowBareChapter);
+  const line = cleanOutlineLabel(rawLine);
+  if (!isUsefulGraphLabel(line)) return null;
+  let match = line.match(/^第\s*([一二三四五六七八九十百零〇两\d]+)\s*([章节篇])\s*[:：、.\s-]*(.{2,36})$/);
+  if (match) {
+    const number = match[1];
+    const title = cleanOutlineLabel(match[3]);
+    const label = `第${number}${match[2]} ${title}`;
+    return isUsefulGraphLabel(title) ? { level: 1, number, label } : null;
+  }
+  match = allowBareChapter ? line.match(/^([0-9]{1,2})(?:[.．]\s*|\s+)(?![0-9.．])(.{2,36})$/) : null;
+  if (match && !/[。！？；;]$/.test(match[2])) {
+    const title = cleanOutlineLabel(match[2]);
+    if (!isUsefulGraphLabel(title)) return null;
+    return { level: 1, number: match[1], label: `第${match[1]}章 ${title}` };
+  }
+  match = line.match(/^([0-9]{1,2}(?:[.．][0-9]{1,2}){1,3})\s*(.{2,42})$/);
+  if (match) {
+    const number = match[1].replace(/．/g, ".");
+    const title = cleanOutlineLabel(match[2]);
+    const level = Math.min(3, number.split(".").length);
+    if (!isUsefulGraphLabel(title)) return null;
+    return { level, number, label: `${number} ${title}` };
+  }
+  return null;
+}
+
+function extractBookOutline(text, subject = "", sourceName = "") {
+  const source = normalizeExtractedText([text, subject, sourceName].filter(Boolean).join("\n\n"));
+  const lower = source.toLowerCase();
+  let markerIndex = -1;
+  const markerMatch = lower.match(/(?:^|\n)\s*(目录|目\s*录|contents|table of contents)\s*(?:\n|$)/i);
+  if (markerMatch) {
+    markerIndex = markerMatch.index;
+  }
+  const inToc = markerIndex >= 0;
+  const outlineWindow = inToc
+    ? source.slice(markerIndex, markerIndex + 100000)
+    : source.slice(0, 90000);
+  const lines = outlineWindow
+    .split(/\r?\n+/)
+    .map((line) => cleanOutlineLabel(line))
+    .filter((line) => line.length >= 3 && line.length <= 70);
+  const combinedLines = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const next = lines[index + 1] || "";
+    if (/^第\s*[一二三四五六七八九十百零〇两\d]+\s*[章节篇]$/.test(line) && isUsefulGraphLabel(next)) {
+      combinedLines.push(`${line} ${next}`);
+      index += 1;
+      continue;
+    }
+    if (/^\d{1,2}(?:[.．]\d{1,2}){1,3}$/.test(line) && isUsefulGraphLabel(next)) {
+      combinedLines.push(`${line} ${next}`);
+      index += 1;
+      continue;
+    }
+    combinedLines.push(line);
+  }
+  const outline = [];
+  const seen = new Set();
+  for (const line of combinedLines) {
+    const item = parseOutlineLine(line, { allowBareChapter: inToc });
+    if (!item) continue;
+    const key = `${item.level}:${item.number}:${outlineLabelCore(item.label)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    outline.push(item);
+    if (outline.length >= 90) break;
+  }
+  const chapterCount = outline.filter((item) => item.level === 1).length;
+  if (chapterCount >= 2 && outline.length >= 5) return outline;
+  if (looksLikeMachineLearning(subject, `${sourceName}\n${source}`)) return fallbackMachineLearningOutline();
+  return outline;
+}
+
+function textAroundLabel(text, label, fallbackStart = 0) {
+  const source = String(text || "");
+  if (!source) return "";
+  const core = outlineLabelCore(label);
+  const candidates = uniqueTexts([label, core, core.replace(/\s+/g, ""), core.split(/[、，,\s/]+/).find((part) => part.length >= 2)]);
+  let index = -1;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    index = source.indexOf(candidate);
+    if (index >= 0) break;
+  }
+  if (index < 0) index = Math.max(0, Math.min(source.length - 1, fallbackStart));
+  return source.slice(Math.max(0, index - 1200), Math.min(source.length, index + 5200));
+}
+
+function fallbackTermsForSection(label, subject = "") {
+  const text = `${subject} ${label}`;
+  if (/初探|人工智能|机器学习是什么/.test(text)) return ["人工智能与机器学习", "预测与决策", "泛化能力", "归纳偏置"];
+  if (/数学|向量|矩阵|梯度|凸函数/.test(text)) return ["向量", "矩阵", "梯度", "凸函数"];
+  if (/K\s*近邻|KNN|最近邻/.test(text)) return ["KNN 算法原理", "分类任务", "回归任务", "距离度量与 K 值"];
+  if (/线性回归/.test(text)) return ["映射形式与学习目标", "解析方法", "梯度下降", "学习率影响"];
+  if (/基本思想|欠拟合|过拟合|超参数|交叉验证/.test(text)) return ["欠拟合与过拟合", "正则化约束", "参数与超参数", "数据集划分与交叉验证"];
+  if (/逻辑斯谛|逻辑回归|Logistic/i.test(text)) return ["逻辑斯谛函数", "最大似然估计", "分类评价指标", "交叉熵损失"];
+  if (/双线性|矩阵分解|因子分解/.test(text)) return ["矩阵分解", "隐向量表示", "因子分解机", "推荐任务"];
+  if (/多层感知机|感知机|反向传播/.test(text)) return ["人工神经网络", "感知机", "隐含层与多层感知机", "反向传播"];
+  if (/卷积神经网络|CNN|卷积|VGG/.test(text)) return ["卷积", "图像分类", "预训练网络", "内容表示与风格表示"];
+  if (/循环神经网络|RNN|GRU|门控/.test(text)) return ["循环神经网络原理", "隐藏状态", "门控循环单元 GRU", "序列建模"];
+  if (/支持向量机|SVM|核函数|最大间隔/.test(text)) return ["最大间隔", "支持向量", "SMO 求解", "核函数"];
+  if (/决策树|ID3|C4\.5|CART/.test(text)) return ["决策树构造", "ID3 与 C4.5", "CART 算法", "剪枝与泛化"];
+  if (/集成|随机森林|Boost|GBDT|梯度提升/.test(text)) return ["自举聚合 Bagging", "随机森林", "Boosting", "梯度提升决策树"];
+  if (/k\s*均值|K-means|聚类/.test(text)) return ["k 均值原理", "聚类中心更新", "k-means++", "聚类评估"];
+  if (/主成分|PCA|降维/.test(text)) return ["主成分与方差", "协方差矩阵", "特征分解", "降维可视化"];
+  if (/概率图|贝叶斯|马尔可夫|朴素贝叶斯/.test(text)) return ["贝叶斯网络", "最大后验估计", "朴素贝叶斯", "马尔可夫网络"];
+  if (/\bEM\b|EM 算法|高斯混合|GMM/.test(text)) return ["高斯混合模型", "E 步", "M 步", "收敛性"];
+  if (/自编码|编码器|解码器/.test(text)) return ["编码器", "解码器", "重构损失", "表示学习"];
+  if (/概述|任务|泛化|流程/.test(text)) return ["监督学习", "无监督学习", "训练集/验证集/测试集", "泛化能力"];
+  if (/预处理|特征|数据/.test(text)) return ["数据清洗", "特征工程", "特征缩放", "数据泄漏"];
+  if (/评估|选择|指标|验证/.test(text)) return ["损失函数", "交叉验证", "过拟合与欠拟合", "评价指标"];
+  if (/优化|梯度|正则/.test(text)) return ["梯度下降", "学习率", "L1/L2 正则化", "早停"];
+  if (/线性|回归|逻辑/.test(text)) return ["线性回归", "逻辑回归", "最小二乘", "Sigmoid 函数"];
+  if (/近邻|KNN/.test(text)) return ["K 近邻", "距离度量", "K 值选择", "特征尺度"];
+  if (/贝叶斯|概率/.test(text)) return ["朴素贝叶斯", "贝叶斯公式", "条件独立假设", "后验概率"];
+  if (/决策树|集成|森林|Boost|GBDT/.test(text)) return ["决策树", "信息增益/基尼指数", "随机森林", "Boosting"];
+  if (/支持向量|SVM|核/.test(text)) return ["支持向量机", "最大间隔", "软间隔", "核函数"];
+  if (/聚类|降维|PCA|无监督/.test(text)) return ["K-means 聚类", "主成分分析 PCA", "高斯混合模型", "EM 算法"];
+  if (/神经|深度|网络|CNN|RNN|Transformer/.test(text)) return ["神经网络", "反向传播", "激活函数", "CNN/RNN/Transformer"];
+  if (/应用|实践|部署|解释/.test(text)) return ["项目流程", "模型部署", "可解释性", "实验复现"];
+  return looksLikeMachineLearning(subject, text)
+    ? ["数据集", "模型训练", "模型评估", "常见误区"]
+    : [];
+}
+
+function extractTermsForSection(text, label, subject = "") {
+  const sectionText = textAroundLabel(text, label);
+  const matched = [];
+  ML_TERM_PATTERNS.forEach((item) => {
+    if (item.pattern.test(`${label}\n${sectionText}\n${subject}`)) matched.push(item.label);
+  });
+  const fallback = fallbackTermsForSection(label, subject);
+  if (fallback.length >= 3 && /^第\s*[一二三四五六七八九十百零〇两\d]+\s*章/.test(cleanOutlineLabel(label))) {
+    return uniqueTexts(fallback).filter(isUsefulGraphLabel).slice(0, 5);
+  }
+  const keywordTerms = extractKeywords(sectionText || label, subject).filter((item) => !outlineLabelCore(label).includes(item));
+  return uniqueTexts(fallback.concat(matched, keywordTerms))
+    .filter(isUsefulGraphLabel)
+    .slice(0, 5);
+}
+
+function knowledgePointsForTerm(sectionText, term, parentLabel, subject = "") {
+  const matched = ML_TERM_PATTERNS.find((item) => item.label === term || item.pattern.test(term));
+  const extracted = knowledgePointsForKeyword(sectionText, term);
+  return uniqueTexts([
+    ...(matched?.points || []),
+    ...extracted,
+    `学习定位：「${term}」属于「${parentLabel}」，复习时要说明定义、输入输出、适用条件和典型题型。`,
+    `GraphRAG 提示：回答「${term}」相关问题时，优先引用教材中对应章节，再补充模型推理和易错点。`,
+    looksLikeMachineLearning(subject, `${term} ${parentLabel}`)
+      ? `易错提醒：不要只记算法名称，要同时说明训练目标、关键假设、参数影响和评估方式。`
+      : `易错提醒：不要只背节点名称，要结合上级章节解释它解决的问题。`
+  ]).slice(0, 6);
+}
+
+function buildOutlineHierarchy(outline) {
+  const chapters = [];
+  let currentChapter = null;
+  let currentSection = null;
+  const chapterByNumber = new Map();
+  outline.forEach((item) => {
+    if (item.level <= 1 || !currentChapter) {
+      currentChapter = { ...item, sections: [] };
+      currentSection = null;
+      chapters.push(currentChapter);
+      if (item.number) chapterByNumber.set(String(item.number).split(".")[0], currentChapter);
+      return;
+    }
+    const chapterKey = String(item.number || "").split(".")[0];
+    const parentChapter = chapterByNumber.get(chapterKey) || currentChapter;
+    if (item.level === 2 || !currentSection) {
+      currentSection = { ...item, children: [] };
+      parentChapter.sections.push(currentSection);
+      currentChapter = parentChapter;
+      return;
+    }
+    currentSection.children.push(item);
+  });
+  return chapters.slice(0, 14);
+}
+
+function addMachineLearningCrossLinks(nodes, links) {
+  const findNode = (pattern) => nodes.find((node) => pattern.test(node.label));
+  [
+    [/训练集|验证集|测试集/, /泛化|过拟合/, "支撑泛化评估"],
+    [/损失函数/, /梯度下降|优化/, "驱动参数更新"],
+    [/正则化|早停/, /过拟合/, "抑制过拟合"],
+    [/特征工程|特征缩放/, /K 近邻|K-means|SVM/, "影响距离与间隔"],
+    [/决策树/, /随机森林|Boosting|集成/, "组成集成学习"],
+    [/PCA|降维/, /可视化|聚类|K-means/, "服务结构发现"],
+    [/反向传播/, /神经网络|深度学习/, "训练深层模型"]
+  ].forEach(([sourcePattern, targetPattern, label]) => {
+    const source = findNode(sourcePattern);
+    const target = findNode(targetPattern);
+    if (source && target && source.id !== target.id) links.push({ source: source.id, target: target.id, label, type: "cross-link" });
+  });
+}
+
+function buildOutlineGraphFromText({ ownerId, title, subject, sourceName, sourceText, extraction, outline }) {
+  const cleanSubject = normalizeSubject(subject);
+  const chapters = buildOutlineHierarchy(outline);
+  const rootLabel = title || `${cleanSubject}知识图谱`;
+  const nodes = [makeGraphNode({
+    id: "n0",
+    label: rootLabel,
+    group: "root",
+    level: 0,
+    subject: cleanSubject,
+    details: `由${sourceName || "教材内容"}按“目录分支 -> 章节知识点 -> 微目标”生成。${extraction?.characters ? `已识别 ${extraction.characters} 个文本字符。` : ""}`,
+    knowledgePoints: [
+      `本图谱先根据目录确定「${cleanSubject}」主分支，再回到书本内容为各分支抽取知识点。`,
+      "节点按章、节、知识点分级，可用于课程问答、GraphRAG 检索、学习路径规划和薄弱点归因。",
+      "双击任一节点可查看知识路径、前置依赖、教学资源、考察属性和知识点详情。"
+    ]
+  })];
+  const links = [];
+  chapters.forEach((chapter, chapterIndex) => {
+    const chapterId = `ch${chapterIndex + 1}`;
+    const chapterText = textAroundLabel(sourceText, chapter.label, chapterIndex * 8000);
+    const chapterCore = outlineLabelCore(chapter.label);
+    nodes.push(makeGraphNode({
+      id: chapterId,
+      label: chapter.label,
+      group: "chapter",
+      level: 1,
+      subject: cleanSubject,
+      parentLabel: rootLabel,
+      details: `一级分支：${chapter.label}。来源于教材目录，作为本章知识组织入口。`,
+      knowledgePoints: uniqueTexts([
+        ...knowledgePointsForKeyword(chapterText, chapterCore),
+        ...fallbackOutlinePoints(chapter.label, rootLabel)
+      ]).slice(0, 6)
+    }));
+    links.push({ source: "n0", target: chapterId, label: "一级章节", type: "contains" });
+    if (chapterIndex > 0) links.push({ source: `ch${chapterIndex}`, target: chapterId, label: "前置依赖", type: "prerequisite" });
+
+    const sections = chapter.sections.length
+      ? chapter.sections
+      : extractTermsForSection(chapterText || sourceText, chapter.label, cleanSubject).slice(0, 3).map((label, index) => ({
+        level: 2,
+        number: `${chapterIndex + 1}.${index + 1}`,
+        label
+      }));
+    sections.slice(0, 8).forEach((section, sectionIndex) => {
+      const sectionId = `${chapterId}s${sectionIndex + 1}`;
+      const sectionText = textAroundLabel(sourceText || chapterText, section.label, chapterIndex * 8000 + sectionIndex * 1800);
+      const sectionCore = outlineLabelCore(section.label);
+      nodes.push(makeGraphNode({
+        id: sectionId,
+        label: section.label,
+        group: sectionIndex % 2 === 0 ? "concept" : "topic",
+        level: 2,
+        subject: cleanSubject,
+        parentLabel: chapter.label,
+        details: `「${chapter.label}」下的二级知识分支：${section.label}。`,
+        knowledgePoints: uniqueTexts([
+          ...knowledgePointsForKeyword(sectionText || chapterText, sectionCore),
+          `本节围绕「${sectionCore || section.label}」组织概念、方法、适用场景和常见误区。`,
+          `学习时先明确它与「${chapter.label}」的关系，再通过例题或实验验证掌握情况。`
+        ]).slice(0, 6)
+      }));
+      links.push({ source: chapterId, target: sectionId, label: "包含", type: "contains" });
+      if (sectionIndex > 0) links.push({ source: `${chapterId}s${sectionIndex}`, target: sectionId, label: "前置依赖", type: "prerequisite" });
+
+      const childLabels = uniqueTexts((section.children || []).map((item) => item.label)
+        .concat(extractTermsForSection(sectionText || chapterText, section.label, cleanSubject)))
+        .filter((label) => isUsefulGraphLabel(label) && outlineLabelCore(label) !== sectionCore)
+        .slice(0, 5);
+      childLabels.forEach((childLabel, childIndex) => {
+        const childId = `${sectionId}k${childIndex + 1}`;
+        nodes.push(makeGraphNode({
+          id: childId,
+          label: childLabel,
+          group: "detail",
+          level: 3,
+          subject: cleanSubject,
+          parentLabel: section.label,
+          details: `「${chapter.label} > ${section.label}」下的三级知识点：${childLabel}。`,
+          knowledgePoints: knowledgePointsForTerm(sectionText || chapterText, childLabel, section.label, cleanSubject)
+        }));
+        links.push({ source: sectionId, target: childId, label: "细分", type: "contains" });
+      });
+    });
+  });
+  if (looksLikeMachineLearning(cleanSubject, `${sourceName}\n${sourceText}`)) addMachineLearningCrossLinks(nodes, links);
+  return enhanceGraphForEducation({
+    id: uid("graph"),
+    ownerId,
+    subject: cleanSubject,
+    title: title || `${cleanSubject}知识图谱`,
+    sourceName: sourceName || "教材/讲义导入",
+    extraction: {
+      ...(extraction || {}),
+      outlineDriven: true,
+      outlineNodes: outline.length,
+      outlineChapters: chapters.length,
+      graphAgent: "outline-aware-education-kg-agent"
+    },
+    nodes,
+    links,
+    global: false,
+    createdAt: now(),
+    updatedAt: now()
+  });
 }
 
 const COMPUTER_ORG_OUTLINE = [
@@ -1710,6 +2392,18 @@ function buildGraphFromText({ ownerId, title, subject, sourceName, sourceText, e
   if (looksLikeComputerOrganization(cleanSubject, graphSourceText)) {
     return buildComputerOrganizationGraph({ ownerId, title, subject: cleanSubject, sourceName, sourceText: graphSourceText, extraction });
   }
+  const outline = extractBookOutline(graphSourceText, cleanSubject, sourceName);
+  if (outline.length >= 3) {
+    return buildOutlineGraphFromText({
+      ownerId,
+      title,
+      subject: cleanSubject,
+      sourceName,
+      sourceText: graphSourceText,
+      extraction,
+      outline
+    });
+  }
   const keywords = extractKeywords(graphSourceText, cleanSubject);
   const nodes = [makeGraphNode({
     id: "n0",
@@ -1876,7 +2570,7 @@ function processGraphGenerationJob(jobId, payload) {
 
       const sourceText = limitText([
         uploaded.text,
-        payload.sourceText,
+        requestText(payload.sourceText),
         aiUnlimited ? payload.subject : "",
         aiUnlimited ? payload.title : "",
         aiUnlimited ? payload.sourceName : ""
@@ -1887,7 +2581,7 @@ function processGraphGenerationJob(jobId, payload) {
       }
 
       assertGraphJobActive(jobId);
-      updateGraphJob(jobId, { stage: "构建图谱", progress: 82, message: "正在生成节点、关系和节点知识点" });
+      updateGraphJob(jobId, { stage: "构建图谱", progress: 82, message: "正在先识别目录分支，再抽取章节知识点和语义关系" });
       const graph = buildGraphFromText({
         ownerId: payload.userId,
         title: payload.title,
@@ -2551,7 +3245,7 @@ async function handleApi(req, res, pathname, searchParams) {
       subject,
       title,
       sourceName,
-      sourceText: body.sourceText || "",
+      sourceText: requestText(body.sourceText),
       extractor,
       uploadId: session.id,
       file: {
@@ -2618,8 +3312,8 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["userId", "subject"]);
     ensureUser(db, body.userId);
-    const uploaded = extractUploadedBookText(body.file);
-    const sourceText = [uploaded.text, body.sourceText].filter(Boolean).join("\n\n");
+    const uploaded = body.file?.dataUrl ? await extractCourseMaterialUpload(body.file) : { text: "", meta: null };
+    const sourceText = [uploaded.text, requestText(body.sourceText)].filter(Boolean).join("\n\n");
     const graph = buildGraphFromText({
       ownerId: body.userId,
       title: body.title,
@@ -2691,10 +3385,10 @@ async function handleApi(req, res, pathname, searchParams) {
     const user = ensureUser(db, body.userId);
     let uploaded = { text: "", meta: null };
     if (body.file?.dataUrl) {
-      uploaded = extractUploadedBookText(body.file);
+      uploaded = await extractCourseMaterialUpload(body.file);
     }
-    const sourceText = [uploaded.text, body.sourceText].filter(Boolean).join("\n\n");
-    if (!sourceText.trim()) return sendError(res, 400, "没有识别到可入库的课程资料文本，请上传 TXT/PDF 或粘贴内容");
+    const sourceText = [uploaded.text, requestText(body.sourceText)].filter(Boolean).join("\n\n");
+    if (!sourceText.trim()) return sendError(res, 400, "没有识别到可入库的课程资料文本，请上传 PDF/Word/PPTX/TXT，扫描版 PDF 会自动尝试 OCR");
     const material = createCourseMaterial({
       ownerId: user.id,
       subject: body.subject,
@@ -2709,6 +3403,41 @@ async function handleApi(req, res, pathname, searchParams) {
     db.courseMaterials.unshift(material);
     writeDb(db);
     return send(res, 201, { ok: true, material: publicCourseMaterial(material) });
+  }
+
+  if (method === "POST" && pathname === "/api/materials/from-upload") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "uploadId", "subject"]);
+    const user = ensureUser(db, body.userId);
+    const session = getUploadSession(body.uploadId);
+    if (session.userId !== body.userId) return sendError(res, 403, "不能使用其他账号的上传文件");
+    if (session.received !== session.size) return sendError(res, 400, "文件尚未上传完成");
+    let uploaded = { text: "", meta: null };
+    try {
+      uploaded = await extractCourseMaterialUpload({
+        name: session.fileName,
+        type: session.fileType,
+        filePath: session.filePath
+      });
+      const sourceText = [uploaded.text, requestText(body.sourceText)].filter(Boolean).join("\n\n");
+      if (!sourceText.trim()) return sendError(res, 400, "没有识别到可入库的课程资料文本，请上传 PDF/Word/PPTX/TXT，扫描版 PDF 会自动尝试 OCR");
+      const material = createCourseMaterial({
+        ownerId: user.id,
+        subject: body.subject,
+        title: body.title || session.fileName || "课程资料",
+        sourceName: body.sourceName || session.fileName || "上传资料",
+        type: session.fileType || "application/octet-stream",
+        text: sourceText,
+        global: user.role === "teacher" ? Boolean(body.global) : false,
+        classId: body.classId
+      });
+      material.extraction = uploaded.meta ? { ...uploaded.meta, agent: "course-rag-material-agent" } : null;
+      db.courseMaterials.unshift(material);
+      writeDb(db);
+      return send(res, 201, { ok: true, material: publicCourseMaterial(material) });
+    } finally {
+      cleanupUploadSession(body.uploadId, true);
+    }
   }
 
   params = routePattern(pathname, "/api/materials/:id");
