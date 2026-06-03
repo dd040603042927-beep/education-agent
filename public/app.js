@@ -9,7 +9,7 @@ const state = {
   selectedGraphId: null,
   graphSubject: "物理",
   activeConversationId: null,
-  aiMode: "explain",
+  aiMode: "rag",
   modelSubject: "物理",
   modelMode: "ideal",
   modelComponents: [],
@@ -91,6 +91,10 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function escapeMultiline(value) {
+  return escapeHtml(value).replace(/\n/g, "<br />");
 }
 
 function fmtTime(value) {
@@ -2101,6 +2105,115 @@ function bindGraphPage() {
   });
 }
 
+function renderCitationList(citations = []) {
+  if (!citations.length) return `<p class="hint">本轮回答暂无明确引用。上传课程资料后，系统会显示 PDF/讲义来源、章节和页码。</p>`;
+  return `
+    <div class="citation-list">
+      ${citations.map((citation) => `
+        <article>
+          <strong>[${escapeHtml(citation.id)}] ${escapeHtml(citation.sourceName || citation.title || "课程资料")}</strong>
+          <span>${escapeHtml(citation.chapter || "课程片段")}${citation.page ? ` · 第 ${citation.page} 页` : ""}</span>
+          <p>${escapeHtml(citation.quote || "")}</p>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderAiMessage(message) {
+  const citations = Array.isArray(message.citations) ? message.citations : [];
+  const confidence = message.confidence ? `<small class="answer-source">可靠性：${escapeHtml(message.confidence)}${citations.length ? ` · 引用 ${citations.length} 条` : ""}</small>` : "";
+  return `
+    <div class="bubble ${message.role}">
+      <span>${message.role === "assistant" ? "AI" : "我"}</span>
+      <p>${escapeMultiline(message.content)}</p>
+      ${confidence}
+      ${message.role === "assistant" && citations.length ? `<div class="bubble-citations">${renderCitationList(citations.slice(0, 3))}</div>` : ""}
+    </div>
+  `;
+}
+
+function renderLearningProfilePanel() {
+  const analytics = state.data.learningAnalytics || {};
+  const profile = analytics.profile || state.data.learningProfile || {};
+  const summary = analytics.summary || {};
+  const weak = summary.weak || [];
+  const strong = summary.strong || [];
+  const wrongNotes = state.data.wrongNotes || [];
+  const avg = Number(summary.average || 0);
+  return `
+    <section class="ai-side-card">
+      <h3>学习画像</h3>
+      <div class="profile-meter"><span style="width:${clamp(avg * 100, 8, 100)}%"></span></div>
+      <p>${escapeHtml(profile.level || "基础")} · 提问 ${profile.questionCount || 0} 次 · 练习 ${profile.practiceCount || 0} 次 · 学习 ${profile.studyMinutes || 0} 分钟</p>
+      <div class="node-chip-row">
+        ${(weak.length ? weak : [{ topic: "暂无明显薄弱点", status: "继续观察" }]).slice(0, 4).map((item) => `<span class="node-chip">${escapeHtml(item.topic)} ${item.score !== undefined ? percentText(item.score) : ""}</span>`).join("")}
+      </div>
+      ${strong.length ? `<p class="hint">优势：${escapeHtml(strong.map((item) => item.topic).join("、"))}</p>` : ""}
+    </section>
+    <section class="ai-side-card">
+      <h3>错题本</h3>
+      ${wrongNotes.slice(0, 4).map((note) => `
+        <article class="mini-note">
+          <strong>${escapeHtml(note.topic)}</strong>
+          <p>${escapeHtml(note.analysis || note.recommendation || "建议复习相关前置知识。")}</p>
+        </article>
+      `).join("") || `<p class="hint">暂无错题记录。AI 批改或低置信问答会自动形成错题线索。</p>`}
+    </section>
+  `;
+}
+
+function renderMaterialsPanel() {
+  const materials = state.data.courseMaterials || [];
+  return `
+    <section class="panel material-panel">
+      <div class="split-head">
+        <h3>课程资料库</h3>
+        <span>${materials.length} 份</span>
+      </div>
+      <form id="materialUploadForm" class="stack">
+        <div class="form-grid">
+          <label>学科<input name="subject" value="${escapeHtml(state.user.subject || "")}" placeholder="例如：操作系统、计算机组成原理" required /></label>
+          <label>资料标题<input name="title" placeholder="例如：第 3 章 存储系统课件" /></label>
+        </div>
+        <label>上传资料<input name="file" type="file" accept=".pdf,.txt,.md,.csv,.json,text/*,application/pdf" /></label>
+        <label>或粘贴资料内容<textarea name="sourceText" rows="4" placeholder="可粘贴教材章节、讲义、习题解析、实验文档内容"></textarea></label>
+        ${state.user.role === "teacher" ? `<label class="check-line"><input name="global" type="checkbox" checked /> 学生可检索这份资料</label>` : ""}
+        <button class="primary" type="submit">入库并建立 RAG 索引</button>
+      </form>
+      <div class="material-list">
+        ${materials.slice(0, 8).map((item) => `
+          <article>
+            <div>
+              <strong>${escapeHtml(item.title)}</strong>
+              <span>${escapeHtml(item.subject)} · ${item.chunkCount} 个片段 · ${item.characters} 字</span>
+            </div>
+            ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
+          </article>
+        `).join("") || emptyBlock("还没有课程资料。先上传 PDF/TXT 或粘贴章节内容。")}
+      </div>
+    </section>
+  `;
+}
+
+function renderAgentTracePanel(active) {
+  const citations = [...(active?.messages || [])].reverse().find((message) => message.citations?.length)?.citations || [];
+  const run = (state.data.agentRuns || [])[0];
+  return `
+    <aside class="ai-side">
+      <section class="ai-side-card">
+        <h3>引用来源</h3>
+        ${renderCitationList(citations)}
+      </section>
+      <section class="ai-side-card">
+        <h3>智能体执行</h3>
+        ${(run?.steps || ["意图识别", "课程知识库检索", "知识图谱关联", "生成与校验"]).map((step, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(step)}</p>`).join("")}
+      </section>
+      ${renderLearningProfilePanel()}
+    </aside>
+  `;
+}
+
 function renderAiPage() {
   const isTeacher = state.user.role === "teacher";
   const conversations = state.data.conversations || [];
@@ -2108,29 +2221,37 @@ function renderAiPage() {
   if (active && !state.activeConversationId) state.activeConversationId = active.id;
   const modeItems = isTeacher
     ? [
-      { key: "explain", label: "讲解策略" },
-      { key: "questions", label: "知识点出题" },
-      { key: "plan", label: "教学方案" }
+      { key: "rag", label: "资料问答" },
+      { key: "socratic", label: "引导追问" },
+      { key: "questions", label: "生成练习" },
+      { key: "teacher-plan", label: "教学设计" },
+      { key: "plan", label: "复习路径" }
     ]
     : [
-      { key: "explain", label: "问题解答" },
-      { key: "questions", label: "知识点出题" },
-      { key: "plan", label: "学习方向" }
+      { key: "rag", label: "资料问答" },
+      { key: "socratic", label: "提示模式" },
+      { key: "practice", label: "自适应练习" },
+      { key: "questions", label: "出题解析" },
+      { key: "plan", label: "学习路径" }
     ];
+  const quickPrompts = isTeacher
+    ? ["根据第 3 章生成 45 分钟教学设计", "汇总学生常见薄弱点并给出课堂练习", "根据 Cache 映射方式生成 5 道选择题并附解析"]
+    : ["这章讲了什么？请引用资料", "用提示模式引导我理解这个概念", "根据我的薄弱点安排 7 天复习计划"];
   return `
     <div class="page-head">
       <div>
-        <h2>${isTeacher ? "✨ 教学指导" : "☁️ 发起对话"}</h2>
-        <p>${isTeacher ? "根据教师提问生成讲解策略、练习题和教学方案，并自动写入历史对话。" : "根据学生提问答疑、出题并规划学习方向，对话可在历史中回看。"} </p>
+        <h2>${isTeacher ? "✨ 教师智能体工作台" : "☁️ 学习智能体工作台"}</h2>
+        <p>${isTeacher ? "支持课程资料 RAG、引用追溯、教案生成、课堂练习和班级薄弱点分析。" : "基于课程资料回答问题，区分资料依据和模型推理，并持续更新个人学习画像。"} </p>
       </div>
       <button id="newConversationBtn" class="primary">新建对话</button>
     </div>
-    <div class="chat-layout">
+    ${renderMaterialsPanel()}
+    <div class="chat-layout wide ai-workbench">
       <aside class="conversation-list">
         ${conversations.map((conv) => `
           <button class="${active?.id === conv.id ? "active" : ""}" data-conversation="${conv.id}">
             <strong>${escapeHtml(conv.title || "新的对话")}</strong>
-            <span>${fmtTime(conv.updatedAt)}</span>
+            <span>${fmtTime(conv.updatedAt)} · ${escapeHtml(conv.mode || "rag")}</span>
           </button>
         `).join("") || emptyBlock("暂无历史对话")}
       </aside>
@@ -2138,19 +2259,19 @@ function renderAiPage() {
         <div class="segmented">
           ${modeItems.map((item) => `<button class="${state.aiMode === item.key ? "active" : ""}" data-ai-mode="${item.key}">${item.label}</button>`).join("")}
         </div>
-        <div class="message-stream" id="aiMessages">
-          ${(active?.messages || []).map((message) => `
-            <div class="bubble ${message.role}">
-              <span>${message.role === "assistant" ? "AI" : "我"}</span>
-              <p>${escapeHtml(message.content)}</p>
-            </div>
-          `).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "输入知识点或课堂问题，我会生成可执行的教学建议。" : "输入你的学习问题，我会给出分步骤指导。"}</p></div>`}
+        <div class="quick-prompts">
+          ${quickPrompts.map((prompt) => `<button class="mini" data-quick-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}</button>`).join("")}
         </div>
-        <form id="aiForm" class="composer">
-          <input name="prompt" placeholder="${isTeacher ? "例如：牛顿第二定律如何讲得更容易理解" : "例如：我不会判断运动学题该用哪个公式"}" />
+        <div class="message-stream" id="aiMessages">
+          ${(active?.messages || []).map(renderAiMessage).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "先上传课程资料，再输入教学目标或课堂问题，我会基于资料生成可追溯建议。" : "先上传或选择课程资料，再问我概念、章节总结或题目思路，我会给出引用来源。"}</p></div>`}
+        </div>
+        <form id="aiForm" class="composer rich-composer">
+          <input name="subject" placeholder="学科/课程，例如：操作系统" value="${escapeHtml(state.user.subject || "")}" />
+          <input name="prompt" placeholder="${isTeacher ? "例如：根据第 4 章存储管理生成课堂教学设计" : "例如：死锁是什么？请先提示我"}" />
           <button class="primary" type="submit">发送</button>
         </form>
       </section>
+      ${renderAgentTracePanel(active)}
     </div>
   `;
 }
@@ -2181,6 +2302,51 @@ function bindAiPage() {
       showToast(error.message, "error");
     }
   });
+  document.getElementById("materialUploadForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const file = form.get("file");
+    try {
+      const filePayload = file && file.name ? await fileToPayload(file) : null;
+      const payload = await api("/api/materials", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          subject: form.get("subject"),
+          title: form.get("title"),
+          sourceText: form.get("sourceText"),
+          global: form.get("global") === "on",
+          file: filePayload
+        }
+      });
+      await loadState();
+      renderShell();
+      showToast(`课程资料已入库：${payload.material.chunkCount} 个检索片段`);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-delete-material]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确认删除这份课程资料？")) return;
+      try {
+        await api(`/api/materials/${button.dataset.deleteMaterial}?userId=${state.user.id}`, { method: "DELETE" });
+        await loadState();
+        renderShell();
+        showToast("课程资料已删除");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-quick-prompt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const form = document.getElementById("aiForm");
+      if (!form) return;
+      form.elements.prompt.value = button.dataset.quickPrompt;
+      form.elements.prompt.focus();
+    });
+  });
   const stream = document.getElementById("aiMessages");
   if (stream) stream.scrollTop = stream.scrollHeight;
   document.getElementById("aiForm")?.addEventListener("submit", async (event) => {
@@ -2195,6 +2361,7 @@ function bindAiPage() {
           userId: state.user.id,
           conversationId: state.activeConversationId,
           mode: state.aiMode,
+          subject: form.get("subject"),
           prompt
         }
       });

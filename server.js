@@ -16,6 +16,9 @@ const MAX_BODY_SIZE = 30 * 1024 * 1024;
 const MAX_UPLOAD_SIZE = Number(process.env.MAX_UPLOAD_SIZE_BYTES || Number.MAX_SAFE_INTEGER);
 const MAX_UPLOAD_CHUNK_SIZE = 12 * 1024 * 1024;
 const MAX_GRAPH_SOURCE_CHARS = 320000;
+const RAG_CHUNK_CHARS = 900;
+const RAG_CHUNK_OVERLAP = 160;
+const RAG_MAX_CONTEXT_CHUNKS = 5;
 const AI_UNLIMITED_EXTRACTOR = "ai-unlimited-pdf-graph-agent";
 const AI_AGENT_TIMEOUT_MS = Math.max(60 * 1000, Number(process.env.AI_PDF_AGENT_TIMEOUT_MS || 8 * 60 * 1000));
 const PDF_LIMITS = {
@@ -174,7 +177,14 @@ function createInitialDb() {
         updatedAt: now()
       }
     ],
-    submissions: []
+    submissions: [],
+    courseMaterials: seedCourseMaterials(teacherId),
+    learningProfiles: [
+      createLearningProfile(studentId, "student"),
+      createLearningProfile(teacherId, "teacher")
+    ],
+    wrongNotes: [],
+    agentRuns: []
   };
 }
 
@@ -183,12 +193,168 @@ function readDb() {
   if (!fs.existsSync(DB_PATH)) {
     fs.writeFileSync(DB_PATH, JSON.stringify(createInitialDb(), null, 2), "utf8");
   }
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  if (ensureDbShape(db)) writeDb(db);
+  return db;
 }
 
 function writeDb(db) {
   ensureDataDir();
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+}
+
+function createLearningProfile(userId, role = "student") {
+  return {
+    userId,
+    role,
+    level: role === "teacher" ? "教师" : "基础",
+    goals: role === "teacher" ? ["提升课堂讲解质量", "掌握班级薄弱点"] : ["稳定掌握课程核心概念", "减少重复错题"],
+    questionCount: 0,
+    practiceCount: 0,
+    gradedCount: 0,
+    studyMinutes: 0,
+    mastery: {},
+    weakPoints: [],
+    recentActivity: [],
+    updatedAt: now()
+  };
+}
+
+function ensureLearningProfile(db, userId) {
+  db.learningProfiles = Array.isArray(db.learningProfiles) ? db.learningProfiles : [];
+  const user = getUser(db, userId);
+  let profile = db.learningProfiles.find((item) => item.userId === userId);
+  if (!profile) {
+    profile = createLearningProfile(userId, user?.role || "student");
+    db.learningProfiles.push(profile);
+  }
+  profile.mastery = profile.mastery && typeof profile.mastery === "object" ? profile.mastery : {};
+  profile.weakPoints = Array.isArray(profile.weakPoints) ? profile.weakPoints : [];
+  profile.recentActivity = Array.isArray(profile.recentActivity) ? profile.recentActivity : [];
+  profile.goals = Array.isArray(profile.goals) ? profile.goals : [];
+  return profile;
+}
+
+function normalizeKeywordText(text) {
+  return String(text || "")
+    .replace(/[^\u4e00-\u9fa5A-Za-z0-9_+\-#/.]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function tokenizeForSearch(text) {
+  const normalized = normalizeKeywordText(text);
+  const tokens = normalized.match(/[\u4e00-\u9fa5]{2,10}|[a-z0-9_+\-#/.]{2,}/g) || [];
+  const cn = normalized.replace(/[^\u4e00-\u9fa5]/g, "");
+  for (let index = 0; index < cn.length - 1; index += 1) tokens.push(cn.slice(index, index + 2));
+  return Array.from(new Set(tokens)).slice(0, 80);
+}
+
+function sourceChapterForText(text, fallback = "课程资料") {
+  const match = String(text || "").match(/第\s*[一二三四五六七八九十百\d]+\s*[章节]\s*[^。\n\r]{0,24}|[一二三四五六七八九十百\d]+[.、]\s*[^。\n\r]{2,24}/);
+  return match ? match[0].replace(/\s+/g, " ").trim() : fallback;
+}
+
+function chunkCourseMaterialText(text, material) {
+  const clean = normalizeExtractedText(text).slice(0, PDF_LIMITS.maxExtractedTextChars);
+  const chunks = [];
+  if (!clean.trim()) return chunks;
+  const paragraphs = clean.split(/\n{2,}|(?<=。|！|？|；)\s*/).map((item) => item.trim()).filter(Boolean);
+  let buffer = "";
+  let page = 1;
+  let chapter = sourceChapterForText(clean, material.title || material.subject || "课程资料");
+  const pushChunk = () => {
+    const content = buffer.trim();
+    if (!content) return;
+    chapter = sourceChapterForText(content, chapter);
+    const index = chunks.length;
+    chunks.push({
+      id: `${material.id}_chunk_${index + 1}`,
+      index,
+      page,
+      chapter,
+      text: content.slice(0, RAG_CHUNK_CHARS + RAG_CHUNK_OVERLAP),
+      keywords: tokenizeForSearch(`${material.subject} ${material.title} ${chapter} ${content}`).slice(0, 24)
+    });
+    page += Math.max(1, Math.round(content.length / 1200));
+    buffer = content.slice(Math.max(0, content.length - RAG_CHUNK_OVERLAP));
+  };
+  paragraphs.forEach((paragraph) => {
+    if ((buffer + "\n" + paragraph).length > RAG_CHUNK_CHARS) pushChunk();
+    buffer = [buffer, paragraph].filter(Boolean).join("\n");
+  });
+  pushChunk();
+  return chunks.slice(0, 260);
+}
+
+function createCourseMaterial({ ownerId, subject, title, sourceName, type = "text/plain", text, global = false, classId = "" }) {
+  const id = uid("mat");
+  const material = {
+    id,
+    ownerId,
+    subject: normalizeSubject(subject),
+    title: String(title || sourceName || "课程资料").trim() || "课程资料",
+    sourceName: String(sourceName || title || "手动录入").trim() || "手动录入",
+    type,
+    text: normalizeExtractedText(text).slice(0, PDF_LIMITS.maxExtractedTextChars),
+    chunks: [],
+    global: Boolean(global),
+    classId: String(classId || ""),
+    createdAt: now(),
+    updatedAt: now()
+  };
+  material.chunks = chunkCourseMaterialText(material.text, material);
+  return material;
+}
+
+function seedCourseMaterials(teacherId) {
+  return [
+    createCourseMaterial({
+      ownerId: teacherId,
+      subject: "物理",
+      title: "牛顿第二定律课堂讲义",
+      sourceName: "系统内置讲义",
+      global: true,
+      text: "第 1 章 力与运动。牛顿第二定律说明物体的加速度与合外力成正比，与质量成反比，方向与合外力方向相同，公式为 F=ma。解题时通常先选研究对象，再进行受力分析，建立坐标轴，列出合力与加速度的关系。常见误区是把速度方向当成合力方向，或者漏掉摩擦力、支持力等受力。课堂练习应让学生区分匀速、匀加速和静止三种状态。"
+    }),
+    createCourseMaterial({
+      ownerId: teacherId,
+      subject: "计算机组成原理",
+      title: "Cache 映射方式与主存关系摘要",
+      sourceName: "系统内置讲义",
+      global: true,
+      text: "第 3 章 存储系统。Cache 位于 CPU 和主存之间，用来缓解 CPU 与主存速度不匹配的问题。Cache 与主存的映射方式包括直接映射、全相联映射和组相联映射。直接映射实现简单但冲突较多，全相联映射冲突少但硬件代价高，组相联映射在冲突率和硬件复杂度之间折中。常见考点包括地址划分、命中率、替换算法、写策略以及 Cache 与主存一致性问题。"
+    })
+  ];
+}
+
+function ensureDbShape(db) {
+  let changed = false;
+  const ensureArray = (key) => {
+    if (!Array.isArray(db[key])) {
+      db[key] = [];
+      changed = true;
+    }
+  };
+  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions"].forEach(ensureArray);
+  (db.users || []).forEach((user) => {
+    const before = db.learningProfiles.length;
+    ensureLearningProfile(db, user.id);
+    if (db.learningProfiles.length !== before) changed = true;
+  });
+  if (!db.courseMaterials.length && db.users?.length) {
+    const teacher = db.users.find((user) => user.role === "teacher") || db.users[0];
+    db.courseMaterials.push(...seedCourseMaterials(teacher.id));
+    changed = true;
+  }
+  db.courseMaterials.forEach((material) => {
+    if (!Array.isArray(material.chunks) || !material.chunks.length) {
+      material.chunks = chunkCourseMaterialText(material.text || "", material);
+      changed = true;
+    }
+  });
+  return changed;
 }
 
 function publicUser(user) {
@@ -1801,6 +1967,387 @@ function scoreMatch(answer, submission) {
   return score;
 }
 
+function visibleCourseMaterials(db, userId) {
+  const user = ensureUser(db, userId);
+  const teacherIds = user.role === "student"
+    ? db.classes.filter((klass) => (user.classIds || []).includes(klass.id)).map((klass) => klass.teacherId)
+    : [];
+  return (db.courseMaterials || []).filter((material) => (
+    material.ownerId === userId
+    || material.global
+    || teacherIds.includes(material.ownerId)
+    || (material.classId && (user.classIds || []).includes(material.classId))
+  ));
+}
+
+function publicCourseMaterial(material) {
+  return {
+    id: material.id,
+    ownerId: material.ownerId,
+    subject: material.subject,
+    title: material.title,
+    sourceName: material.sourceName,
+    type: material.type,
+    global: Boolean(material.global),
+    classId: material.classId || "",
+    chunkCount: (material.chunks || []).length,
+    characters: String(material.text || "").length,
+    preview: String(material.text || "").slice(0, 180),
+    extraction: material.extraction || null,
+    createdAt: material.createdAt,
+    updatedAt: material.updatedAt
+  };
+}
+
+function searchCourseKnowledge(db, userId, query, options = {}) {
+  const subject = normalizeSubject(options.subject || "");
+  const queryTokens = tokenizeForSearch(query);
+  const queryTokenSet = new Set(queryTokens);
+  const materials = visibleCourseMaterials(db, userId)
+    .filter((material) => !subject || subject === "通用" || material.subject === subject || String(query).includes(material.subject));
+  const materialHits = [];
+  materials.forEach((material) => {
+    (material.chunks || []).forEach((chunk) => {
+      const chunkTokens = chunk.keywords?.length ? chunk.keywords : tokenizeForSearch(chunk.text);
+      const overlap = chunkTokens.filter((token) => queryTokenSet.has(token));
+      const exactBoost = String(chunk.text || "").includes(String(query || "").slice(0, 12)) ? 4 : 0;
+      const score = overlap.length * 2 + exactBoost + (String(chunk.text || "").includes(subject) ? 1 : 0);
+      if (score <= 0 && materialHits.length > 0) return;
+      materialHits.push({
+        type: "material",
+        score,
+        materialId: material.id,
+        chunkId: chunk.id,
+        title: material.title,
+        sourceName: material.sourceName,
+        subject: material.subject,
+        chapter: chunk.chapter || material.title,
+        page: chunk.page || Math.max(1, (chunk.index || 0) + 1),
+        quote: String(chunk.text || "").slice(0, 220),
+        text: chunk.text
+      });
+    });
+  });
+
+  const graphHits = [];
+  (db.knowledgeGraphs || [])
+    .filter((graph) => graph.ownerId === userId || graph.global || !subject || graph.subject === subject)
+    .forEach((graph) => {
+      (graph.nodes || []).forEach((node) => {
+        const nodeText = [node.label, node.details, ...(node.knowledgePoints || [])].join(" ");
+        const tokens = tokenizeForSearch(nodeText);
+        const overlap = tokens.filter((token) => queryTokenSet.has(token));
+        const score = overlap.length * 1.6 + (String(query).includes(node.label) ? 5 : 0);
+        if (score <= 0) return;
+        graphHits.push({
+          type: "graph",
+          score,
+          graphId: graph.id,
+          nodeId: node.id,
+          title: graph.title,
+          sourceName: graph.sourceName || graph.title,
+          subject: graph.subject,
+          chapter: node.ontology?.parent || node.ontology?.layer || "知识图谱",
+          page: null,
+          quote: nodeText.slice(0, 220),
+          text: nodeText,
+          nodeLabel: node.label
+        });
+      });
+    });
+
+  return materialHits.concat(graphHits)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, options.limit || RAG_MAX_CONTEXT_CHUNKS);
+}
+
+function citationsFromHits(hits) {
+  return hits.map((hit, index) => ({
+    id: `S${index + 1}`,
+    type: hit.type,
+    title: hit.title,
+    sourceName: hit.sourceName,
+    subject: hit.subject,
+    chapter: hit.chapter,
+    page: hit.page,
+    quote: hit.quote,
+    materialId: hit.materialId,
+    graphId: hit.graphId,
+    nodeId: hit.nodeId
+  }));
+}
+
+function isAcademicMisuse(prompt) {
+  return /直接.*(写|生成|完成).*(作业|论文|实验报告|考试|答案)|代写|替我写|帮我作弊|考试.*答案|不要解释.*只给答案/.test(String(prompt || ""));
+}
+
+function inferQuestionTopics(text, subject = "") {
+  return extractKeywords(text, subject).slice(0, 6);
+}
+
+function profileMasterySummary(profile) {
+  const entries = Object.entries(profile.mastery || {})
+    .map(([topic, item]) => ({ topic, score: Number(item.score || 0), status: item.status || "待诊断" }))
+    .sort((a, b) => a.score - b.score);
+  return {
+    weak: entries.filter((item) => item.score < 0.58).slice(0, 6),
+    strong: entries.filter((item) => item.score >= 0.75).slice(-6).reverse(),
+    average: entries.length ? Number((entries.reduce((sum, item) => sum + item.score, 0) / entries.length).toFixed(2)) : 0.55
+  };
+}
+
+function updateTopicMastery(db, userId, topics, delta, evidence) {
+  const profile = ensureLearningProfile(db, userId);
+  topics.filter(Boolean).slice(0, 8).forEach((topic) => {
+    const current = profile.mastery[topic] || { score: 0.52, status: "待诊断", evidence: [] };
+    const nextScore = Math.max(0.08, Math.min(0.98, Number(current.score || 0.52) + delta));
+    current.score = Number(nextScore.toFixed(2));
+    current.status = nextScore < 0.35 ? "未掌握" : nextScore < 0.58 ? "模糊" : nextScore < 0.78 ? "基本掌握" : "精通";
+    current.evidence = Array.isArray(current.evidence) ? current.evidence.slice(-8) : [];
+    current.evidence.push({ text: evidence, at: now() });
+    current.updatedAt = now();
+    profile.mastery[topic] = current;
+  });
+  const weakSet = new Set(profile.weakPoints || []);
+  Object.entries(profile.mastery || {}).forEach(([topic, item]) => {
+    if (Number(item.score || 0) < 0.58) weakSet.add(topic);
+    else weakSet.delete(topic);
+  });
+  profile.weakPoints = Array.from(weakSet).slice(0, 12);
+  profile.updatedAt = now();
+  return profile;
+}
+
+function recordLearningActivity(db, userId, activity) {
+  const profile = ensureLearningProfile(db, userId);
+  profile.questionCount = Number(profile.questionCount || 0) + (activity.kind === "question" ? 1 : 0);
+  profile.practiceCount = Number(profile.practiceCount || 0) + (activity.kind === "practice" ? 1 : 0);
+  profile.studyMinutes = Number(profile.studyMinutes || 0) + Number(activity.minutes || 3);
+  profile.recentActivity = Array.isArray(profile.recentActivity) ? profile.recentActivity : [];
+  profile.recentActivity.unshift({ ...activity, at: now() });
+  profile.recentActivity = profile.recentActivity.slice(0, 30);
+  profile.updatedAt = now();
+  return profile;
+}
+
+function addWrongNote(db, userId, note) {
+  db.wrongNotes = Array.isArray(db.wrongNotes) ? db.wrongNotes : [];
+  const wrongNote = {
+    id: uid("wrong"),
+    userId,
+    source: note.source || "智能体反馈",
+    topic: note.topic || "待归类",
+    question: note.question || "",
+    answer: note.answer || "",
+    analysis: note.analysis || "",
+    recommendation: note.recommendation || "",
+    createdAt: now()
+  };
+  db.wrongNotes.unshift(wrongNote);
+  db.wrongNotes = db.wrongNotes.slice(0, 500);
+  return wrongNote;
+}
+
+function formatCitations(citations) {
+  if (!citations.length) return "暂无课程资料引用。";
+  return citations.map((citation) => {
+    const location = citation.page ? `${citation.chapter || "课程片段"}，第 ${citation.page} 页` : (citation.chapter || "知识图谱节点");
+    return `[${citation.id}] ${citation.sourceName || citation.title} · ${location}`;
+  }).join("\n");
+}
+
+function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
+  const hasEvidence = hits.length > 0 && hits[0].score > 0;
+  const topics = inferQuestionTopics([prompt, ...hits.map((hit) => hit.text)].join("\n"), hits[0]?.subject || user.subject || "");
+  const mastery = profileMasterySummary(profile);
+  const levelHint = profile.level === "基础" || mastery.average < 0.58
+    ? "我会先用通俗语言解释，再补充正式定义。"
+    : "你已有一定基础，我会同时给出原理、边界条件和迁移应用。";
+  if (!hasEvidence) {
+    return {
+      content: [
+        "课程资料中没有检索到足够明确的依据，因此我不能把下面内容当作资料结论。",
+        "",
+        `【不确定说明】当前问题是：「${prompt}」。建议先上传教材、课件或讲义，或指定章节/页码后再问。`,
+        "【可作为模型推理的学习建议】先明确相关概念的定义、适用条件、典型例题和易混淆点；如果是题目，请补充题干、已知量和你的解题步骤。"
+      ].join("\n"),
+      confidence: "low",
+      topics
+    };
+  }
+
+  const evidenceLines = hits.slice(0, 3).map((hit, index) => `依据 [S${index + 1}]：${String(hit.text || hit.quote).slice(0, 160)}`);
+  if (mode === "socratic") {
+    return {
+      content: [
+        `${levelHint}`,
+        "【苏格拉底式引导】我先不直接给最终答案，先按三步帮你判断：",
+        `1. 先看资料依据：${evidenceLines[0] || "当前片段不足"}`,
+        `2. 你先回答：这里最关键的概念或条件是什么？`,
+        `3. 如果是题目，请你先写出第一步公式/定义/判断依据，我再根据你的回答继续提示。`,
+        "",
+        "【可能误区】不要只背结论，要说明前提条件、适用范围和与相邻知识点的区别。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "medium",
+      topics
+    };
+  }
+  if (mode === "questions" || mode === "practice") {
+    const topic = topics[0] || prompt;
+    return {
+      content: [
+        `根据课程资料为「${topic}」生成自适应练习：`,
+        "",
+        `1. 基础选择题：${topic} 的核心定义或作用是什么？`,
+        "A. 只记名称即可  B. 说明定义、条件和作用  C. 与相邻概念无关  D. 不需要例题",
+        "答案：B。解析：资料要求同时把定义、条件、作用和相邻关系说清楚。",
+        "",
+        `2. 提高题：结合资料 [S1]，说明「${topic}」在本章知识结构中的作用。`,
+        "答案要点：写出概念定位、前置知识、适用场景和常见误区。",
+        "",
+        `3. 综合题：设计一个能考查「${topic}」的课堂问题，并说明评分标准。`,
+        "参考：看学生是否能引用资料依据、解释过程，并识别易混淆点。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "high",
+      topics
+    };
+  }
+  if (mode === "plan") {
+    const weak = mastery.weak.map((item) => item.topic).concat(profile.weakPoints || []).filter(Boolean);
+    return {
+      content: [
+        "【个性化学习路径】",
+        `当前画像：${profile.level || "基础"}；薄弱点：${weak.slice(0, 5).join("、") || "暂未形成明确薄弱点"}。`,
+        "1. 先复习资料中最直接相关的定义和例题。",
+        `2. 按顺序学习：${topics.slice(0, 5).join(" → ") || "概念 → 例题 → 练习 → 错题复盘"}。`,
+        "3. 每个知识点完成 2 道基础题和 1 道迁移题。",
+        "4. 做错后把错因归类到“概念不清、条件漏看、步骤错误、计算错误”。",
+        "5. 复习 24 小时后再做一次同类题，更新掌握度。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "high",
+      topics
+    };
+  }
+  if (mode === "teacher-plan") {
+    const topic = topics[0] || prompt;
+    return {
+      content: [
+        `【45 分钟教学设计：${topic}】`,
+        `教学目标：学生能依据课程资料解释「${topic}」的概念、条件和应用。`,
+        "重难点：概念边界、典型题型、易混淆点和迁移应用。",
+        "教学流程：5 分钟前测；12 分钟概念讲解；12 分钟例题拆解；10 分钟分层练习；4 分钟错因归纳；2 分钟布置复习任务。",
+        "课堂提问：这个概念的前置知识是什么？如果条件变化，结论是否仍成立？",
+        "课后作业：1 道基础题、1 道迁移题、1 个错因反思。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "high",
+      topics
+    };
+  }
+  return {
+    content: [
+      `${levelHint}`,
+      "【课程资料依据】",
+      ...evidenceLines,
+      "",
+      "【回答】",
+      `围绕「${prompt}」，课程资料支持的核心结论是：${String(hits[0].text || hits[0].quote).slice(0, 180)}。`,
+      hits[1] ? `进一步看，${String(hits[1].text || hits[1].quote).slice(0, 150)}。` : "",
+      "",
+      "【模型推理/补充】",
+      "基于以上资料，可以按“定义/条件/步骤/例题/易错点”五个角度复习。若这是解题问题，请先列出题干条件，再把相关公式或规则与条件逐一对应。",
+      "",
+      `【引用来源】\n${formatCitations(citations)}`
+    ].filter(Boolean).join("\n"),
+    confidence: hasEvidence ? "high" : "low",
+    topics
+  };
+}
+
+function buildEducationalAgentAnswer(db, user, body) {
+  const prompt = String(body.prompt || "").trim();
+  const mode = String(body.mode || "rag");
+  const subject = normalizeSubject(body.subject || user.subject || "");
+  const profile = ensureLearningProfile(db, user.id);
+  if (isAcademicMisuse(prompt)) {
+    return {
+      content: "我不能直接代写作业、论文、实验报告或考试答案。可以改为帮你梳理结构、解释知识点、检查你的草稿、给出修改建议，或按提示模式一步步引导你完成。",
+      citations: [],
+      confidence: "safety",
+      topics: inferQuestionTopics(prompt, subject),
+      intent: "academic-integrity"
+    };
+  }
+  const hits = searchCourseKnowledge(db, user.id, prompt, { subject, limit: RAG_MAX_CONTEXT_CHUNKS });
+  const citations = citationsFromHits(hits);
+  const agent = answerFromEvidence({ user, mode, prompt, hits, citations, profile });
+  const evidenceDelta = agent.confidence === "high" ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
+  updateTopicMastery(db, user.id, agent.topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  recordLearningActivity(db, user.id, {
+    kind: mode === "questions" || mode === "practice" ? "practice" : "question",
+    mode,
+    prompt: prompt.slice(0, 120),
+    topics: agent.topics,
+    confidence: agent.confidence,
+    minutes: mode === "plan" ? 6 : 3
+  });
+  if (agent.confidence === "low" && agent.topics[0]) {
+    addWrongNote(db, user.id, {
+      source: "不确定问答",
+      topic: agent.topics[0],
+      question: prompt,
+      analysis: "课程资料中缺少明确依据，建议补充资料或回看前置概念。",
+      recommendation: "上传对应章节资料后重新提问。"
+    });
+  }
+  return {
+    ...agent,
+    citations,
+    intent: mode,
+    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score }))
+  };
+}
+
+function learningAnalytics(db, userId) {
+  const profile = ensureLearningProfile(db, userId);
+  const summary = profileMasterySummary(profile);
+  const wrongNotes = (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 10);
+  return {
+    profile,
+    summary,
+    wrongNotes,
+    recommendations: [
+      summary.weak[0] ? `优先复习「${summary.weak[0].topic}」，先看定义和前置知识。` : "继续保持稳定练习，系统会根据提问和作业自动识别薄弱点。",
+      wrongNotes[0] ? `最近错题集中在「${wrongNotes[0].topic}」，建议生成 3 道同类题。` : "完成一次阶段测验后可得到更准确的错题分布。",
+      "每次回答都优先查看引用来源，区分资料依据和模型推理。"
+    ]
+  };
+}
+
+function gradeSubmissionWithFeedback(db, homework, submission) {
+  const score = scoreMatch(homework.answer, submission.answerText);
+  const referenceTokens = tokenizeForSearch(homework.answer);
+  const answerTokens = new Set(tokenizeForSearch(submission.answerText));
+  const missing = referenceTokens.filter((token) => !answerTokens.has(token)).slice(0, 8);
+  const topics = inferQuestionTopics(`${homework.title} ${homework.description} ${homework.answer}`, "");
+  const strengths = score >= 75 ? "答案覆盖了主要要点，结构基本完整。" : "答案已经给出部分相关内容，但关键条件或步骤还不完整。";
+  const weakness = missing.length ? `缺少或表达不清：${missing.join("、")}。` : "主要关键词已覆盖，建议补充更完整的推理过程。";
+  const comment = [
+    `AI 评分建议：${score} 分。`,
+    strengths,
+    weakness,
+    "建议教师复核图片/视频附件中的关键步骤，最终分数以教师确认为准。"
+  ].join(" ");
+  return { score, comment, missing, topics };
+}
+
 function findOrCreateDirectThread(db, userA, userB) {
   let thread = db.chatThreads.find((item) => item.type === "direct" && item.memberIds.includes(userA) && item.memberIds.includes(userB));
   if (!thread) {
@@ -1863,7 +2410,12 @@ function getRelevantState(db, userId) {
     })),
     classes: db.classes.filter((item) => item.teacherId === userId || item.studentIds.includes(userId)),
     homework: db.homework.filter((item) => item.teacherId === userId || classIds.includes(item.classId)),
-    submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId))
+    submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
+    courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
+    learningProfile: ensureLearningProfile(db, userId),
+    wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
+    learningAnalytics: learningAnalytics(db, userId),
+    agentRuns: (db.agentRuns || []).filter((item) => item.userId === userId).slice(0, 30)
   };
 }
 
@@ -2124,6 +2676,52 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 200, { ok: true });
   }
 
+  if (method === "GET" && pathname === "/api/materials") {
+    const userId = searchParams.get("userId");
+    ensureUser(db, userId);
+    const subject = searchParams.get("subject");
+    let materials = visibleCourseMaterials(db, userId);
+    if (subject) materials = materials.filter((item) => item.subject === normalizeSubject(subject));
+    return send(res, 200, { ok: true, materials: materials.map(publicCourseMaterial) });
+  }
+
+  if (method === "POST" && pathname === "/api/materials") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "subject"]);
+    const user = ensureUser(db, body.userId);
+    let uploaded = { text: "", meta: null };
+    if (body.file?.dataUrl) {
+      uploaded = extractUploadedBookText(body.file);
+    }
+    const sourceText = [uploaded.text, body.sourceText].filter(Boolean).join("\n\n");
+    if (!sourceText.trim()) return sendError(res, 400, "没有识别到可入库的课程资料文本，请上传 TXT/PDF 或粘贴内容");
+    const material = createCourseMaterial({
+      ownerId: user.id,
+      subject: body.subject,
+      title: body.title || body.file?.name || "课程资料",
+      sourceName: body.sourceName || body.file?.name || "手动录入",
+      type: body.file?.type || "text/plain",
+      text: sourceText,
+      global: user.role === "teacher" ? Boolean(body.global) : false,
+      classId: body.classId
+    });
+    material.extraction = uploaded.meta ? { ...uploaded.meta, agent: "course-rag-material-agent" } : null;
+    db.courseMaterials.unshift(material);
+    writeDb(db);
+    return send(res, 201, { ok: true, material: publicCourseMaterial(material) });
+  }
+
+  params = routePattern(pathname, "/api/materials/:id");
+  if (method === "DELETE" && params) {
+    const userId = searchParams.get("userId");
+    const index = db.courseMaterials.findIndex((item) => item.id === params.id);
+    if (index < 0) return notFound(res);
+    if (db.courseMaterials[index].ownerId !== userId) return sendError(res, 403, "只能删除自己上传的课程资料");
+    db.courseMaterials.splice(index, 1);
+    writeDb(db);
+    return send(res, 200, { ok: true });
+  }
+
   if (method === "GET" && pathname === "/api/conversations") {
     const userId = searchParams.get("userId");
     ensureUser(db, userId);
@@ -2168,16 +2766,43 @@ async function handleApi(req, res, pathname, searchParams) {
       db.conversations.unshift(conv);
     }
     const userMessage = { id: uid("msg"), role: "user", content: String(body.prompt), createdAt: now() };
+    const agentAnswer = buildEducationalAgentAnswer(db, user, body);
     const assistantMessage = {
       id: uid("msg"),
       role: "assistant",
-      content: aiAnswer({ role: user.role, mode: body.mode || conv.mode, prompt: body.prompt }),
+      content: agentAnswer.content,
+      citations: agentAnswer.citations,
+      confidence: agentAnswer.confidence,
+      intent: agentAnswer.intent,
+      retrieved: agentAnswer.retrieved,
       createdAt: now()
     };
     conv.mode = body.mode || conv.mode;
     conv.messages.push(userMessage, assistantMessage);
     conv.updatedAt = now();
     if (conv.title === "新的对话") conv.title = String(body.prompt).slice(0, 24);
+    db.agentRuns = Array.isArray(db.agentRuns) ? db.agentRuns : [];
+    db.agentRuns.unshift({
+      id: uid("run"),
+      userId: user.id,
+      conversationId: conv.id,
+      mode: conv.mode,
+      prompt: String(body.prompt).slice(0, 240),
+      confidence: agentAnswer.confidence,
+      citations: agentAnswer.citations,
+      retrieved: agentAnswer.retrieved,
+      steps: [
+        "意图识别",
+        "学习画像读取",
+        "课程资料 RAG 检索",
+        "知识图谱关联",
+        "生成回答",
+        "可靠性与引用标注",
+        "学习记录更新"
+      ],
+      createdAt: now()
+    });
+    db.agentRuns = db.agentRuns.slice(0, 200);
     writeDb(db);
     return send(res, 200, { ok: true, conversation: conv, messages: [userMessage, assistantMessage] });
   }
@@ -2481,13 +3106,41 @@ async function handleApi(req, res, pathname, searchParams) {
     if (!submission) return notFound(res);
     const homework = db.homework.find((item) => item.id === submission.homeworkId);
     if (!homework || homework.teacherId !== body.teacherId) return sendError(res, 403, "无批改权限");
-    const score = scoreMatch(homework.answer, submission.answerText);
-    submission.score = score;
+    const feedback = gradeSubmissionWithFeedback(db, homework, submission);
+    submission.score = feedback.score;
     submission.status = "graded";
     submission.gradeType = "ai";
-    submission.comment = `AI 按参考答案匹配度给出 ${score} 分。已结合文字答案，图片/视频内容请在手动复核时确认关键步骤。`;
+    submission.comment = feedback.comment;
+    submission.feedback = {
+      missing: feedback.missing,
+      topics: feedback.topics,
+      teacherReviewRequired: true,
+      reliability: "AI 给出评分建议，最终结果建议由教师确认"
+    };
     submission.gradedAt = now();
     submission.updatedAt = now();
+    const delta = feedback.score >= 80 ? 0.08 : feedback.score >= 60 ? 0.02 : -0.08;
+    updateTopicMastery(db, submission.studentId, feedback.topics, delta, `作业批改：${homework.title} ${feedback.score} 分`);
+    const profile = ensureLearningProfile(db, submission.studentId);
+    profile.gradedCount = Number(profile.gradedCount || 0) + 1;
+    recordLearningActivity(db, submission.studentId, {
+      kind: "graded",
+      mode: "homework",
+      prompt: homework.title,
+      topics: feedback.topics,
+      score: feedback.score,
+      minutes: 5
+    });
+    if (feedback.score < 75 && feedback.topics[0]) {
+      addWrongNote(db, submission.studentId, {
+        source: `作业：${homework.title}`,
+        topic: feedback.topics[0],
+        question: homework.description,
+        answer: submission.answerText,
+        analysis: feedback.comment,
+        recommendation: "先补齐缺失要点，再生成 2 道同类题练习。"
+      });
+    }
     writeDb(db);
     return send(res, 200, { ok: true, submission });
   }
@@ -2505,6 +3158,8 @@ async function handleApi(req, res, pathname, searchParams) {
     submission.comment = String(body.comment || "");
     submission.gradedAt = now();
     submission.updatedAt = now();
+    const topics = inferQuestionTopics(`${homework.title} ${homework.description}`, "");
+    updateTopicMastery(db, submission.studentId, topics, Number(body.score) >= 80 ? 0.06 : Number(body.score) >= 60 ? 0.01 : -0.06, `教师手动批改：${homework.title}`);
     writeDb(db);
     return send(res, 200, { ok: true, submission });
   }
