@@ -168,7 +168,7 @@ const MODEL_LABS = {
       { type: "ml-naive-bayes", icon: "NB", label: "朴素贝叶斯", subject: "机器学习", kind: "algorithm", defaults: { model: "GaussianNB", assumption: "条件独立" } },
       { type: "ml-gmm", icon: "GMM", label: "高斯混合", subject: "机器学习", kind: "algorithm", defaults: { components: "3", optimizer: "EM" } },
       { type: "ml-mlp", icon: "MLP", label: "多层感知机", subject: "机器学习", kind: "algorithm", defaults: { layers: "64-32", activation: "ReLU" } },
-      { type: "ml-cnn", icon: "CNN", label: "卷积网络", subject: "机器学习", kind: "algorithm", defaults: { layers: "Conv-ReLU-Pool", task: "图像分类" } }
+      { type: "ml-cnn", icon: "空白", label: "空白画布", subject: "机器学习", kind: "algorithm", defaults: {} }
     ]
   },
   通用: {
@@ -384,9 +384,9 @@ model.fit(X_train, y_train)
 print("accuracy:", round(model.score(X_test, y_test), 3))`
   },
   "ml-cnn": {
-    title: "卷积神经网络 CNN",
-    chapter: "深度学习 · 自定义卷积网络",
-    result: "运行结果：请先输入自定义 CNN 或其他深度学习算法代码，再点击运行测试。",
+    title: "空白画布",
+    chapter: "自定义机器学习算法",
+    result: "运行结果：请先输入自定义算法代码，再点击运行测试。",
     code: ""
   }
 };
@@ -849,7 +849,7 @@ function renderGraphProgress() {
     status: "idle",
     stage: "等待开始",
     progress: 0,
-    message: "选择 PDF/TXT/EPUB 并点击生成后，这里会显示上传、解析、抽取、生成和保存进度。"
+    message: ""
   };
   const statusText = {
     idle: "未开始",
@@ -878,7 +878,7 @@ function renderGraphProgress() {
         <strong>${escapeHtml(job.stage || "等待开始")}</strong>
         <span>${clamp(Number(job.progress || 0), 0, 100)}%</span>
       </div>
-      <p>${escapeHtml(job.error || job.message || "")}</p>
+      ${job.error || job.message ? `<p>${escapeHtml(job.error || job.message || "")}</p>` : ""}
       ${extraction ? `<small>解析工具：${escapeHtml(extraction.method || extraction.extractor || "PDF/OCR 解析智能体")}；识别字符：${extraction.characters || 0}；文件大小：${formatBytes(extraction.size || extraction.fileSize || 0)}${ocrInfo}</small>` : ""}
     </section>
   `;
@@ -892,15 +892,14 @@ function renderTeacherGraphPage() {
     <div class="page-head">
       <div>
         <h2>📘 导入书本 / 知识图谱</h2>
-        <p>导入书本生成知识图谱，也可以直接导入图谱 JSON；图谱存储在当前账号下，可导出、删除或上传到总图谱。</p>
       </div>
       <div class="stat-strip">
         <span>${graphs.length}<small>账号可见图谱</small></span>
         <span>${graphs.filter((item) => item.global).length}<small>总图谱</small></span>
       </div>
     </div>
-    <div class="grid two">
-      <section class="panel">
+    <div class="grid two graph-form-grid">
+      <section class="panel graph-form-card">
         <h3>生成图谱</h3>
         <form id="generateGraphForm" class="stack">
           <div class="form-grid">
@@ -916,7 +915,6 @@ function renderTeacherGraphPage() {
             </select>
           </label>
           <label>上传书本（PDF/TXT/EPUB）<input name="book" type="file" accept=".pdf,.txt,.epub,.md" /></label>
-          <p class="hint">大 PDF 会自动分块上传；AI 自动图谱智能体不设固定总上传大小，优先读取文本层，扫描版会做有限 OCR 并融合目录/文件名/补充知识点防止崩溃。</p>
           <div class="actions">
             <button class="primary" type="submit">🚀 生成图谱</button>
             <button class="ghost" type="button" id="sampleGraphBtn">生成示例</button>
@@ -924,7 +922,7 @@ function renderTeacherGraphPage() {
         </form>
         <div id="graphProgressMount">${renderGraphProgress()}</div>
       </section>
-      <section class="panel import-graph-panel">
+      <section class="panel import-graph-panel graph-form-card">
         <h3>直接导入图谱</h3>
         <form id="importGraphForm" class="stack import-graph-form">
           <div class="form-grid">
@@ -932,7 +930,6 @@ function renderTeacherGraphPage() {
             <label>图谱名称<input name="title" placeholder="导入图谱名称" /></label>
           </div>
           <label>图谱 JSON 文件<input name="graph" type="file" accept=".json" required /></label>
-          <p class="hint">JSON 需要包含 nodes 与 links，例如：{"nodes":[{"id":"n1","label":"力学"}],"links":[]}。</p>
         </form>
         <label class="supplement-field">补充目录或知识点
           <textarea name="sourceText" form="generateGraphForm" rows="6" placeholder="可粘贴目录、章节标题、重点知识点，系统会据此生成节点和关系">${escapeHtml(draft.sourceText || "")}</textarea>
@@ -943,7 +940,7 @@ function renderTeacherGraphPage() {
     <section class="panel">
       <div class="split-head">
         <h3>最近生成的知识图谱</h3>
-        <span>${graphs.length ? "滚轮/按钮缩放，拖拽空白区域移动整个图谱，双击节点查看知识点" : "暂无图谱"}</span>
+        <span>${graphs.length ? `${graphs.length} 个图谱` : "暂无图谱"}</span>
       </div>
       <div class="graph-workspace">
         <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock("还没有图谱，请先生成或导入。")}</div>
@@ -2899,8 +2896,7 @@ function openModelCode(type, componentId = null) {
   state.modelCodeType = type;
   state.modelCodeComponentId = componentId;
   state.modelCodeDraft = hasSavedCode ? component.props.code : algorithm?.code || "";
-  state.modelRunResult = component?.props?.runResult || "";
-  state.modelCodeRan = Boolean(component?.props?.runResult);
+  state.modelCodeRan = false;
 }
 
 function persistOpenModelCodeDraft() {
@@ -3306,7 +3302,6 @@ function bindModelPage() {
       state.modelMode = model.subject === "机器学习" ? "algorithm" : model.mode;
       state.modelComponents = normalizeLoadedModelComponents(model);
       state.selectedComponentId = state.modelComponents[0]?.id || null;
-      state.modelRunResult = state.modelComponents[0]?.props?.runResult || "";
       resetModelCodeState();
       if (model.subject === "机器学习") {
         const codeComponent = state.modelComponents.find((component) => componentSupportsCode(component));
