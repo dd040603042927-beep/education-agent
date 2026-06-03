@@ -29,6 +29,7 @@ const state = {
     sourceText: "",
     extractor: DEFAULT_GRAPH_EXTRACTOR
   },
+  conversationContextMenu: null,
   graphUploadAbort: null,
   graphGenerationCanceled: false,
   searchResults: []
@@ -54,7 +55,6 @@ const EDUCATION_RELATION_LABELS = {
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
   { key: "ai", icon: "🎓", label: "教学指导（对话）" },
-  { key: "history", icon: "💬", label: "历史对话" },
   { key: "materials", icon: "📚", label: "课程资料" },
   { key: "models", icon: "🧠", label: "模型显示" },
   { key: "chat", icon: "☁️", label: "聊天信息" },
@@ -66,7 +66,6 @@ const teacherMenus = [
 const studentMenus = [
   { key: "graph", icon: "📗", label: "知识图谱" },
   { key: "ai", icon: "☁️", label: "发起对话" },
-  { key: "history", icon: "📜", label: "历史对话" },
   { key: "materials", icon: "📚", label: "课程资料" },
   { key: "models", icon: "🧠", label: "模型显示" },
   { key: "chat", icon: "☁️", label: "聊天信息" },
@@ -207,6 +206,34 @@ function subjectOptions(selected) {
   return subjects.map((subject) => `<option value="${subject}" ${subject === selected ? "selected" : ""}>${subject}</option>`).join("");
 }
 
+function renderSidebarConversations() {
+  const conversations = (state.data?.conversations || []).slice(0, 80);
+  return `
+    <div class="nav-conversation-wrap">
+      <div class="nav-subtitle">历史对话</div>
+      <div class="nav-conversation-list">
+        ${conversations.map((conv) => `
+          <button class="${state.activeConversationId === conv.id ? "active" : ""}" data-sidebar-conversation="${conv.id}" title="双击打开，右键删除">
+            <strong>${escapeHtml(conv.title || "新的对话")}</strong>
+            <span>${fmtTime(conv.updatedAt)} · ${escapeHtml(conv.mode || "rag")}</span>
+          </button>
+        `).join("") || `<p class="nav-empty">暂无历史对话</p>`}
+      </div>
+    </div>
+  `;
+}
+
+function renderConversationContextMenu() {
+  if (!state.conversationContextMenu) return "";
+  const conv = (state.data?.conversations || []).find((item) => item.id === state.conversationContextMenu.id);
+  if (!conv) return "";
+  return `
+    <div class="context-menu conversation-context-menu" style="left:${state.conversationContextMenu.x}px; top:${state.conversationContextMenu.y}px">
+      <button data-context-delete-conversation="${conv.id}">删除</button>
+    </div>
+  `;
+}
+
 function renderAuth() {
   app.innerHTML = `
     <main class="auth-shell">
@@ -304,6 +331,7 @@ function renderAuth() {
 function renderShell() {
   const menus = state.user.role === "teacher" ? teacherMenus : studentMenus;
   const classes = state.data?.classes || [];
+  if (state.page === "history") state.page = "ai";
   app.innerHTML = `
     <div class="layout">
       <aside class="sidebar">
@@ -318,6 +346,7 @@ function renderShell() {
             <button class="nav-item ${state.page === item.key ? "active" : ""}" data-page="${item.key}">
               <span>${item.icon}</span>${item.label}
             </button>
+            ${item.key === "ai" ? renderSidebarConversations() : ""}
           `).join("")}
         </nav>
         <div class="profile-mini">
@@ -343,6 +372,7 @@ function renderShell() {
         <button title="刷新数据" id="refreshBtn">↻</button>
         <button title="回到知识图谱" data-page="graph">✦</button>
       </div>
+      ${renderConversationContextMenu()}
     </div>
   `;
   document.querySelectorAll("[data-page]").forEach((button) => {
@@ -353,6 +383,42 @@ function renderShell() {
       renderShell();
     });
   });
+  document.querySelectorAll("[data-sidebar-conversation]").forEach((button) => {
+    button.addEventListener("dblclick", async () => {
+      state.activeConversationId = button.dataset.sidebarConversation;
+      state.page = "ai";
+      state.conversationContextMenu = null;
+      await loadState();
+      renderShell();
+    });
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      state.conversationContextMenu = {
+        id: button.dataset.sidebarConversation,
+        x: Math.min(event.clientX, window.innerWidth - 130),
+        y: Math.min(event.clientY, window.innerHeight - 60)
+      };
+      renderShell();
+    });
+  });
+  document.querySelector("[data-context-delete-conversation]")?.addEventListener("click", async (event) => {
+    const conversationId = event.currentTarget.dataset.contextDeleteConversation;
+    try {
+      await api(`/api/conversations/${conversationId}?userId=${state.user.id}`, { method: "DELETE" });
+      if (state.activeConversationId === conversationId) state.activeConversationId = null;
+      state.conversationContextMenu = null;
+      await loadState();
+      renderShell();
+      showToast("历史对话已删除");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.conversationContextMenu || event.target.closest(".conversation-context-menu")) return;
+    state.conversationContextMenu = null;
+    renderShell();
+  }, { once: true });
   document.getElementById("logoutBtn").addEventListener("click", () => {
     localStorage.removeItem("edu-user");
     Object.assign(state, {
@@ -374,10 +440,11 @@ function renderShell() {
 
 function renderContent() {
   const content = document.getElementById("content");
+  if (state.page === "history") state.page = "ai";
+  content.className = state.page === "ai" ? "content ai-content" : "content";
   const pageMap = {
     graph: renderGraphPage,
     ai: renderAiPage,
-    history: renderHistoryPage,
     materials: renderMaterialsPage,
     models: renderModelPage,
     chat: renderChatPage,
@@ -394,7 +461,6 @@ function bindCurrentPage() {
   const binders = {
     graph: bindGraphPage,
     ai: bindAiPage,
-    history: bindHistoryPage,
     materials: bindMaterialsPage,
     models: bindModelPage,
     chat: bindChatPage,
@@ -2334,6 +2400,25 @@ function renderAgentTracePanel(active) {
   `;
 }
 
+function aiModePlaceholder(isTeacher) {
+  const teacher = {
+    rag: "例如：根据第 4 章存储管理生成课堂教学设计",
+    socratic: "例如：用追问方式引导学生理解 Cache 映射方式",
+    questions: "例如：根据 Cache 映射方式生成 5 道选择题并附解析",
+    "teacher-plan": "例如：根据第 3 章生成 45 分钟教学设计",
+    plan: "例如：根据班级薄弱点安排一周复习路径"
+  };
+  const student = {
+    rag: "例如：死锁是什么？请引用资料回答",
+    socratic: "例如：请用提示模式引导我理解死锁必要条件",
+    practice: "例如：根据我的薄弱点生成 5 道练习",
+    questions: "例如：根据 Cache 映射方式出题并解析",
+    plan: "例如：帮我安排 7 天复习路径"
+  };
+  const map = isTeacher ? teacher : student;
+  return map[state.aiMode] || map.rag;
+}
+
 function renderAiPage() {
   const isTeacher = state.user.role === "teacher";
   const conversations = state.data.conversations || [];
@@ -2354,39 +2439,25 @@ function renderAiPage() {
       { key: "questions", label: "出题解析" },
       { key: "plan", label: "学习路径" }
     ];
-  const quickPrompts = isTeacher
-    ? ["根据第 3 章生成 45 分钟教学设计", "汇总学生常见薄弱点并给出课堂练习", "根据 Cache 映射方式生成 5 道选择题并附解析"]
-    : ["这章讲了什么？请引用资料", "用提示模式引导我理解这个概念", "根据我的薄弱点安排 7 天复习计划"];
   return `
-    <div class="page-head">
-      <div>
-        <h2>${isTeacher ? "✨ 教师智能体工作台" : "☁️ 学习智能体工作台"}</h2>
-        <p>${isTeacher ? "支持课程资料 RAG、引用追溯、教案生成、课堂练习和班级薄弱点分析。" : "基于课程资料回答问题，区分资料依据和模型推理，并持续更新个人学习画像。"} </p>
-      </div>
-      <button id="newConversationBtn" class="primary">新建对话</button>
-    </div>
-    <div class="chat-layout wide ai-workbench">
-      <aside class="conversation-list">
-        ${conversations.map((conv) => `
-          <button class="${active?.id === conv.id ? "active" : ""}" data-conversation="${conv.id}">
-            <strong>${escapeHtml(conv.title || "新的对话")}</strong>
-            <span>${fmtTime(conv.updatedAt)} · ${escapeHtml(conv.mode || "rag")}</span>
-          </button>
-        `).join("") || emptyBlock("暂无历史对话")}
-      </aside>
-      <section class="panel chat-panel">
-        <div class="segmented">
-          ${modeItems.map((item) => `<button class="${state.aiMode === item.key ? "active" : ""}" data-ai-mode="${item.key}">${item.label}</button>`).join("")}
+    <div class="chat-layout ai-workbench">
+      <section class="panel chat-panel ai-chat-panel">
+        <div class="ai-chat-toolbar">
+          <div class="segmented">
+            ${modeItems.map((item) => `<button class="${state.aiMode === item.key ? "active" : ""}" data-ai-mode="${item.key}">${item.label}</button>`).join("")}
+          </div>
+          <button id="newConversationBtn" class="primary">新建对话</button>
         </div>
-        <div class="quick-prompts">
-          ${quickPrompts.map((prompt) => `<button class="mini" data-quick-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}</button>`).join("")}
+        <div class="ai-active-title">
+          <strong>${escapeHtml(active?.title || "新的对话")}</strong>
+          <span>${escapeHtml(modeItems.find((item) => item.key === state.aiMode)?.label || "资料问答")} · ${active ? fmtTime(active.updatedAt) : "尚未开始"}</span>
         </div>
         <div class="message-stream" id="aiMessages">
           ${(active?.messages || []).map(renderAiMessage).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "先上传课程资料，再输入教学目标或课堂问题，我会基于资料生成可追溯建议。" : "先上传或选择课程资料，再问我概念、章节总结或题目思路，我会给出引用来源。"}</p></div>`}
         </div>
         <form id="aiForm" class="composer rich-composer">
           <input name="subject" placeholder="学科/课程，例如：操作系统" value="${escapeHtml(state.user.subject || "")}" />
-          <input name="prompt" placeholder="${isTeacher ? "例如：根据第 4 章存储管理生成课堂教学设计" : "例如：死锁是什么？请先提示我"}" />
+          <input name="prompt" placeholder="${escapeHtml(aiModePlaceholder(isTeacher))}" />
           <button class="primary" type="submit">发送</button>
         </form>
       </section>
@@ -2400,12 +2471,7 @@ function bindAiPage() {
     button.addEventListener("click", () => {
       state.aiMode = button.dataset.aiMode;
       renderContent();
-    });
-  });
-  document.querySelectorAll("[data-conversation]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.activeConversationId = button.dataset.conversation;
-      renderContent();
+      setTimeout(() => document.querySelector("#aiForm input[name='prompt']")?.focus(), 0);
     });
   });
   document.getElementById("newConversationBtn")?.addEventListener("click", async () => {
@@ -2420,14 +2486,6 @@ function bindAiPage() {
     } catch (error) {
       showToast(error.message, "error");
     }
-  });
-  document.querySelectorAll("[data-quick-prompt]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const form = document.getElementById("aiForm");
-      if (!form) return;
-      form.elements.prompt.value = button.dataset.quickPrompt;
-      form.elements.prompt.focus();
-    });
   });
   const stream = document.getElementById("aiMessages");
   if (stream) stream.scrollTop = stream.scrollHeight;
@@ -2450,73 +2508,6 @@ function bindAiPage() {
       state.activeConversationId = payload.conversation.id;
       await loadState();
       renderShell();
-    } catch (error) {
-      showToast(error.message, "error");
-    }
-  });
-}
-
-function renderHistoryPage() {
-  const conversations = state.data.conversations || [];
-  const active = conversations.find((conv) => conv.id === state.activeConversationId) || conversations[0];
-  return `
-    <div class="page-head">
-      <div>
-        <h2>💬 历史对话</h2>
-        <p>所有教学指导和学习对话都会按账号保存，新建对话后也可以在这里回看和继续。</p>
-      </div>
-    </div>
-    <div class="chat-layout">
-      <aside class="conversation-list">
-        ${conversations.map((conv) => `
-          <button class="${active?.id === conv.id ? "active" : ""}" data-history-conversation="${conv.id}">
-            <strong>${escapeHtml(conv.title || "新的对话")}</strong>
-            <span>${fmtTime(conv.updatedAt)} · ${escapeHtml(conv.mode)}</span>
-          </button>
-        `).join("") || emptyBlock("暂无历史对话")}
-      </aside>
-      <section class="panel chat-panel">
-        ${active ? `
-          <div class="split-head">
-            <h3>${escapeHtml(active.title || "新的对话")}</h3>
-            <div class="actions">
-              <button class="primary" id="continueConversationBtn">继续对话</button>
-              <button class="danger" id="deleteConversationBtn">删除</button>
-            </div>
-          </div>
-          <div class="message-stream">
-            ${active.messages.map((message) => `
-              <div class="bubble ${message.role}">
-                <span>${message.role === "assistant" ? "AI" : "我"}</span>
-                <p>${escapeHtml(message.content)}</p>
-              </div>
-            `).join("")}
-          </div>
-        ` : emptyBlock("选择一条历史对话查看详情。")}
-      </section>
-    </div>
-  `;
-}
-
-function bindHistoryPage() {
-  document.querySelectorAll("[data-history-conversation]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.activeConversationId = button.dataset.historyConversation;
-      renderContent();
-    });
-  });
-  document.getElementById("continueConversationBtn")?.addEventListener("click", () => {
-    state.page = "ai";
-    renderShell();
-  });
-  document.getElementById("deleteConversationBtn")?.addEventListener("click", async () => {
-    if (!state.activeConversationId || !confirm("确认删除这条对话？")) return;
-    try {
-      await api(`/api/conversations/${state.activeConversationId}?userId=${state.user.id}`, { method: "DELETE" });
-      state.activeConversationId = null;
-      await loadState();
-      renderShell();
-      showToast("历史对话已删除");
     } catch (error) {
       showToast(error.message, "error");
     }
