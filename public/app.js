@@ -15,6 +15,8 @@ const state = {
   modelComponents: [],
   selectedComponentId: null,
   loadedModelId: null,
+  modelCodeType: null,
+  modelCodeRan: false,
   activeThreadId: null,
   selectedMessages: new Set(),
   selectedClassId: null,
@@ -35,7 +37,7 @@ const state = {
   searchResults: []
 };
 
-const subjects = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"];
+const subjects = ["数学", "物理", "化学", "生物", "机器学习", "语文", "英语", "历史", "地理", "政治", "通用"];
 const GRAPH_WIDTH = 1340;
 const GRAPH_HEIGHT = 1180;
 const GRAPH_LAYOUT_VERSION = "graph-layout-v11-outline-materials";
@@ -73,18 +75,359 @@ const studentMenus = [
   { key: "profile", icon: "ℹ️", label: "个人信息" }
 ];
 
-const componentPalette = [
-  { type: "cart", icon: "▣", label: "小车", subject: "物理", defaults: { mass: "2kg", velocity: "0m/s" } },
-  { type: "slope", icon: "╱", label: "斜面", subject: "物理", defaults: { angle: "30°", friction: "0.2" } },
-  { type: "spring", icon: "⌁", label: "弹簧", subject: "物理", defaults: { k: "20N/m" } },
-  { type: "pulley", icon: "○", label: "滑轮", subject: "物理", defaults: { radius: "0.2m" } },
-  { type: "battery", icon: "▥", label: "电源", subject: "物理", defaults: { voltage: "6V" } },
-  { type: "resistor", icon: "▱", label: "电阻", subject: "物理", defaults: { resistance: "10Ω" } },
-  { type: "lens", icon: "◐", label: "透镜", subject: "物理", defaults: { focal: "10cm" } },
-  { type: "axis", icon: "＋", label: "坐标系", subject: "通用", defaults: { scale: "1:1" } },
-  { type: "point", icon: "●", label: "质点", subject: "物理", defaults: { position: "(0,0)" } },
-  { type: "formula", icon: "ƒ", label: "公式块", subject: "通用", defaults: { formula: "F=ma" } }
-];
+const MODEL_LABS = {
+  物理: {
+    title: "物理实验室",
+    summary: "力学、电学、光学和运动学组件可组合成真实或理想状态模型。",
+    hint: "拖入小车、斜面、弹簧、电路或透镜后，可编辑质量、速度、电压、焦距等参数。",
+    showAxes: true,
+    components: [
+      { type: "cart", icon: "▣", label: "小车", subject: "物理", defaults: { mass: "2kg", velocity: "0m/s", acceleration: "0m/s²" } },
+      { type: "slope", icon: "╱", label: "斜面", subject: "物理", defaults: { angle: "30°", friction: "0.20", length: "2m" } },
+      { type: "spring", icon: "⌁", label: "弹簧", subject: "物理", defaults: { k: "20N/m", elongation: "0.10m" } },
+      { type: "pulley", icon: "○", label: "滑轮", subject: "物理", defaults: { radius: "0.20m", tension: "待测" } },
+      { type: "battery", icon: "▥", label: "电源", subject: "物理", defaults: { voltage: "6V", internalResistance: "0Ω" } },
+      { type: "resistor", icon: "▱", label: "电阻", subject: "物理", defaults: { resistance: "10Ω", current: "0.6A" } },
+      { type: "lens", icon: "◐", label: "透镜", subject: "物理", defaults: { focal: "10cm", objectDistance: "30cm" } },
+      { type: "force", icon: "→", label: "力矢量", subject: "物理", defaults: { magnitude: "10N", direction: "0°" } },
+      { type: "point", icon: "●", label: "质点", subject: "物理", defaults: { position: "(0,0)", velocity: "v" } },
+      { type: "formula", icon: "ƒ", label: "公式块", subject: "通用", defaults: { formula: "F=ma", condition: "理想状态" } }
+    ]
+  },
+  化学: {
+    title: "化学实验室",
+    summary: "围绕反应装置、溶液、分子结构和实验现象搭建化学模型。",
+    hint: "拖入烧杯、滴定管、反应箭头或分子模型，记录浓度、温度、pH、催化剂和现象。",
+    showAxes: false,
+    components: [
+      { type: "beaker", icon: "杯", label: "烧杯", subject: "化学", defaults: { solution: "NaCl(aq)", volume: "100mL", concentration: "0.1mol/L" } },
+      { type: "test-tube", icon: "管", label: "试管", subject: "化学", defaults: { reagent: "待加入", observation: "无明显现象" } },
+      { type: "burette", icon: "滴", label: "滴定管", subject: "化学", defaults: { titrant: "NaOH", concentration: "0.1000mol/L", endpoint: "酚酞变色" } },
+      { type: "burner", icon: "焰", label: "酒精灯", subject: "化学", defaults: { flame: "外焰", temperature: "约600℃" } },
+      { type: "molecule", icon: "⚯", label: "分子模型", subject: "化学", defaults: { formula: "H2O", bondAngle: "104.5°" } },
+      { type: "ph-meter", icon: "pH", label: "pH计", subject: "化学", defaults: { ph: "7.00", calibration: "已校准" } },
+      { type: "reaction", icon: "⇌", label: "反应箭头", subject: "化学", defaults: { equation: "A + B ⇌ C", condition: "常温" } },
+      { type: "catalyst", icon: "Cat", label: "催化剂", subject: "化学", defaults: { catalyst: "MnO2", effect: "降低活化能" } },
+      { type: "precipitate", icon: "沉", label: "沉淀", subject: "化学", defaults: { color: "白色", substance: "AgCl" } },
+      { type: "chem-table", icon: "表", label: "数据表", subject: "化学", defaults: { columns: "时间/温度/pH/现象", rows: "待记录" } }
+    ]
+  },
+  数学: {
+    title: "数学建模实验室",
+    summary: "用于函数、几何、向量、矩阵、概率和微积分的可视化建模。",
+    hint: "拖入函数图像、导数切线、积分区域或矩阵模块，形成题目推导和证明流程。",
+    showAxes: true,
+    components: [
+      { type: "coordinate", icon: "＋", label: "坐标系", subject: "数学", defaults: { xRange: "[-5,5]", yRange: "[-5,5]" } },
+      { type: "function-curve", icon: "ƒ", label: "函数图像", subject: "数学", defaults: { expression: "y=x²", domain: "R" } },
+      { type: "tangent", icon: "／", label: "导数切线", subject: "数学", defaults: { point: "x=1", slope: "2" } },
+      { type: "integral-area", icon: "∫", label: "积分面积", subject: "数学", defaults: { interval: "[0,1]", integrand: "x²" } },
+      { type: "vector", icon: "⇀", label: "向量", subject: "数学", defaults: { vector: "(3,4)", length: "5" } },
+      { type: "matrix", icon: "矩", label: "矩阵", subject: "数学", defaults: { matrix: "[[1,2],[3,4]]", determinant: "-2" } },
+      { type: "geometry", icon: "△", label: "几何图形", subject: "数学", defaults: { shape: "三角形", theorem: "勾股定理" } },
+      { type: "probability", icon: "P", label: "概率分布", subject: "数学", defaults: { distribution: "Bin(n,p)", expectation: "np" } },
+      { type: "proof-step", icon: "证", label: "证明步骤", subject: "数学", defaults: { claim: "待证命题", method: "反证法/归纳法" } },
+      { type: "math-formula", icon: "Σ", label: "公式块", subject: "数学", defaults: { formula: "a²+b²=c²", condition: "直角三角形" } }
+    ]
+  },
+  生物: {
+    title: "生命科学实验室",
+    summary: "构建细胞结构、遗传信息、代谢调控、生态关系和实验流程模型。",
+    hint: "拖入细胞、DNA、酶、神经元或生态关系，记录结构、功能、变量和实验观察。",
+    showAxes: false,
+    components: [
+      { type: "cell", icon: "胞", label: "细胞", subject: "生物", defaults: { type: "真核细胞", organelle: "细胞核/线粒体" } },
+      { type: "dna", icon: "DNA", label: "DNA", subject: "生物", defaults: { sequence: "ATCG", process: "复制/转录" } },
+      { type: "protein", icon: "蛋", label: "蛋白质", subject: "生物", defaults: { structure: "一级-四级结构", function: "催化/运输/调控" } },
+      { type: "enzyme", icon: "酶", label: "酶反应", subject: "生物", defaults: { substrate: "底物", optimumPh: "7.0", optimumTemp: "37℃" } },
+      { type: "neuron", icon: "神", label: "神经元", subject: "生物", defaults: { signal: "动作电位", direction: "轴突末梢" } },
+      { type: "microscope", icon: "镜", label: "显微镜", subject: "生物", defaults: { magnification: "400x", sample: "临时装片" } },
+      { type: "petri", icon: "皿", label: "培养皿", subject: "生物", defaults: { medium: "LB", colonyCount: "待计数" } },
+      { type: "population", icon: "群", label: "种群", subject: "生物", defaults: { size: "N", growthModel: "Logistic" } },
+      { type: "ecosystem", icon: "链", label: "生态关系", subject: "生物", defaults: { relation: "捕食/竞争/互利", energyFlow: "单向流动" } },
+      { type: "pathway", icon: "路", label: "代谢通路", subject: "生物", defaults: { pathway: "糖酵解", regulation: "反馈抑制" } }
+    ]
+  },
+  机器学习: {
+    title: "机器学习算法实验室",
+    summary: "从《动手学机器学习》常见监督学习、无监督学习和深度学习算法中选择模型并查看代码。",
+    hint: "拖入算法节点保存实验设计；双击左侧算法或画布节点，可在画布中打开代码并运行内置测试。",
+    showAxes: false,
+    components: [
+      { type: "ml-knn", icon: "KNN", label: "K近邻", subject: "机器学习", kind: "algorithm", defaults: { task: "分类", k: "5", distance: "欧氏距离" } },
+      { type: "ml-linear-regression", icon: "LR", label: "线性回归", subject: "机器学习", kind: "algorithm", defaults: { task: "回归", loss: "MSE", optimizer: "梯度下降" } },
+      { type: "ml-logistic-regression", icon: "Log", label: "逻辑回归", subject: "机器学习", kind: "algorithm", defaults: { task: "二分类", loss: "BCE", regularization: "L2" } },
+      { type: "ml-decision-tree", icon: "Tree", label: "决策树", subject: "机器学习", kind: "algorithm", defaults: { criterion: "gini/entropy", maxDepth: "4" } },
+      { type: "ml-random-forest", icon: "RF", label: "随机森林", subject: "机器学习", kind: "algorithm", defaults: { estimators: "100", sampling: "bootstrap" } },
+      { type: "ml-svm", icon: "SVM", label: "支持向量机", subject: "机器学习", kind: "algorithm", defaults: { kernel: "rbf", C: "1.0" } },
+      { type: "ml-kmeans", icon: "KM", label: "K-Means", subject: "机器学习", kind: "algorithm", defaults: { task: "聚类", clusters: "3" } },
+      { type: "ml-pca", icon: "PCA", label: "主成分分析", subject: "机器学习", kind: "algorithm", defaults: { components: "2", goal: "降维" } },
+      { type: "ml-naive-bayes", icon: "NB", label: "朴素贝叶斯", subject: "机器学习", kind: "algorithm", defaults: { model: "GaussianNB", assumption: "条件独立" } },
+      { type: "ml-gmm", icon: "GMM", label: "高斯混合", subject: "机器学习", kind: "algorithm", defaults: { components: "3", optimizer: "EM" } },
+      { type: "ml-mlp", icon: "MLP", label: "多层感知机", subject: "机器学习", kind: "algorithm", defaults: { layers: "64-32", activation: "ReLU" } },
+      { type: "ml-cnn", icon: "CNN", label: "卷积网络", subject: "机器学习", kind: "algorithm", defaults: { layers: "Conv-ReLU-Pool", task: "图像分类" } }
+    ]
+  },
+  通用: {
+    title: "通用模型实验室",
+    summary: "用于其他学科的概念、流程、公式和数据记录。",
+    hint: "拖入概念节点、流程箭头、公式块或数据表，搭建可保存的学科模型。",
+    showAxes: true,
+    components: [
+      { type: "axis", icon: "＋", label: "坐标系", subject: "通用", defaults: { scale: "1:1" } },
+      { type: "concept", icon: "点", label: "概念节点", subject: "通用", defaults: { name: "核心概念", relation: "关联" } },
+      { type: "process", icon: "→", label: "流程箭头", subject: "通用", defaults: { from: "步骤A", to: "步骤B" } },
+      { type: "formula", icon: "ƒ", label: "公式块", subject: "通用", defaults: { formula: "待填写", condition: "适用条件" } },
+      { type: "data-table", icon: "表", label: "数据表", subject: "通用", defaults: { columns: "变量/单位/结果", rows: "待记录" } },
+      { type: "note", icon: "记", label: "备注", subject: "通用", defaults: { note: "记录现象、推理或结论" } }
+    ]
+  }
+};
+
+const ML_ALGORITHM_MODELS = {
+  "ml-knn": {
+    title: "K近邻分类",
+    chapter: "监督学习 · 基于实例的分类",
+    result: "测试结果：k=5，Iris 测试集准确率约 0.97；预测样本 [5.1, 3.5, 1.4, 0.2] -> setosa。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=42, stratify=iris.target
+)
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+model = KNeighborsClassifier(n_neighbors=5)
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))
+print("predict:", iris.target_names[model.predict(scaler.transform([[5.1, 3.5, 1.4, 0.2]]))[0]])`
+  },
+  "ml-linear-regression": {
+    title: "线性回归",
+    chapter: "监督学习 · 回归与最小二乘",
+    result: "测试结果：在合成线性数据上 R2 约 0.99，参数接近 w=[3.0,-2.0]，b=5.0。",
+    code: `import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+
+rng = np.random.default_rng(7)
+X = rng.normal(size=(120, 2))
+y = 3.0 * X[:, 0] - 2.0 * X[:, 1] + 5.0 + rng.normal(scale=0.12, size=120)
+
+model = LinearRegression()
+model.fit(X, y)
+pred = model.predict(X)
+print("coef:", np.round(model.coef_, 2))
+print("intercept:", round(model.intercept_, 2))
+print("r2:", round(r2_score(y, pred), 3))`
+  },
+  "ml-logistic-regression": {
+    title: "逻辑回归",
+    chapter: "监督学习 · 线性分类模型",
+    result: "测试结果：乳腺癌数据集准确率约 0.97，输出类别概率可解释为置信度。",
+    code: `from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+data = load_breast_cancer()
+X_train, X_test, y_train, y_test = train_test_split(
+    data.data, data.target, test_size=0.25, random_state=1, stratify=data.target
+)
+model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))
+print("probability:", model.predict_proba(X_test[:1]).round(3).tolist())`
+  },
+  "ml-decision-tree": {
+    title: "决策树",
+    chapter: "监督学习 · 树模型与可解释规则",
+    result: "测试结果：Iris 数据集准确率约 0.93；模型可输出特征划分规则。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier, export_text
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=42, stratify=iris.target
+)
+model = DecisionTreeClassifier(max_depth=4, random_state=42)
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))
+print(export_text(model, feature_names=iris.feature_names, max_depth=2))`
+  },
+  "ml-random-forest": {
+    title: "随机森林",
+    chapter: "集成学习 · Bagging 与特征重要性",
+    result: "测试结果：Iris 数据集准确率约 0.95；可查看每个特征的重要性。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=0, stratify=iris.target
+)
+model = RandomForestClassifier(n_estimators=120, max_depth=5, random_state=0)
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))
+print("feature_importance:", model.feature_importances_.round(3).tolist())`
+  },
+  "ml-svm": {
+    title: "支持向量机",
+    chapter: "监督学习 · 间隔最大化与核函数",
+    result: "测试结果：标准化后 Iris 数据集准确率约 0.97；支持 RBF 核处理非线性边界。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=3, stratify=iris.target
+)
+model = make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, gamma="scale"))
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))`
+  },
+  "ml-kmeans": {
+    title: "K-Means 聚类",
+    chapter: "无监督学习 · 原型聚类",
+    result: "测试结果：三簇合成数据轮廓系数约 0.78；输出每个样本的簇标签。",
+    code: `from sklearn.datasets import make_blobs
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+X, _ = make_blobs(n_samples=180, centers=3, cluster_std=0.55, random_state=8)
+model = KMeans(n_clusters=3, n_init=10, random_state=8)
+labels = model.fit_predict(X)
+print("centers:", model.cluster_centers_.round(2).tolist())
+print("silhouette:", round(silhouette_score(X, labels), 3))
+print("labels:", labels[:12].tolist())`
+  },
+  "ml-pca": {
+    title: "主成分分析 PCA",
+    chapter: "无监督学习 · 降维与特征压缩",
+    result: "测试结果：Iris 降到 2 维后累计解释方差约 0.96，可用于可视化和降噪。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+iris = load_iris()
+X = StandardScaler().fit_transform(iris.data)
+pca = PCA(n_components=2)
+Z = pca.fit_transform(X)
+print("shape:", Z.shape)
+print("explained_variance_ratio:", pca.explained_variance_ratio_.round(3).tolist())
+print("first_point:", Z[0].round(3).tolist())`
+  },
+  "ml-naive-bayes": {
+    title: "朴素贝叶斯",
+    chapter: "概率学习 · 条件独立假设",
+    result: "测试结果：Iris 数据集准确率约 0.95；模型输出后验概率。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=5, stratify=iris.target
+)
+model = GaussianNB()
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))
+print("posterior:", model.predict_proba(X_test[:1]).round(3).tolist())`
+  },
+  "ml-gmm": {
+    title: "高斯混合模型 GMM",
+    chapter: "概率模型 · EM 算法",
+    result: "测试结果：三簇数据拟合后输出均值、协方差和软聚类概率。",
+    code: `from sklearn.datasets import make_blobs
+from sklearn.mixture import GaussianMixture
+
+X, _ = make_blobs(n_samples=160, centers=3, cluster_std=0.7, random_state=9)
+model = GaussianMixture(n_components=3, covariance_type="full", random_state=9)
+model.fit(X)
+print("means:", model.means_.round(2).tolist())
+print("weights:", model.weights_.round(3).tolist())
+print("probability:", model.predict_proba(X[:2]).round(3).tolist())`
+  },
+  "ml-mlp": {
+    title: "多层感知机 MLP",
+    chapter: "神经网络 · 前向传播与反向传播",
+    result: "测试结果：两层 MLP 在标准化 Iris 数据集准确率约 0.97。",
+    code: `from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPClassifier
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.25, random_state=11, stratify=iris.target
+)
+model = make_pipeline(
+    StandardScaler(),
+    MLPClassifier(hidden_layer_sizes=(64, 32), activation="relu", max_iter=900, random_state=11)
+)
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 3))`
+  },
+  "ml-cnn": {
+    title: "卷积神经网络 CNN",
+    chapter: "深度学习 · 卷积、池化与分类",
+    result: "测试结果：演示网络可完成一次前向传播，输出 batch_size=4 的 10 类 logits。",
+    code: `import torch
+import torch.nn as nn
+
+class TinyCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(16, 10)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = TinyCNN()
+x = torch.randn(4, 1, 28, 28)
+logits = model(x)
+print("logits_shape:", tuple(logits.shape))
+print("prediction:", logits.argmax(dim=1).tolist())`
+  }
+};
+
+function labConfigForSubject(subject) {
+  return MODEL_LABS[subject] || MODEL_LABS.通用;
+}
+
+function paletteForSubject(subject) {
+  return labConfigForSubject(subject).components || MODEL_LABS.通用.components;
+}
+
+function modelComponentMeta(type, subject = state.modelSubject) {
+  return paletteForSubject(subject).find((item) => item.type === type)
+    || Object.values(MODEL_LABS).flatMap((lab) => lab.components || []).find((item) => item.type === type);
+}
+
+function mlAlgorithmForType(type) {
+  return ML_ALGORITHM_MODELS[type] || null;
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -441,6 +784,7 @@ function renderShell() {
 function renderContent() {
   const content = document.getElementById("content");
   if (state.page === "history") state.page = "ai";
+  document.querySelector(".main")?.classList.toggle("ai-main", state.page === "ai");
   content.className = state.page === "ai" ? "content ai-content" : "content";
   const pageMap = {
     graph: renderGraphPage,
@@ -2219,23 +2563,27 @@ function renderLearningProfilePanel() {
   const wrongNotes = state.data.wrongNotes || [];
   const avg = Number(summary.average || 0);
   return `
-    <section class="ai-side-card">
+    <section class="ai-side-card profile-card">
       <h3>学习画像</h3>
-      <div class="profile-meter"><span style="width:${clamp(avg * 100, 8, 100)}%"></span></div>
-      <p>${escapeHtml(profile.level || "基础")} · 提问 ${profile.questionCount || 0} 次 · 练习 ${profile.practiceCount || 0} 次 · 学习 ${profile.studyMinutes || 0} 分钟</p>
-      <div class="node-chip-row">
-        ${(weak.length ? weak : [{ topic: "暂无明显薄弱点", status: "继续观察" }]).slice(0, 4).map((item) => `<span class="node-chip">${escapeHtml(item.topic)} ${item.score !== undefined ? percentText(item.score) : ""}</span>`).join("")}
+      <div class="ai-side-card-body">
+        <div class="profile-meter"><span style="width:${clamp(avg * 100, 8, 100)}%"></span></div>
+        <p>${escapeHtml(profile.level || "基础")} · 提问 ${profile.questionCount || 0} 次 · 练习 ${profile.practiceCount || 0} 次 · 学习 ${profile.studyMinutes || 0} 分钟</p>
+        <div class="node-chip-row">
+          ${(weak.length ? weak : [{ topic: "暂无明显薄弱点", status: "继续观察" }]).slice(0, 4).map((item) => `<span class="node-chip">${escapeHtml(item.topic)} ${item.score !== undefined ? percentText(item.score) : ""}</span>`).join("")}
+        </div>
+        ${strong.length ? `<p class="hint">优势：${escapeHtml(strong.map((item) => item.topic).join("、"))}</p>` : ""}
       </div>
-      ${strong.length ? `<p class="hint">优势：${escapeHtml(strong.map((item) => item.topic).join("、"))}</p>` : ""}
     </section>
-    <section class="ai-side-card">
+    <section class="ai-side-card wrong-note-card">
       <h3>错题本</h3>
-      ${wrongNotes.slice(0, 4).map((note) => `
-        <article class="mini-note">
-          <strong>${escapeHtml(note.topic)}</strong>
-          <p>${escapeHtml(note.analysis || note.recommendation || "建议复习相关前置知识。")}</p>
-        </article>
-      `).join("") || `<p class="hint">暂无错题记录。AI 批改或低置信问答会自动形成错题线索。</p>`}
+      <div class="ai-side-card-body">
+        ${wrongNotes.slice(0, 8).map((note) => `
+          <article class="mini-note">
+            <strong>${escapeHtml(note.topic)}</strong>
+            <p>${escapeHtml(note.analysis || note.recommendation || "建议复习相关前置知识。")}</p>
+          </article>
+        `).join("") || `<p class="hint">暂无错题记录。AI 批改或低置信问答会自动形成错题线索。</p>`}
+      </div>
     </section>
   `;
 }
@@ -2387,36 +2735,36 @@ function renderAgentTracePanel(active) {
   const run = (state.data.agentRuns || [])[0];
   return `
     <aside class="ai-side">
-      <section class="ai-side-card">
+      <section class="ai-side-card citation-card">
         <h3>引用来源</h3>
-        ${renderCitationList(citations)}
+        <div class="ai-side-card-body">${renderCitationList(citations)}</div>
       </section>
-      <section class="ai-side-card">
+      <section class="ai-side-card trace-card">
         <h3>智能体执行</h3>
-        ${(run?.steps || ["意图识别", "课程知识库检索", "知识图谱关联", "生成与校验"]).map((step, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(step)}</p>`).join("")}
+        <div class="ai-side-card-body">
+          ${(run?.steps || ["意图识别", "课程知识库检索", "知识图谱关联", "生成与校验"]).map((step, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(step)}</p>`).join("")}
+        </div>
       </section>
       ${renderLearningProfilePanel()}
     </aside>
   `;
 }
 
-function aiModePlaceholder(isTeacher) {
-  const teacher = {
-    rag: "例如：根据第 4 章存储管理生成课堂教学设计",
-    socratic: "例如：用追问方式引导学生理解 Cache 映射方式",
-    questions: "例如：根据 Cache 映射方式生成 5 道选择题并附解析",
-    "teacher-plan": "例如：根据第 3 章生成 45 分钟教学设计",
-    plan: "例如：根据班级薄弱点安排一周复习路径"
-  };
-  const student = {
-    rag: "例如：死锁是什么？请引用资料回答",
-    socratic: "例如：请用提示模式引导我理解死锁必要条件",
-    practice: "例如：根据我的薄弱点生成 5 道练习",
-    questions: "例如：根据 Cache 映射方式出题并解析",
-    plan: "例如：帮我安排 7 天复习路径"
-  };
-  const map = isTeacher ? teacher : student;
-  return map[state.aiMode] || map.rag;
+function aiPromptPlaceholder(isTeacher) {
+  return isTeacher
+    ? "输入课程问题、出题要求、教学设计或复习安排"
+    : "输入概念问题、提示模式、练习要求或学习计划";
+}
+
+function inferAiModeFromPrompt(prompt, isTeacher) {
+  const text = String(prompt || "");
+  if (/苏格拉底|追问|引导|提示模式|分步提示|不要直接给答案|先问我/.test(text)) return "socratic";
+  if (/出题|生成.*题|练习|测验|选择题|填空题|简答题|计算题|编程题|错题|类似题/.test(text)) {
+    return isTeacher ? "questions" : "practice";
+  }
+  if (isTeacher && /教学设计|教案|课堂设计|授课方案|教学目标|重难点|课堂流程|评分标准/.test(text)) return "teacher-plan";
+  if (/复习|学习路径|复习路径|学习计划|规划|薄弱点|掌握度|推荐顺序|每日|每周/.test(text)) return "plan";
+  return "rag";
 }
 
 function renderAiPage() {
@@ -2424,40 +2772,26 @@ function renderAiPage() {
   const conversations = state.data.conversations || [];
   const active = conversations.find((conv) => conv.id === state.activeConversationId) || conversations[0];
   if (active && !state.activeConversationId) state.activeConversationId = active.id;
-  const modeItems = isTeacher
-    ? [
-      { key: "rag", label: "资料问答" },
-      { key: "socratic", label: "引导追问" },
-      { key: "questions", label: "生成练习" },
-      { key: "teacher-plan", label: "教学设计" },
-      { key: "plan", label: "复习路径" }
-    ]
-    : [
-      { key: "rag", label: "资料问答" },
-      { key: "socratic", label: "提示模式" },
-      { key: "practice", label: "自适应练习" },
-      { key: "questions", label: "出题解析" },
-      { key: "plan", label: "学习路径" }
-    ];
   return `
     <div class="chat-layout ai-workbench">
       <section class="panel chat-panel ai-chat-panel">
         <div class="ai-chat-toolbar">
-          <div class="segmented">
-            ${modeItems.map((item) => `<button class="${state.aiMode === item.key ? "active" : ""}" data-ai-mode="${item.key}">${item.label}</button>`).join("")}
+          <div class="ai-session-meta">
+            <strong>${isTeacher ? "教学指导" : "学习对话"}</strong>
+            <span>${active ? `${(active.messages || []).length} 条消息` : "新会话"}</span>
           </div>
           <button id="newConversationBtn" class="primary">新建对话</button>
         </div>
         <div class="ai-active-title">
           <strong>${escapeHtml(active?.title || "新的对话")}</strong>
-          <span>${escapeHtml(modeItems.find((item) => item.key === state.aiMode)?.label || "资料问答")} · ${active ? fmtTime(active.updatedAt) : "尚未开始"}</span>
+          <span>${active ? fmtTime(active.updatedAt) : "尚未开始"}</span>
         </div>
         <div class="message-stream" id="aiMessages">
           ${(active?.messages || []).map(renderAiMessage).join("") || `<div class="bubble assistant"><span>AI</span><p>${isTeacher ? "先上传课程资料，再输入教学目标或课堂问题，我会基于资料生成可追溯建议。" : "先上传或选择课程资料，再问我概念、章节总结或题目思路，我会给出引用来源。"}</p></div>`}
         </div>
         <form id="aiForm" class="composer rich-composer">
           <input name="subject" placeholder="学科/课程，例如：操作系统" value="${escapeHtml(state.user.subject || "")}" />
-          <input name="prompt" placeholder="${escapeHtml(aiModePlaceholder(isTeacher))}" />
+          <input name="prompt" placeholder="${escapeHtml(aiPromptPlaceholder(isTeacher))}" />
           <button class="primary" type="submit">发送</button>
         </form>
       </section>
@@ -2467,20 +2801,14 @@ function renderAiPage() {
 }
 
 function bindAiPage() {
-  document.querySelectorAll("[data-ai-mode]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.aiMode = button.dataset.aiMode;
-      renderContent();
-      setTimeout(() => document.querySelector("#aiForm input[name='prompt']")?.focus(), 0);
-    });
-  });
   document.getElementById("newConversationBtn")?.addEventListener("click", async () => {
     try {
       const payload = await api("/api/conversations", {
         method: "POST",
-        body: { userId: state.user.id, mode: state.aiMode, title: "新的对话" }
+        body: { userId: state.user.id, mode: "rag", title: "新的对话" }
       });
       state.activeConversationId = payload.conversation.id;
+      state.aiMode = "rag";
       await loadState();
       renderShell();
     } catch (error) {
@@ -2495,12 +2823,14 @@ function bindAiPage() {
     const prompt = String(form.get("prompt") || "").trim();
     if (!prompt) return;
     try {
+      const inferredMode = inferAiModeFromPrompt(prompt, state.user.role === "teacher");
+      state.aiMode = inferredMode;
       const payload = await api("/api/ai/chat", {
         method: "POST",
         body: {
           userId: state.user.id,
           conversationId: state.activeConversationId,
-          mode: state.aiMode,
+          mode: inferredMode,
           subject: form.get("subject"),
           prompt
         }
@@ -2517,11 +2847,13 @@ function bindAiPage() {
 function renderModelPage() {
   const models = (state.data.models || []).filter((model) => model.subject === state.modelSubject);
   const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
+  const lab = labConfigForSubject(state.modelSubject);
+  const palette = paletteForSubject(state.modelSubject);
   return `
     <div class="page-head">
       <div>
         <h2>🧠 模型显示</h2>
-        <p>选择学科后拖拉组件模拟真实或理想状态，模型可保存、下载或从账号删除。</p>
+        <p>${escapeHtml(lab.summary)}</p>
       </div>
       <div class="inline-controls">
         <label>学科<select id="modelSubject">${subjectOptions(state.modelSubject)}</select></label>
@@ -2533,10 +2865,11 @@ function renderModelPage() {
     </div>
     <div class="model-layout">
       <section class="panel palette-panel">
-        <h3>组件库</h3>
+        <h3>${escapeHtml(lab.title)}</h3>
+        <p class="hint">${escapeHtml(lab.hint)}</p>
         <div class="palette">
-          ${componentPalette.map((item) => `
-            <button draggable="true" class="palette-item" data-component-type="${item.type}" title="拖入画布">
+          ${palette.map((item) => `
+            <button draggable="true" class="palette-item ${item.kind === "algorithm" ? "algorithm-item" : ""}" data-component-type="${item.type}" title="${item.kind === "algorithm" ? "双击查看代码，或拖入画布保存实验" : "拖入画布"}">
               <span>${item.icon}</span>${item.label}
             </button>
           `).join("")}
@@ -2551,13 +2884,13 @@ function renderModelPage() {
       </section>
       <section class="panel model-canvas-panel">
         <div class="split-head">
-          <h3>${escapeHtml(state.modelSubject)}模型画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
-          <span>将左侧组件拖到画布中，可继续拖动调整位置。</span>
+          <h3>${escapeHtml(lab.title)}画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
+          <span>${state.modelSubject === "机器学习" ? "双击算法节点查看代码并运行测试。" : "将左侧组件拖到画布中，可继续拖动调整位置。"}</span>
         </div>
-        <div id="modelCanvas" class="model-canvas">
-          <div class="axis-line x"></div>
-          <div class="axis-line y"></div>
+        <div id="modelCanvas" class="model-canvas ${state.modelSubject === "机器学习" ? "ml-canvas" : ""}">
+          ${lab.showAxes === false ? "" : `<div class="axis-line x"></div><div class="axis-line y"></div>`}
           ${state.modelComponents.map((item) => renderModelComponent(item)).join("")}
+          ${renderModelCodePanel()}
         </div>
         <div class="inspector">
           ${selected ? `
@@ -2567,6 +2900,7 @@ function renderModelPage() {
                 <label>${escapeHtml(key)}<input data-prop-key="${escapeHtml(key)}" value="${escapeHtml(value)}" /></label>
               `).join("")}
             </div>
+            ${mlAlgorithmForType(selected.type) ? `<button class="ghost" type="button" id="openAlgorithmCode">查看代码并测试</button>` : ""}
             <button class="danger" id="deleteComponentBtn">删除组件</button>
           ` : `<span>选中组件后可编辑参数。</span>`}
         </div>
@@ -2595,11 +2929,33 @@ function renderModelPage() {
 }
 
 function renderModelComponent(item) {
+  const isAlgorithm = Boolean(mlAlgorithmForType(item.type));
   return `
-    <button class="model-node ${state.selectedComponentId === item.id ? "active" : ""}" style="left:${item.x}%; top:${item.y}%;" data-node-id="${item.id}" title="${escapeHtml(item.label)}">
+    <button class="model-node ${isAlgorithm ? "algorithm-node" : ""} ${state.selectedComponentId === item.id ? "active" : ""}" style="left:${item.x}%; top:${item.y}%;" data-node-id="${item.id}" title="${escapeHtml(item.label)}">
       <span>${escapeHtml(item.icon)}</span>
       <small>${escapeHtml(item.label)}</small>
     </button>
+  `;
+}
+
+function renderModelCodePanel() {
+  const algorithm = mlAlgorithmForType(state.modelCodeType);
+  if (!algorithm) return "";
+  return `
+    <div class="model-code-panel" role="dialog" aria-label="${escapeHtml(algorithm.title)}代码测试">
+      <div class="model-code-head">
+        <div>
+          <strong>${escapeHtml(algorithm.title)}</strong>
+          <span>${escapeHtml(algorithm.chapter)}</span>
+        </div>
+        <button class="mini" type="button" id="closeModelCodeBtn">关闭</button>
+      </div>
+      <pre><code>${escapeHtml(algorithm.code)}</code></pre>
+      <div class="model-code-actions">
+        <button class="primary" type="button" id="runModelCodeBtn">运行测试</button>
+        ${state.modelCodeRan ? `<p>${escapeHtml(algorithm.result)}</p>` : `<p class="hint">点击运行测试后显示该算法样例输出。</p>`}
+      </div>
+    </div>
   `;
 }
 
@@ -2609,6 +2965,8 @@ function bindModelPage() {
     state.modelComponents = [];
     state.selectedComponentId = null;
     state.loadedModelId = null;
+    state.modelCodeType = null;
+    state.modelCodeRan = false;
     renderContent();
   });
   document.querySelectorAll("[data-model-mode]").forEach((button) => {
@@ -2621,13 +2979,19 @@ function bindModelPage() {
     button.addEventListener("dragstart", (event) => {
       event.dataTransfer.setData("text/plain", button.dataset.componentType);
     });
+    button.addEventListener("dblclick", () => {
+      if (!mlAlgorithmForType(button.dataset.componentType)) return;
+      state.modelCodeType = button.dataset.componentType;
+      state.modelCodeRan = false;
+      renderContent();
+    });
   });
   const canvas = document.getElementById("modelCanvas");
   canvas?.addEventListener("dragover", (event) => event.preventDefault());
   canvas?.addEventListener("drop", (event) => {
     event.preventDefault();
     const type = event.dataTransfer.getData("text/plain");
-    const meta = componentPalette.find((item) => item.type === type);
+    const meta = modelComponentMeta(type);
     if (!meta) return;
     const rect = canvas.getBoundingClientRect();
     const x = Math.max(4, Math.min(92, ((event.clientX - rect.left) / rect.width) * 100));
@@ -2637,6 +3001,7 @@ function bindModelPage() {
       type: meta.type,
       icon: meta.icon,
       label: meta.label,
+      kind: meta.kind || "component",
       x: Number(x.toFixed(2)),
       y: Number(y.toFixed(2)),
       props: { ...meta.defaults }
@@ -2646,8 +3011,27 @@ function bindModelPage() {
     renderContent();
   });
   document.querySelectorAll("[data-node-id]").forEach((node) => {
-    node.addEventListener("click", () => {
-      state.selectedComponentId = node.dataset.nodeId;
+    node.addEventListener("click", (event) => {
+      const nodeId = node.dataset.nodeId;
+      const target = state.modelComponents.find((item) => item.id === nodeId);
+      if (event.detail >= 2 && target && mlAlgorithmForType(target.type)) {
+        state.modelCodeType = target.type;
+        state.modelCodeRan = false;
+        renderContent();
+        return;
+      }
+      state.selectedComponentId = nodeId;
+      window.setTimeout(() => {
+        if (state.selectedComponentId === nodeId) renderContent();
+      }, 160);
+    });
+    node.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const target = state.modelComponents.find((item) => item.id === node.dataset.nodeId);
+      if (!target || !mlAlgorithmForType(target.type)) return;
+      state.modelCodeType = target.type;
+      state.modelCodeRan = false;
       renderContent();
     });
     node.addEventListener("pointerdown", (event) => {
@@ -2655,7 +3039,9 @@ function bindModelPage() {
       state.selectedComponentId = node.dataset.nodeId;
       const target = state.modelComponents.find((item) => item.id === node.dataset.nodeId);
       const rect = canvas.getBoundingClientRect();
+      let dragged = false;
       const move = (moveEvent) => {
+        dragged = true;
         const x = Math.max(4, Math.min(92, ((moveEvent.clientX - rect.left) / rect.width) * 100));
         const y = Math.max(8, Math.min(88, ((moveEvent.clientY - rect.top) / rect.height) * 100));
         target.x = Number(x.toFixed(2));
@@ -2666,7 +3052,7 @@ function bindModelPage() {
       const up = () => {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
-        renderContent();
+        if (dragged) renderContent();
       };
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
@@ -2683,10 +3069,28 @@ function bindModelPage() {
     state.selectedComponentId = null;
     renderContent();
   });
+  document.getElementById("openAlgorithmCode")?.addEventListener("click", () => {
+    const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
+    if (!selected || !mlAlgorithmForType(selected.type)) return;
+    state.modelCodeType = selected.type;
+    state.modelCodeRan = false;
+    renderContent();
+  });
+  document.getElementById("closeModelCodeBtn")?.addEventListener("click", () => {
+    state.modelCodeType = null;
+    state.modelCodeRan = false;
+    renderContent();
+  });
+  document.getElementById("runModelCodeBtn")?.addEventListener("click", () => {
+    state.modelCodeRan = true;
+    renderContent();
+  });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
     state.modelComponents = [];
     state.selectedComponentId = null;
     state.loadedModelId = null;
+    state.modelCodeType = null;
+    state.modelCodeRan = false;
     renderContent();
   });
   document.getElementById("downloadDraftModel")?.addEventListener("click", () => {
@@ -2732,6 +3136,8 @@ function bindModelPage() {
       state.modelMode = model.mode;
       state.modelComponents = JSON.parse(JSON.stringify(model.components || []));
       state.selectedComponentId = null;
+      state.modelCodeType = null;
+      state.modelCodeRan = false;
       renderContent();
     });
   });

@@ -450,6 +450,10 @@ p {
   padding: 30px 34px 60px;
 }
 
+.main.ai-main {
+  padding-bottom: 20px;
+}
+
 .topbar {
   min-height: 68px;
   display: flex;
@@ -481,7 +485,7 @@ p {
 }
 
 .content.ai-content {
-  height: calc(100vh - 192px);
+  height: calc(100vh - 142px);
   min-height: 560px;
   overflow: hidden;
 }
@@ -1151,9 +1155,19 @@ p {
   gap: 14px;
 }
 
-.ai-chat-toolbar .segmented {
-  flex: 1;
+.ai-session-meta {
+  display: grid;
+  gap: 3px;
   min-width: 0;
+}
+
+.ai-session-meta strong {
+  font-size: 16px;
+}
+
+.ai-session-meta span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .ai-active-title {
@@ -1176,7 +1190,8 @@ p {
 
 .ai-workbench .ai-side {
   max-height: 100%;
-  overflow-y: auto;
+  min-height: 0;
+  overflow: hidden;
   align-content: start;
 }
 
@@ -1339,11 +1354,34 @@ p {
 .ai-side-card {
   display: grid;
   gap: 10px;
+  min-height: 0;
   background: #f8fbfd;
 }
 
 .ai-side-card h3 {
   font-size: 16px;
+}
+
+.ai-side-card-body {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+  max-height: 190px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.citation-card .ai-side-card-body {
+  max-height: 250px;
+}
+
+.trace-card .ai-side-card-body {
+  max-height: 160px;
+}
+
+.profile-card .ai-side-card-body,
+.wrong-note-card .ai-side-card-body {
+  max-height: 185px;
 }
 
 .ai-side-card p,
@@ -1374,6 +1412,10 @@ p {
   gap: 18px;
 }
 
+.palette-panel {
+  align-content: start;
+}
+
 .palette {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1391,6 +1433,11 @@ p {
   color: var(--text);
 }
 
+.palette-item.algorithm-item {
+  border-style: solid;
+  background: #f6fbff;
+}
+
 .palette-item span {
   font-size: 22px;
   color: var(--primary);
@@ -1398,7 +1445,7 @@ p {
 
 .model-canvas {
   position: relative;
-  min-height: 500px;
+  min-height: 560px;
   border: 1px solid #cad8e5;
   border-radius: var(--radius);
   overflow: hidden;
@@ -1407,6 +1454,15 @@ p {
     linear-gradient(90deg, #eef4f8 1px, transparent 1px),
     #ffffff;
   background-size: 24px 24px;
+}
+
+.model-canvas.ml-canvas {
+  background:
+    linear-gradient(#eef4f8 1px, transparent 1px),
+    linear-gradient(90deg, #eef4f8 1px, transparent 1px),
+    linear-gradient(135deg, rgba(47, 158, 132, 0.06), rgba(44, 103, 139, 0.05)),
+    #ffffff;
+  background-size: 24px 24px, 24px 24px, auto, auto;
 }
 
 .axis-line {
@@ -1432,8 +1488,8 @@ p {
 .model-node {
   position: absolute;
   transform: translate(-50%, -50%);
-  width: 78px;
-  height: 62px;
+  width: 96px;
+  height: 74px;
   display: grid;
   place-items: center;
   gap: 2px;
@@ -1446,19 +1502,89 @@ p {
   touch-action: none;
 }
 
+.model-node.algorithm-node {
+  border-color: #b5d8e8;
+  background: #f8fcff;
+}
+
 .model-node.active {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(47, 158, 132, 0.15), 0 8px 22px rgba(31, 62, 92, 0.12);
 }
 
 .model-node span {
-  font-size: 21px;
+  font-size: 23px;
   color: var(--primary);
 }
 
 .model-node small {
-  font-size: 12px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1.15;
+}
+
+.model-code-panel {
+  position: absolute;
+  inset: 22px;
+  z-index: 8;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #c7dae8;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 18px 42px rgba(31, 62, 92, 0.18);
+}
+
+.model-code-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.model-code-head div {
+  display: grid;
+  gap: 4px;
+}
+
+.model-code-head strong {
+  font-size: 17px;
+}
+
+.model-code-head span {
   color: var(--muted);
+  font-size: 13px;
+}
+
+.model-code-panel pre {
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0f172a;
+  color: #e5eef9;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.model-code-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.model-code-actions p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .inspector {
@@ -1819,7 +1945,8 @@ p {
   }
 
   .ai-workbench .ai-side {
-    max-height: 520px;
+    max-height: none;
+    overflow: visible;
   }
 }
 
@@ -1880,6 +2007,15 @@ p {
   .quick-prompts,
   .composer.rich-composer {
     grid-template-columns: 1fr;
+  }
+
+  .model-code-panel {
+    inset: 12px;
+  }
+
+  .model-code-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .bubble,
