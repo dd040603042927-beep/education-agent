@@ -459,6 +459,10 @@ p {
   padding-bottom: 20px;
 }
 
+.main.ml-model-main {
+  padding: 20px 28px 16px;
+}
+
 .topbar {
   min-height: 68px;
   display: flex;
@@ -493,6 +497,13 @@ p {
   height: calc(100vh - 142px);
   min-height: 560px;
   overflow: hidden;
+}
+
+.content.ml-model-content {
+  height: calc(100vh - 116px);
+  min-height: 0;
+  overflow: hidden;
+  padding-top: 14px;
 }
 
 .page-head {
@@ -1441,8 +1452,27 @@ p {
   gap: 18px;
 }
 
+.ml-model-content .model-layout {
+  grid-template-columns: 232px minmax(0, 1fr) 292px;
+  gap: 14px;
+  height: 100%;
+  min-height: 0;
+}
+
 .palette-panel {
   align-content: start;
+}
+
+.ml-model-content .palette-panel,
+.ml-model-content .model-canvas-panel,
+.ml-model-content .saved-models {
+  min-height: 0;
+  overflow: hidden;
+  padding: 14px;
+}
+
+.ml-model-content .palette-panel {
+  gap: 10px;
 }
 
 .lab-head {
@@ -1485,23 +1515,25 @@ p {
   color: var(--primary);
 }
 
-.custom-algorithm-form {
-  display: grid;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: #fbfdff;
+.ml-model-content .palette {
+  gap: 8px;
 }
 
-.custom-algorithm-form h4 {
-  font-size: 15px;
+.ml-model-content .palette-item {
+  min-height: 54px;
+  padding: 6px;
 }
 
-.custom-algorithm-form textarea {
-  min-height: 116px;
-  font-family: Consolas, "SFMono-Regular", monospace;
-  font-size: 13px;
+.ml-model-content .palette-item span {
+  font-size: 20px;
+}
+
+.ml-model-content .stack {
+  gap: 8px;
+}
+
+.ml-model-content .stack textarea {
+  min-height: 62px;
 }
 
 .model-canvas {
@@ -1638,9 +1670,29 @@ p {
   background: #0f172a;
   color: #e5eef9;
   font-family: Consolas, "SFMono-Regular", monospace;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.55;
   resize: none;
+}
+
+.ml-model-content .model-canvas-panel {
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.ml-model-content .model-canvas {
+  min-height: 0;
+  height: 100%;
+}
+
+.ml-model-content .model-code-panel {
+  inset: 14px;
+  padding: 14px;
+}
+
+.ml-model-content .model-code-panel textarea {
+  font-size: 16px;
+  line-height: 1.6;
 }
 
 .model-code-actions {
@@ -1693,6 +1745,25 @@ p {
 
 .saved-models {
   align-content: start;
+}
+
+.ml-model-content .saved-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.ml-model-content .inspector {
+  min-height: 0;
+  max-height: 132px;
+  overflow: hidden;
+}
+
+.ml-model-content .run-result-panel {
+  min-height: 96px;
+}
+
+.ml-model-content .saved-models {
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .contact-panel {

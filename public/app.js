@@ -792,8 +792,15 @@ function renderShell() {
 function renderContent() {
   const content = document.getElementById("content");
   if (state.page === "history") state.page = "ai";
-  document.querySelector(".main")?.classList.toggle("ai-main", state.page === "ai");
-  content.className = state.page === "ai" ? "content ai-content" : "content";
+  const main = document.querySelector(".main");
+  main?.classList.toggle("ai-main", state.page === "ai");
+  main?.classList.toggle("model-main", state.page === "models");
+  main?.classList.toggle("ml-model-main", state.page === "models" && state.modelSubject === "机器学习");
+  const contentClasses = ["content"];
+  if (state.page === "ai") contentClasses.push("ai-content");
+  if (state.page === "models") contentClasses.push("model-content");
+  if (state.page === "models" && state.modelSubject === "机器学习") contentClasses.push("ml-model-content");
+  content.className = contentClasses.join(" ");
   const pageMap = {
     graph: renderGraphPage,
     ai: renderAiPage,
@@ -2933,6 +2940,32 @@ function hasCanvasModel() {
   return state.modelComponents.length > 0;
 }
 
+function hasModelDraft() {
+  return hasCanvasModel() || (state.modelSubject === "机器学习" && Boolean(modelCodeDefinition()));
+}
+
+function modelDraftComponents() {
+  if (state.modelComponents.length) return state.modelComponents;
+  if (state.modelSubject !== "机器学习" || !state.modelCodeType) return [];
+  const meta = modelComponentMeta(state.modelCodeType, "机器学习");
+  const definition = modelCodeDefinition();
+  if (!meta || !definition) return [];
+  return [{
+    id: `cmp_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    type: meta.type,
+    icon: meta.icon,
+    label: meta.label,
+    kind: meta.kind || "algorithm",
+    x: 50,
+    y: 45,
+    props: {
+      ...meta.defaults,
+      code: state.modelCodeDraft || definition.code || "",
+      expectedResult: definition.result || ""
+    }
+  }];
+}
+
 function componentSupportsCode(component) {
   return Boolean(component && (mlAlgorithmForType(component.type) || component.kind === "customAlgorithm" || component.props?.code !== undefined));
 }
@@ -2964,19 +2997,6 @@ function normalizeLoadedModelComponents(model) {
   }];
 }
 
-function renderCustomAlgorithmForm() {
-  if (state.modelSubject !== "机器学习") return "";
-  return `
-    <form id="customAlgorithmForm" class="custom-algorithm-form">
-      <h4>新增算法模型</h4>
-      <input name="label" placeholder="算法名称，例如：Transformer 分类器" autocomplete="off" />
-      <textarea name="code" rows="5" placeholder="在这里输入新的算法模型代码"></textarea>
-      <input name="result" placeholder="预期运行结果，例如：accuracy: 0.92" autocomplete="off" />
-      <button class="ghost" type="submit">添加到画布</button>
-    </form>
-  `;
-}
-
 function renderRunResultPanel() {
   const result = state.modelRunResult || "";
   return `
@@ -2992,7 +3012,8 @@ function renderModelPage() {
   const selected = state.modelComponents.find((item) => item.id === state.selectedComponentId);
   const lab = labConfigForSubject(state.modelSubject);
   const palette = paletteForSubject(state.modelSubject);
-  const canSaveOrDownload = hasCanvasModel();
+  const isMachineLearning = state.modelSubject === "机器学习";
+  const canSaveOrDownload = hasModelDraft();
   return `
     <div class="model-layout">
       <section class="panel palette-panel">
@@ -3011,27 +3032,28 @@ function renderModelPage() {
             </button>
           `).join("")}
         </div>
-        ${renderCustomAlgorithmForm()}
         <form id="saveModelForm" class="stack">
-          <label>模型名称<input name="name" value="${escapeHtml(models.find((model) => model.id === state.loadedModelId)?.name || "")}" placeholder="例如：斜面小车运动模型" /></label>
+          <label>模型名称<input name="name" value="${escapeHtml(models.find((model) => model.id === state.loadedModelId)?.name || "")}" placeholder="${isMachineLearning ? "例如：KNN分类实验" : "例如：斜面小车运动模型"}" /></label>
           <label>说明<textarea name="notes" rows="3" placeholder="记录参数、题目来源或使用场景"></textarea></label>
-          <button class="primary" type="submit" ${canSaveOrDownload ? "" : "disabled"}>保存模型</button>
-          <button class="ghost" type="button" id="downloadDraftModel" ${canSaveOrDownload ? "" : "disabled"}>下载当前模型</button>
+          <button class="primary" type="submit" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "保存算法代码" : "保存模型"}</button>
+          <button class="ghost" type="button" id="downloadDraftModel" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "下载算法代码" : "下载当前模型"}</button>
           <button class="ghost" type="button" id="clearModelCanvas">清空画布</button>
           ${canSaveOrDownload ? "" : `<p class="hint">请先把模型或算法节点拖入画布，再保存或下载。</p>`}
         </form>
       </section>
       <section class="panel model-canvas-panel">
-        <div class="split-head">
-          <div>
-            <h3>${escapeHtml(lab.title)}画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
-            <span>${state.modelSubject === "机器学习" ? "双击算法节点查看代码并运行测试。" : "将左侧组件拖到画布中，可继续拖动调整位置。"}</span>
+        ${isMachineLearning ? "" : `
+          <div class="split-head">
+            <div>
+              <h3>${escapeHtml(lab.title)}画布 · ${state.modelMode === "ideal" ? "理想状态" : "真实状态"}</h3>
+              <span>将左侧组件拖到画布中，可继续拖动调整位置。</span>
+            </div>
+            <div class="segmented compact">
+              <button class="${state.modelMode === "ideal" ? "active" : ""}" data-model-mode="ideal">理想状态</button>
+              <button class="${state.modelMode === "real" ? "active" : ""}" data-model-mode="real">真实状态</button>
+            </div>
           </div>
-          <div class="segmented compact">
-            <button class="${state.modelMode === "ideal" ? "active" : ""}" data-model-mode="ideal">理想状态</button>
-            <button class="${state.modelMode === "real" ? "active" : ""}" data-model-mode="real">真实状态</button>
-          </div>
-        </div>
+        `}
         <div id="modelCanvas" class="model-canvas ${state.modelSubject === "机器学习" ? "ml-canvas" : ""}">
           ${lab.showAxes === false ? "" : `<div class="axis-line x"></div><div class="axis-line y"></div>`}
           ${state.modelComponents.map((item) => renderModelComponent(item)).join("")}
@@ -3058,7 +3080,7 @@ function renderModelPage() {
             <article class="list-card">
               <div>
                 <h3>${escapeHtml(model.name)}</h3>
-                <p>${escapeHtml(model.mode === "real" ? "真实状态" : "理想状态")} · ${model.components.length} 个组件</p>
+                <p>${isMachineLearning ? `算法代码 · ${model.components.length || 1} 个模型` : `${escapeHtml(model.mode === "real" ? "真实状态" : "理想状态")} · ${model.components.length} 个组件`}</p>
                 <small>${fmtTime(model.updatedAt)}</small>
               </div>
               <div class="row-actions">
@@ -3109,6 +3131,7 @@ function renderModelCodePanel() {
 function bindModelPage() {
   document.getElementById("modelSubject")?.addEventListener("change", (event) => {
     state.modelSubject = event.target.value;
+    state.modelMode = state.modelSubject === "机器学习" ? "algorithm" : "ideal";
     state.modelComponents = [];
     state.selectedComponentId = null;
     state.loadedModelId = null;
@@ -3241,32 +3264,6 @@ function bindModelPage() {
     }
     renderContent();
   });
-  document.getElementById("customAlgorithmForm")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const label = String(form.get("label") || "").trim();
-    const code = String(form.get("code") || "").trim();
-    if (!label || !code) return showToast("请填写算法名称和代码", "error");
-    const component = {
-      id: `cmp_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-      type: `custom-ml-${Date.now()}`,
-      icon: label.slice(0, 3).toUpperCase(),
-      label,
-      kind: "customAlgorithm",
-      x: 50,
-      y: 45,
-      props: {
-        task: "自定义算法",
-        chapter: "自定义机器学习模型",
-        code,
-        expectedResult: String(form.get("result") || "").trim() || "模拟运行完成：自定义算法代码已载入。"
-      }
-    };
-    state.modelComponents.push(component);
-    state.selectedComponentId = component.id;
-    openModelCode(component.type, component.id);
-    renderContent();
-  });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
     state.modelComponents = [];
     state.selectedComponentId = null;
@@ -3276,13 +3273,13 @@ function bindModelPage() {
     renderContent();
   });
   document.getElementById("downloadDraftModel")?.addEventListener("click", () => {
-    if (!hasCanvasModel()) return showToast("请先在画布中添加模型", "error");
+    if (!hasModelDraft()) return showToast("请先在画布中添加模型或打开算法代码", "error");
     persistOpenModelCodeDraft();
     downloadJson(`${state.modelSubject}-模型草稿.json`, {
       name: "未命名模型",
       subject: state.modelSubject,
-      mode: state.modelMode,
-      components: state.modelComponents
+      mode: state.modelSubject === "机器学习" ? "algorithm" : state.modelMode,
+      components: modelDraftComponents()
     });
   });
   document.getElementById("saveModelForm")?.addEventListener("submit", async (event) => {
@@ -3290,8 +3287,9 @@ function bindModelPage() {
     const form = new FormData(event.currentTarget);
     const name = String(form.get("name") || "").trim();
     if (!name) return showToast("请填写模型名称", "error");
-    if (!hasCanvasModel()) return showToast("请先在画布中添加模型", "error");
+    if (!hasModelDraft()) return showToast("请先在画布中添加模型或打开算法代码", "error");
     persistOpenModelCodeDraft();
+    const components = modelDraftComponents();
     try {
       const payload = await api("/api/models", {
         method: "POST",
@@ -3300,15 +3298,23 @@ function bindModelPage() {
           userId: state.user.id,
           name,
           subject: state.modelSubject,
-          mode: state.modelMode,
-          components: state.modelComponents,
+          mode: state.modelSubject === "机器学习" ? "algorithm" : state.modelMode,
+          components,
           notes: form.get("notes")
         }
       });
-      state.loadedModelId = payload.model.id;
+      if (state.modelSubject === "机器学习") {
+        state.modelComponents = [];
+        state.selectedComponentId = null;
+        state.loadedModelId = null;
+        state.modelRunResult = "";
+        resetModelCodeState();
+      } else {
+        state.loadedModelId = payload.model.id;
+      }
       await loadState();
       renderShell();
-      showToast("模型已保存");
+      showToast(state.modelSubject === "机器学习" ? "算法代码已保存，画布已清空" : "模型已保存");
     } catch (error) {
       showToast(error.message, "error");
     }
@@ -3319,7 +3325,7 @@ function bindModelPage() {
       if (!model) return;
       state.loadedModelId = model.id;
       state.modelSubject = model.subject;
-      state.modelMode = model.mode;
+      state.modelMode = model.subject === "机器学习" ? "algorithm" : model.mode;
       state.modelComponents = normalizeLoadedModelComponents(model);
       state.selectedComponentId = state.modelComponents[0]?.id || null;
       state.modelRunResult = state.modelComponents[0]?.props?.runResult || "";
