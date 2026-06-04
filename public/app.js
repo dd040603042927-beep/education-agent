@@ -26,6 +26,11 @@ const state = {
   homeworkModal: null,
   graphViews: {},
   graphNodeModal: null,
+  graphLayer: "overview",
+  graphFocusNodeId: null,
+  graphSelectedNodeId: null,
+  graphSearch: "",
+  graphRelationFilters: ["contains", "prerequisite", "misconception"],
   graphJob: null,
   graphJobTimer: null,
   graphDraft: {
@@ -49,13 +54,29 @@ const TREE_LINK_LABELS = new Set(["一级章节", "一级模块", "包含", "细
 const EDUCATION_RELATION_LABELS = {
   contains: "层级包含",
   prerequisite: "前置依赖",
+  dependency: "强依赖",
   misconception: "易混淆/迷思概念",
   "cross-link": "横向关联",
   assessment: "考察属性",
+  examines: "考查",
   resource: "教学资源",
+  review: "推荐复习",
   competency: "核心素养",
   semantic: "语义关联"
 };
+const GRAPH_LAYER_OPTIONS = [
+  { key: "overview", label: "课程总览" },
+  { key: "relation", label: "知识关系" },
+  { key: "diagnosis", label: "学习诊断" }
+];
+const GRAPH_RELATION_FILTERS = [
+  { key: "contains", label: "包含" },
+  { key: "prerequisite", label: "前置" },
+  { key: "misconception", label: "易混淆" },
+  { key: "exam", label: "考点" },
+  { key: "resource", label: "资料" },
+  { key: "review", label: "路径" }
+];
 
 const teacherMenus = [
   { key: "graph", icon: "📘", label: "导入书本生成图谱" },
@@ -942,10 +963,7 @@ function renderTeacherGraphPage() {
         <h3>最近生成的知识图谱</h3>
         <span>${graphs.length ? `${graphs.length} 个图谱` : "暂无图谱"}</span>
       </div>
-      <div class="graph-workspace">
-        <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock("还没有图谱，请先生成或导入。")}</div>
-        <div class="graph-canvas">${selected ? renderGraphViewer(selected) : emptyBlock("选择一个图谱后将在这里渲染。")}</div>
-      </div>
+      ${renderGraphLearningWorkspace(graphs, selected, "teacher")}
     </section>
     ${renderGraphNodeModal()}
   `;
@@ -963,12 +981,180 @@ function renderStudentGraphPage() {
       <label class="compact-label">学科<select id="studentGraphSubject">${subjectOptions(state.graphSubject)}</select></label>
     </div>
     <section class="panel">
-      <div class="graph-workspace">
-        <div class="graph-list">${graphs.map(graphCard).join("") || emptyBlock(`数据库中暂未找到「${escapeHtml(state.graphSubject)}」图谱。`)}</div>
-        <div class="graph-canvas">${selected ? renderGraphViewer(selected) : emptyBlock("请选择其他学科查看可用图谱。")}</div>
-      </div>
+      ${renderGraphLearningWorkspace(graphs, selected, "student")}
     </section>
     ${renderGraphNodeModal()}
+  `;
+}
+
+function renderGraphLearningWorkspace(graphs, selected, mode = "teacher") {
+  return `
+    <div class="graph-workspace graph-learning-workspace">
+      ${renderGraphControlPanel(graphs, selected, mode)}
+      <div class="graph-canvas">${selected ? renderGraphViewer(selected) : emptyBlock(mode === "student" ? "请选择其他学科查看可用图谱。" : "选择一个图谱后将在这里渲染。")}</div>
+      ${renderGraphDetailPanel(selected, mode)}
+    </div>
+  `;
+}
+
+function renderGraphControlPanel(graphs, graph, mode = "teacher") {
+  const filterSet = graphFilterSet();
+  const layer = state.graphLayer || "overview";
+  return `
+    <aside class="graph-control-panel">
+      <section class="graph-control-block">
+        <strong>三层图谱视图</strong>
+        <div class="graph-layer-tabs">
+          ${GRAPH_LAYER_OPTIONS.map((item) => `
+            <button type="button" class="${layer === item.key ? "active" : ""}" data-graph-layer="${item.key}">${item.label}</button>
+          `).join("")}
+        </div>
+      </section>
+      <section class="graph-control-block">
+        <strong>搜索定位</strong>
+        <form id="graphSearchForm" class="graph-search">
+          <input name="query" value="${escapeHtml(state.graphSearch || "")}" placeholder="输入知识点名称" />
+          <button class="mini" type="submit">定位</button>
+        </form>
+      </section>
+      <section class="graph-control-block">
+        <strong>关系筛选</strong>
+        <div class="graph-filter-list">
+          ${GRAPH_RELATION_FILTERS.map((item) => `
+            <label><input type="checkbox" data-graph-relation="${item.key}" ${filterSet.has(item.key) ? "checked" : ""} />${item.label}</label>
+          `).join("")}
+        </div>
+      </section>
+      <section class="graph-control-block">
+        <strong>课程章节树</strong>
+        ${graph ? renderGraphChapterTree(graph) : emptyBlock(mode === "student" ? `数据库中暂未找到「${escapeHtml(state.graphSubject)}」图谱。` : "还没有图谱，请先生成或导入。")}
+      </section>
+      <section class="graph-control-block">
+        <strong>图谱列表</strong>
+        <div class="graph-list compact">${graphs.map(graphCard).join("") || emptyBlock(mode === "student" ? `数据库中暂未找到「${escapeHtml(state.graphSubject)}」图谱。` : "还没有图谱，请先生成或导入。")}</div>
+      </section>
+    </aside>
+  `;
+}
+
+function renderGraphChapterTree(graph) {
+  const nodes = graph.nodes || [];
+  if (!nodes.length) return emptyBlock("当前图谱没有节点。");
+  const parents = graphParentMap(graph);
+  const children = graphChildrenMap(parents);
+  const root = nodes[0];
+  const chapters = nodes
+    .map((node, index) => ({ node, index }))
+    .filter((entry) => graphNodeLevel(entry.node, entry.index) <= 1)
+    .slice(0, 36);
+  const selectedId = state.graphFocusNodeId || state.graphSelectedNodeId || root?.id;
+  return `
+    <div class="chapter-tree">
+      ${chapters.map(({ node, index }) => {
+        const childCount = (children.get(node.id) || []).length;
+        return `
+          <button type="button" class="chapter-tree-item level-${graphNodeLevel(node, index)} ${selectedId === node.id ? "active" : ""}" data-graph-focus-node="${node.id}">
+            <span>${escapeHtml(node.label)}</span>
+            <small>${childCount ? `${childCount} 个下级` : graphNodeLevel(node, index) === 0 ? "课程根" : "末级"}</small>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderGraphDetailPanel(graph, mode = "teacher") {
+  if (!graph) {
+    return `<aside class="graph-detail-panel">${emptyBlock("选择图谱后显示节点详情。")}</aside>`;
+  }
+  const node = graphSelectedNode(graph);
+  if (!node) return `<aside class="graph-detail-panel">${emptyBlock("当前图谱没有可查看的节点。")}</aside>`;
+  const context = graphNodeContext(graph, node);
+  const learningPath = graphShortestLearningPath(graph, node, context);
+  const weaknesses = graphWeaknessAttribution(graph, node);
+  const localSubgraph = graphLocalSubgraphSummary(graph, node, context);
+  const points = enrichedNodePoints(graph, node, context).slice(0, 5);
+  const learner = node.learnerState || {};
+  const mastery = Number(learner.mastery);
+  const masteryWidth = Number.isFinite(mastery) ? clamp(mastery, 0, 1) * 100 : 0;
+  const resources = Array.isArray(node.resources) ? node.resources : [];
+  const prerequisiteLabels = context.incoming
+    .filter(isPrerequisiteLink)
+    .map((link) => (graph.nodes || []).find((item) => item.id === link.source)?.label || link.source)
+    .slice(0, 6);
+  const nextLabels = context.children.map((item) => item.label).slice(0, 6);
+  const sourceText = resources.length
+    ? resources.slice(0, 3).map((item) => `${resourceTypeLabel(item.type)}：${item.title || "课程资料"}`).join("；")
+    : `${graph.title} · ${node.ontology?.layer || "课程图谱节点"}`;
+  return `
+    <aside class="graph-detail-panel">
+      <div class="detail-head">
+        <span>${mode === "student" ? "学生视图" : "教师视图"}</span>
+        <h3>${escapeHtml(node.label)}</h3>
+        <p>${escapeHtml((context.path || []).map((item) => item.label).join(" / ") || graph.title)}</p>
+      </div>
+      <div class="node-chip-row">
+        <span class="node-chip">${escapeHtml(node.ontology?.layer || "知识点")}</span>
+        <span class="node-chip">${escapeHtml(node.cognitive?.bloom || "理解")}</span>
+        <span class="node-chip ${graphNodeHasWeakness(node) ? "" : "strong"}">${escapeHtml(learner.status || "待诊断")} ${percentText(learner.mastery)}</span>
+      </div>
+      <section class="detail-card">
+        <strong>掌握度与诊断</strong>
+        <div class="mastery-meter"><span style="width:${masteryWidth}%"></span></div>
+        <p>${escapeHtml(learner.evidence || (mode === "student" ? "根据提问、练习和错题记录更新掌握情况。" : "教师可结合班级错题和问答记录查看薄弱点。"))}</p>
+      </section>
+      <section class="detail-card">
+        <strong>前置 / 后续</strong>
+        <p>前置：${escapeHtml(prerequisiteLabels.length ? prerequisiteLabels.join("、") : context.parent?.label || "暂无明确前置")}</p>
+        <p>后续：${escapeHtml(nextLabels.length ? nextLabels.join("、") : "暂无下级节点，可生成练习巩固。")}</p>
+      </section>
+      <section class="detail-card">
+        <strong>课程资料引用</strong>
+        <p>${escapeHtml(sourceText)}</p>
+      </section>
+      <section class="detail-card">
+        <strong>常见错误</strong>
+        <p>${escapeHtml(node.misconception || "注意区分概念边界、适用条件和相邻知识点的关系。")}</p>
+      </section>
+      <section class="detail-card">
+        <strong>推荐学习路径</strong>
+        <p>${escapeHtml(learningPath.join(" → ") || node.label)}</p>
+      </section>
+      <section class="detail-card">
+        <strong>薄弱点追溯</strong>
+        <p>${escapeHtml(weaknesses.map((item) => `${item.label}（${percentText(item.mastery)}）`).join("；") || "暂无薄弱点记录。")}</p>
+      </section>
+      <section class="detail-card">
+        <strong>GraphRAG 局部子图</strong>
+        <p>节点：${escapeHtml(localSubgraph.nodes.join("、") || node.label)}</p>
+        <p>关系：${escapeHtml(localSubgraph.relations.join("、") || "层级包含")}</p>
+      </section>
+      <section class="detail-card">
+        <strong>知识点解释</strong>
+        ${points.map((point) => `<p>${escapeHtml(point)}</p>`).join("")}
+      </section>
+      <div class="detail-actions">
+        <button class="mini" type="button" data-graph-node-action="explain">讲解</button>
+        <button class="mini" type="button" data-graph-node-action="exercise">出题</button>
+        <button class="mini" type="button" data-graph-node-action="path">学习路径</button>
+        <button class="mini" type="button" data-graph-node-action="compare">对比</button>
+      </div>
+      ${renderGraphLegend()}
+    </aside>
+  `;
+}
+
+function renderGraphLegend() {
+  return `
+    <section class="graph-legend">
+      <strong>图例</strong>
+      <div><span class="legend-dot concept"></span>概念</div>
+      <div><span class="legend-dot method"></span>方法/算法</div>
+      <div><span class="legend-dot formula"></span>公式</div>
+      <div><span class="legend-dot misconception"></span>易错点</div>
+      <div><span class="legend-line prerequisite"></span>前置依赖</div>
+      <div><span class="legend-line misconception"></span>易混淆</div>
+    </section>
   `;
 }
 
@@ -1011,6 +1197,240 @@ function graphGroupClass(group) {
 function educationRelationLabel(link) {
   const type = String(link?.type || "");
   return link?.typeLabel || EDUCATION_RELATION_LABELS[type] || EDUCATION_RELATION_LABELS.semantic;
+}
+
+function graphSafeDomId(value) {
+  return String(value || "graph").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function graphRelationKey(link) {
+  if (isTreeLink(link)) return "contains";
+  const type = String(link?.type || "").toLowerCase();
+  const label = String(link?.label || link?.relation || link?.typeLabel || "");
+  if (type.includes("prerequisite") || /前置|递进|支撑|先学|基础/.test(label)) return "prerequisite";
+  if (type.includes("dependency") || /依赖|强依赖/.test(label)) return "dependency";
+  if (type.includes("misconception") || /易混|迷思|混淆|误区/.test(label)) return "misconception";
+  if (type.includes("assessment") || type.includes("exam") || /考点|考查|题型|题目/.test(label)) return "exam";
+  if (type.includes("resource") || /资料|来源|引用|课件|教材/.test(label)) return "resource";
+  if (type.includes("review") || /复习|推荐|路径/.test(label)) return "review";
+  if (type.includes("cross")) return "cross-link";
+  return type || "semantic";
+}
+
+function graphRelationClass(link) {
+  return graphRelationKey(link).replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+function graphFilterSet() {
+  const filters = Array.isArray(state.graphRelationFilters) ? state.graphRelationFilters : [];
+  return new Set(filters.length ? filters : ["contains", "prerequisite"]);
+}
+
+function graphRelationAllowed(link, layer = state.graphLayer) {
+  const key = graphRelationKey(link);
+  if (layer === "overview") return key === "contains" || key === "prerequisite";
+  if (layer === "diagnosis") return ["contains", "prerequisite", "review", "exam", "misconception"].includes(key);
+  const filters = graphFilterSet();
+  if (key === "dependency") return filters.has("prerequisite");
+  if (key === "assessment" || key === "examines") return filters.has("exam");
+  return filters.has(key) || key === "contains";
+}
+
+function graphNodeVisualClass(node, index = 0) {
+  if (index === 0 || node?.group === "root") return "root";
+  if (node?.group === "chapter") return "chapter";
+  const type = String(node?.ontology?.type || node?.type || node?.group || "").toLowerCase();
+  const label = String(node?.label || "");
+  if (/formula|公式/.test(type) || /公式/.test(label)) return "formula";
+  if (/question|exercise|problem|exam|题/.test(type) || /题|练习|测试/.test(label)) return "question";
+  if (/resource|source|document|资料|来源/.test(type)) return "resource";
+  if (/misconception|mistake|易错|混淆/.test(type) || /易错|混淆|误区/.test(label)) return "misconception";
+  if (/method|algorithm|方法|算法/.test(type) || /算法|方法|流程/.test(label)) return "method";
+  if (node?.group === "concept") return "concept";
+  return graphGroupClass(node?.group);
+}
+
+function graphNodeImportanceScore(node, index = 0) {
+  const level = graphNodeLevel(node, index);
+  const frequency = String(node?.assessment?.examFrequency || "");
+  const frequencyScore = frequency.includes("高") ? 16 : frequency.includes("中") ? 9 : frequency.includes("低") ? 3 : 0;
+  const importance = Number(node?.importance ?? node?.assessment?.importance ?? node?.learnerState?.weight);
+  const childCount = Number(node?.childCount || 0);
+  return (4 - Math.min(level, 3)) * 18 + (Number.isFinite(importance) ? importance * 4 : 0) + frequencyScore + childCount;
+}
+
+function graphNodeHasWeakness(node) {
+  const status = String(node?.learnerState?.status || "");
+  const mastery = Number(node?.learnerState?.mastery);
+  return status.includes("未") || status.includes("薄弱") || (Number.isFinite(mastery) && mastery < 0.45);
+}
+
+function graphNodeBadges(node) {
+  const badges = [];
+  if ((node?.resources || []).length || Number(node?.sourceCount || 0) > 0) badges.push("文");
+  if (Number(node?.questionCount || node?.assessment?.questionCount || 0) > 0 || /题|练习/.test(String(node?.label || ""))) badges.push("题");
+  if (Number(node?.mistakeCount || node?.assessment?.mistakeCount || 0) > 0 || graphNodeHasWeakness(node)) badges.push("错");
+  return badges.slice(0, 3);
+}
+
+function graphTextMatchesNode(node, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return false;
+  const haystack = [
+    node?.label,
+    node?.details,
+    node?.ontology?.layer,
+    node?.ontology?.type,
+    node?.misconception,
+    ...(Array.isArray(node?.knowledgePoints) ? node.knowledgePoints : [])
+  ].join(" ").toLowerCase();
+  return haystack.includes(q);
+}
+
+function graphAddAncestors(ids, nodeId, parents) {
+  let current = nodeId;
+  const guard = new Set();
+  while (current && !guard.has(current)) {
+    guard.add(current);
+    ids.add(current);
+    current = parents.get(current);
+  }
+}
+
+function graphAddChildren(ids, nodeId, children, limit = 24) {
+  (children.get(nodeId) || []).slice(0, limit).forEach((id) => ids.add(id));
+}
+
+function graphAddNeighbors(ids, graph, nodeId, limit = 48) {
+  let count = 0;
+  (graph.links || []).forEach((link) => {
+    if (count >= limit || !graphRelationAllowed(link, state.graphLayer)) return;
+    if (link.source === nodeId) {
+      ids.add(link.target);
+      count += 1;
+    } else if (link.target === nodeId) {
+      ids.add(link.source);
+      count += 1;
+    }
+  });
+}
+
+function graphSelectedNode(graph) {
+  const nodes = graph?.nodes || [];
+  return nodes.find((node) => node.id === state.graphSelectedNodeId)
+    || nodes.find((node) => node.id === state.graphFocusNodeId)
+    || nodes[0]
+    || null;
+}
+
+function graphVisibleSubgraph(graph) {
+  const nodes = graph.nodes || [];
+  const links = graph.links || [];
+  if (!nodes.length) return { nodes: [], links: [], hiddenNodes: 0, hiddenLinks: 0 };
+  const nodesById = new Map(nodes.map((node, index) => [node.id, { node, index }]));
+  const parents = graphParentMap(graph);
+  const children = graphChildrenMap(parents);
+  const ids = new Set();
+  const layer = state.graphLayer || "overview";
+  const query = String(state.graphSearch || "").trim();
+  const validFocus = nodesById.has(state.graphFocusNodeId) ? state.graphFocusNodeId : null;
+  const validSelected = nodesById.has(state.graphSelectedNodeId) ? state.graphSelectedNodeId : null;
+  const focusId = validFocus || validSelected;
+
+  if (query) {
+    nodes.forEach((node) => {
+      if (!graphTextMatchesNode(node, query)) return;
+      graphAddAncestors(ids, node.id, parents);
+      graphAddChildren(ids, node.id, children, 18);
+      graphAddNeighbors(ids, graph, node.id, 28);
+    });
+  }
+
+  if (!ids.size && layer === "relation" && focusId) {
+    graphAddAncestors(ids, focusId, parents);
+    graphAddChildren(ids, focusId, children, 46);
+    graphAddNeighbors(ids, graph, focusId, 54);
+  }
+
+  if (!ids.size && layer === "diagnosis") {
+    nodes.forEach((node, index) => {
+      if (index === 0 || graphNodeLevel(node, index) <= 1 || graphNodeHasWeakness(node)) ids.add(node.id);
+    });
+    if (focusId) {
+      graphAddAncestors(ids, focusId, parents);
+      graphAddNeighbors(ids, graph, focusId, 32);
+    }
+  }
+
+  if (!ids.size) {
+    nodes
+      .map((node, index) => ({ node, index, score: graphNodeImportanceScore(node, index) }))
+      .filter((entry) => graphNodeLevel(entry.node, entry.index) <= 2)
+      .sort((a, b) => graphNodeLevel(a.node, a.index) - graphNodeLevel(b.node, b.index) || b.score - a.score)
+      .slice(0, 80)
+      .forEach((entry) => ids.add(entry.node.id));
+  }
+
+  if (!ids.size && nodes[0]) ids.add(nodes[0].id);
+
+  const limit = layer === "relation" ? 120 : layer === "diagnosis" ? 100 : 80;
+  let visibleNodes = nodes.filter((node) => ids.has(node.id));
+  if (visibleNodes.length > limit) {
+    const protectedIds = new Set([nodes[0]?.id, focusId, validSelected].filter(Boolean));
+    visibleNodes = visibleNodes
+      .map((node) => ({ node, entry: nodesById.get(node.id) }))
+      .sort((a, b) => {
+        const protectedDelta = Number(protectedIds.has(b.node.id)) - Number(protectedIds.has(a.node.id));
+        if (protectedDelta) return protectedDelta;
+        return graphNodeLevel(a.node, a.entry?.index || 0) - graphNodeLevel(b.node, b.entry?.index || 0)
+          || graphNodeImportanceScore(b.node, b.entry?.index || 0) - graphNodeImportanceScore(a.node, a.entry?.index || 0);
+      })
+      .slice(0, limit)
+      .map((entry) => entry.node);
+  }
+  const visibleIds = new Set(visibleNodes.map((node) => node.id));
+  let visibleLinks = links.filter((link) => visibleIds.has(link.source) && visibleIds.has(link.target) && graphRelationAllowed(link, layer));
+  const linkLimit = layer === "overview" ? 120 : 180;
+  if (visibleLinks.length > linkLimit) {
+    visibleLinks = visibleLinks
+      .map((link) => ({ link, score: (isTreeLink(link) ? 30 : 0) + Number(link.weight || 0) * 10 }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, linkLimit)
+      .map((entry) => entry.link);
+  }
+  return {
+    nodes: visibleNodes,
+    links: visibleLinks,
+    hiddenNodes: Math.max(0, nodes.length - visibleNodes.length),
+    hiddenLinks: Math.max(0, links.length - visibleLinks.length)
+  };
+}
+
+function graphDisplayGraph(graph) {
+  const visible = graphVisibleSubgraph(graph);
+  return {
+    ...graph,
+    nodes: visible.nodes,
+    links: visible.links,
+    meta: {
+      ...(graph.meta || {}),
+      visibleStats: {
+        nodes: visible.nodes.length,
+        links: visible.links.length,
+        hiddenNodes: visible.hiddenNodes,
+        hiddenLinks: visible.hiddenLinks,
+        totalNodes: (graph.nodes || []).length,
+        totalLinks: (graph.links || []).length
+      }
+    }
+  };
+}
+
+function graphZoomClass(graphId) {
+  const scale = Number(state.graphViews?.[graphId]?.scale || 1);
+  if (scale < 0.7) return "zoom-global";
+  if (scale < 1.15) return "zoom-mid";
+  return "zoom-local";
 }
 
 function graphMasteryClass(node) {
@@ -1478,13 +1898,15 @@ function getGraphView(graph) {
 }
 
 function renderGraphViewer(graph) {
+  const displayGraph = graphDisplayGraph(graph);
+  const stats = displayGraph.meta?.visibleStats || {};
   return `
     <div class="graph-viewer" data-graph-viewer="${graph.id}">
       <div class="graph-toolbar">
         <button class="mini" data-graph-zoom="out">缩小</button>
         <button class="mini" data-graph-zoom="reset">重置</button>
         <button class="mini" data-graph-zoom="in">放大</button>
-        <span>拖拽空白区域移动图谱，拖拽节点会带动相连节点，双击节点查看知识点</span>
+        <span>${stats.nodes || 0}/${stats.totalNodes || 0} 节点 · ${stats.links || 0}/${stats.totalLinks || 0} 关系 · 双击节点展开邻域</span>
       </div>
       ${renderGraphSvg(graph)}
     </div>
@@ -1492,19 +1914,22 @@ function renderGraphViewer(graph) {
 }
 
 function renderGraphSvg(graph) {
-  const size = graphCanvasSize(graph);
+  const displayGraph = graphDisplayGraph(graph);
+  const size = graphCanvasSize(displayGraph);
   const width = size.width;
   const height = size.height;
-  const links = graph.links || [];
-  const nodes = graph.nodes || [];
-  const view = getGraphView(graph);
+  const links = displayGraph.links || [];
+  const nodes = displayGraph.nodes || [];
+  const view = getGraphView(displayGraph);
   const positions = view.positions;
   const nodeEntriesById = new Map(nodes.map((node, index) => [node.id, { node, index }]));
   const renderedLinks = links
     .map((link, index) => ({ link, index }))
     .sort((a, b) => Number(!isTreeLink(a.link)) - Number(!isTreeLink(b.link)));
+  const safeId = graphSafeDomId(graph.id);
+  const arrowId = `arrow-${safeId}`;
   return `
-    <svg class="graph-svg network" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" style="height:${size.pixelHeight}px; min-height:${size.pixelHeight}px" role="img" aria-label="${escapeHtml(graph.title)}">
+    <svg class="graph-svg network ${graphZoomClass(graph.id)}" data-graph-id="${graph.id}" viewBox="0 0 ${width} ${height}" style="height:${size.pixelHeight}px; min-height:${size.pixelHeight}px" role="img" aria-label="${escapeHtml(graph.title)}">
       <defs>
         <linearGradient id="nodeGrad" x1="0%" x2="100%">
           <stop offset="0%" stop-color="#247db2"></stop>
@@ -1513,6 +1938,9 @@ function renderGraphSvg(graph) {
         <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
           <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#13506f" flood-opacity="0.16"></feDropShadow>
         </filter>
+        <marker id="${arrowId}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#2b84b8"></path>
+        </marker>
       </defs>
       <g class="graph-viewport" transform="translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})">
         ${renderedLinks.map(({ link, index }) => {
@@ -1523,9 +1951,11 @@ function renderGraphSvg(graph) {
           const targetEntry = nodeEntriesById.get(link.target);
           const treeLink = isTreeLink(link);
           const linkPath = graphNetworkLinkPath(s, t, link, index, sourceEntry?.node, targetEntry?.node, nodes.length);
+          const relationClass = graphRelationClass(link);
+          const marker = ["prerequisite", "dependency", "review"].includes(graphRelationKey(link)) ? `marker-end="url(#${arrowId})"` : "";
           return `
-            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link halo ${treeLink ? "tree" : "cross"}"></path>
-            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link ${treeLink ? "tree" : "cross"}"></path>
+            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link halo ${treeLink ? "tree" : "cross"} relation-${relationClass}"></path>
+            <path data-link-index="${index}" data-link-source="${link.source}" data-link-target="${link.target}" d="${linkPath}" class="graph-link ${treeLink ? "tree" : "cross"} relation-${relationClass}" ${marker}></path>
           `;
         }).join("")}
         ${nodes.map((node, index) => {
@@ -1533,13 +1963,16 @@ function renderGraphSvg(graph) {
           const root = index === 0 || node.group === "root";
           const level = graphNodeLevel(node, index);
           const radius = size.complex ? graphNetworkRadius(node, index, nodes.length) : graphNodeRadius(node, index);
-          const groupClass = graphGroupClass(node.group);
+          const groupClass = graphNodeVisualClass(node, index);
           const masteryClass = graphMasteryClass(node);
+          const selected = state.graphSelectedNodeId === node.id ? "selected" : "";
+          const focused = state.graphFocusNodeId === node.id ? "focused" : "";
           const label = String(node.label || "");
           const labelLines = graphInnerLabelLines(label, radius, root);
           const lineHeight = root ? 18 : radius >= 58 ? 16 : radius >= 46 ? 14 : 13;
+          const badges = graphNodeBadges(node);
           return `
-            <g class="graph-node level-${level} ${groupClass} ${masteryClass}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
+            <g class="graph-node level-${level} ${groupClass} ${masteryClass} ${selected} ${focused}" data-node-id="${node.id}" transform="translate(${p.x},${p.y})" ${size.complex ? "" : `filter="url(#softShadow)"`}>
               <title>${escapeHtml(label)}</title>
               <circle r="${radius + 7}" class="mastery-ring"></circle>
               <circle r="${radius}" class="${root ? "root" : groupClass}"></circle>
@@ -1547,6 +1980,12 @@ function renderGraphSvg(graph) {
                 const labelY = (lineIndex - (labelLines.length - 1) / 2) * lineHeight;
                 return `<text x="0" y="${labelY}" class="inside label-center ${root ? "root" : ""}">${escapeHtml(line)}</text>`;
               }).join("")}
+              ${badges.map((badge, badgeIndex) => `
+                <g class="node-badge" transform="translate(${radius - 4},${-radius + 10 + badgeIndex * 17})">
+                  <circle r="8"></circle>
+                  <text x="0" y="0">${escapeHtml(badge)}</text>
+                </g>
+              `).join("")}
             </g>
           `;
         }).join("")}
@@ -1558,7 +1997,7 @@ function renderGraphSvg(graph) {
           const treeLink = isTreeLink(link);
           const labelPoint = graphLinkLabelPoint(s, t, index, treeLink);
           const visibleLabel = graphVisibleLinkLabel(label);
-          return `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${labelPoint.x}" y="${labelPoint.y}" class="graph-link-label ${treeLink ? "tree" : "cross"}">${escapeHtml(visibleLabel)}</text>`;
+          return `<text data-link-label="${index}" data-link-source="${link.source}" data-link-target="${link.target}" x="${labelPoint.x}" y="${labelPoint.y}" class="graph-link-label ${treeLink ? "tree" : "cross"} relation-${graphRelationClass(link)}">${escapeHtml(visibleLabel)}</text>`;
         }).join("")}
       </g>
     </svg>
@@ -1691,13 +2130,17 @@ function applyGraphTransform(svg, graphId) {
   const view = state.graphViews[graphId];
   const viewport = svg.querySelector(".graph-viewport");
   if (view && viewport) viewport.setAttribute("transform", `translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})`);
+  svg.classList.remove("zoom-global", "zoom-mid", "zoom-local");
+  svg.classList.add(graphZoomClass(graphId));
 }
 
 function updateGraphDom(svg, graphId) {
   const view = state.graphViews[graphId];
   if (!view) return;
   const graph = state.data?.knowledgeGraphs?.find((item) => item.id === graphId);
-  const graphNodes = graph?.nodes || [];
+  const displayGraph = graph ? graphDisplayGraph(graph) : null;
+  const graphNodes = displayGraph?.nodes || [];
+  const graphLinks = displayGraph?.links || [];
   const nodeEntriesById = new Map(graphNodes.map((node, index) => [node.id, { node, index }]));
   svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
     const position = view.positions[nodeEl.dataset.nodeId];
@@ -1708,7 +2151,7 @@ function updateGraphDom(svg, graphId) {
     const target = view.positions[line.dataset.linkTarget];
     if (!source || !target) return;
     const index = Number(line.dataset.linkIndex || 0);
-    const link = graph?.links?.[index] || { label: line.dataset.linkLabel || "" };
+    const link = graphLinks[index] || { label: line.dataset.linkLabel || "" };
     const sourceEntry = nodeEntriesById.get(line.dataset.linkSource);
     const targetEntry = nodeEntriesById.get(line.dataset.linkTarget);
     line.setAttribute("d", graphNetworkLinkPath(source, target, link, index, sourceEntry?.node, targetEntry?.node, graphNodes.length));
@@ -1718,7 +2161,7 @@ function updateGraphDom(svg, graphId) {
     const target = view.positions[label.dataset.linkTarget];
     if (!source || !target) return;
     const index = Number(label.dataset.linkLabel || 0);
-    const link = graph?.links?.[index] || {};
+    const link = graphLinks[index] || {};
     const point = graphLinkLabelPoint(source, target, index, isTreeLink(link));
     label.setAttribute("x", point.x);
     label.setAttribute("y", point.y);
@@ -1982,8 +2425,9 @@ function bindInteractiveGraph() {
   const graphId = svg.dataset.graphId;
   const graph = state.data.knowledgeGraphs.find((item) => item.id === graphId);
   if (!graph) return;
-  const size = graphCanvasSize(graph);
-  getGraphView(graph);
+  const displayGraph = graphDisplayGraph(graph);
+  const size = graphCanvasSize(displayGraph);
+  getGraphView(displayGraph);
 
   document.querySelectorAll("[data-graph-zoom]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1996,7 +2440,7 @@ function bindInteractiveGraph() {
         view.offsetX = offset.x;
         view.offsetY = offset.y;
         view.positions = {};
-        getGraphView(graph);
+        getGraphView(displayGraph);
         updateGraphDom(svg, graphId);
       }
       applyGraphTransform(svg, graphId);
@@ -2012,10 +2456,23 @@ function bindInteractiveGraph() {
 
   let dragged = null;
   let panning = null;
+  let nodeClickTimer = null;
   svg.querySelectorAll(".graph-node").forEach((nodeEl) => {
+    nodeEl.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (nodeClickTimer) clearTimeout(nodeClickTimer);
+      if (event.detail > 1) return;
+      nodeClickTimer = setTimeout(() => {
+        state.graphSelectedNodeId = nodeEl.dataset.nodeId;
+        renderContent();
+      }, 180);
+    });
     nodeEl.addEventListener("dblclick", (event) => {
       event.stopPropagation();
-      state.graphNodeModal = { graphId, nodeId: nodeEl.dataset.nodeId };
+      if (nodeClickTimer) clearTimeout(nodeClickTimer);
+      state.graphSelectedNodeId = nodeEl.dataset.nodeId;
+      state.graphFocusNodeId = nodeEl.dataset.nodeId;
+      state.graphLayer = "relation";
       renderContent();
     });
     nodeEl.addEventListener("pointerdown", (event) => {
@@ -2092,7 +2549,7 @@ function bindInteractiveGraph() {
         y: clamp(item.startY + dy * item.weight, padding, size.height - padding)
       };
     });
-    relaxGraphViewPositions(graph, view, size, { fixedIds: [dragged.nodeId], iterations: 2 });
+    relaxGraphViewPositions(displayGraph, view, size, { fixedIds: [dragged.nodeId], iterations: 2 });
     updateGraphDom(svg, graphId);
   });
 
@@ -2103,7 +2560,7 @@ function bindInteractiveGraph() {
     }
     if (!dragged) return;
     const view = state.graphViews[graphId];
-    relaxGraphViewPositions(graph, view, size, { fixedIds: [dragged.nodeId], iterations: 14 });
+    relaxGraphViewPositions(displayGraph, view, size, { fixedIds: [dragged.nodeId], iterations: 14 });
     updateGraphDom(svg, graphId);
     svg.querySelector(`[data-node-id="${CSS.escape(dragged.nodeId)}"]`)?.classList.remove("dragging");
     dragged = null;
@@ -2336,9 +2793,68 @@ function bindGraphPage() {
     renderContent();
   });
 
+  const currentGraph = state.data.knowledgeGraphs.find((item) => item.id === state.selectedGraphId)
+    || graphListForCurrentRole()[0];
+
+  document.querySelectorAll("[data-graph-layer]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.graphLayer = button.dataset.graphLayer || "overview";
+      renderContent();
+    });
+  });
+
+  document.getElementById("graphSearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = String(new FormData(event.currentTarget).get("query") || "").trim();
+    state.graphSearch = query;
+    if (currentGraph && query) {
+      const match = (currentGraph.nodes || []).find((node) => graphTextMatchesNode(node, query));
+      if (match) {
+        state.graphSelectedNodeId = match.id;
+        state.graphFocusNodeId = match.id;
+        state.graphLayer = "relation";
+      } else {
+        showToast("未找到匹配知识点", "error");
+      }
+    }
+    renderContent();
+  });
+
+  document.querySelectorAll("[data-graph-relation]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      state.graphRelationFilters = Array.from(document.querySelectorAll("[data-graph-relation]:checked"))
+        .map((item) => item.dataset.graphRelation);
+      renderContent();
+    });
+  });
+
+  document.querySelectorAll("[data-graph-focus-node]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.graphFocusNodeId = button.dataset.graphFocusNode;
+      state.graphSelectedNodeId = button.dataset.graphFocusNode;
+      state.graphLayer = "relation";
+      renderContent();
+    });
+  });
+
+  document.querySelectorAll("[data-graph-node-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const actionText = {
+        explain: "已定位知识点，可在教学指导中生成分层讲解。",
+        exercise: "已定位知识点，可基于当前子图生成练习题。",
+        path: "已根据前置关系生成推荐学习路径。",
+        compare: "请选择另一个易混淆节点后生成对比讲解。"
+      }[button.dataset.graphNodeAction] || "已记录当前知识点操作。";
+      showToast(actionText);
+    });
+  });
+
   document.querySelectorAll("[data-select-graph]").forEach((card) => {
     card.addEventListener("click", () => {
       state.selectedGraphId = card.dataset.selectGraph;
+      state.graphFocusNodeId = null;
+      state.graphSelectedNodeId = null;
+      state.graphSearch = "";
       renderContent();
     });
     card.addEventListener("dblclick", () => {
@@ -2361,6 +2877,8 @@ function bindGraphPage() {
       try {
         await api(`/api/graphs/${button.dataset.deleteGraph}?userId=${state.user.id}`, { method: "DELETE" });
         state.selectedGraphId = null;
+        state.graphFocusNodeId = null;
+        state.graphSelectedNodeId = null;
         await loadState();
         renderShell();
         showToast("图谱已删除");
@@ -2387,6 +2905,9 @@ function bindGraphPage() {
   document.getElementById("studentGraphSubject")?.addEventListener("change", (event) => {
     state.graphSubject = event.target.value;
     state.selectedGraphId = null;
+    state.graphFocusNodeId = null;
+    state.graphSelectedNodeId = null;
+    state.graphSearch = "";
     renderContent();
   });
 

@@ -658,6 +658,213 @@ p {
   align-items: stretch;
 }
 
+.graph-learning-workspace {
+  grid-template-columns: 320px minmax(0, 1fr) 340px;
+}
+
+.graph-control-panel,
+.graph-detail-panel {
+  min-height: 700px;
+  max-height: 760px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+}
+
+.graph-control-block,
+.detail-card,
+.graph-legend {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.graph-control-block > strong,
+.detail-card > strong,
+.graph-legend > strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.graph-layer-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.graph-layer-tabs button {
+  min-height: 34px;
+  padding: 7px 8px;
+  border-radius: var(--radius);
+  background: #eef5f8;
+  color: #24556f;
+  font-weight: 800;
+}
+
+.graph-layer-tabs button.active {
+  background: var(--primary);
+  color: #fff;
+}
+
+.graph-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.graph-filter-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.graph-filter-list label {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.graph-filter-list input {
+  width: auto;
+}
+
+.chapter-tree {
+  display: grid;
+  gap: 8px;
+}
+
+.chapter-tree-item {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+  color: var(--text);
+  text-align: left;
+}
+
+.chapter-tree-item.level-0 {
+  background: #e8f4f8;
+  border-color: #c8e3ee;
+  font-weight: 900;
+}
+
+.chapter-tree-item.active {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(32, 125, 168, 0.12);
+}
+
+.chapter-tree-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 800;
+}
+
+.chapter-tree-item small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.graph-list.compact {
+  max-height: 310px;
+  overflow: auto;
+}
+
+.graph-list.compact .list-card {
+  padding: 12px;
+}
+
+.detail-head {
+  display: grid;
+  gap: 6px;
+}
+
+.detail-head span {
+  width: fit-content;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #e7f3f5;
+  color: var(--primary-strong);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.detail-head h3 {
+  font-size: 20px;
+}
+
+.detail-head p,
+.detail-card p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.detail-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.graph-legend {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+}
+
+.graph-legend strong {
+  grid-column: 1 / -1;
+}
+
+.graph-legend div {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-dot.concept { background: #2f88c8; }
+.legend-dot.method { background: #4fb879; }
+.legend-dot.formula { background: #7d5bc4; }
+.legend-dot.misconception { background: #df8b3d; }
+
+.legend-line {
+  width: 24px;
+  height: 0;
+  border-top: 3px solid #2b84b8;
+  display: inline-block;
+}
+
+.legend-line.misconception {
+  border-top-style: dashed;
+  border-color: #df8b3d;
+}
+
 .progress-card {
   display: grid;
   gap: 10px;
@@ -846,6 +1053,37 @@ p {
   opacity: 0.7;
 }
 
+.graph-link.relation-prerequisite:not(.halo),
+.graph-link.relation-dependency:not(.halo) {
+  stroke: #1f7aa8;
+  stroke-width: 2.4;
+  opacity: 0.86;
+}
+
+.graph-link.relation-misconception:not(.halo) {
+  stroke: #df8b3d;
+  stroke-dasharray: 7 7;
+  opacity: 0.86;
+}
+
+.graph-link.relation-exam:not(.halo),
+.graph-link.relation-assessment:not(.halo),
+.graph-link.relation-examines:not(.halo) {
+  stroke: #7d5bc4;
+  stroke-dasharray: 2 6;
+  stroke-width: 2.2;
+}
+
+.graph-link.relation-resource:not(.halo) {
+  stroke: #4fb879;
+  stroke-dasharray: 10 5;
+}
+
+.graph-link.relation-review:not(.halo) {
+  stroke: #1f9aaa;
+  stroke-width: 2.8;
+}
+
 .graph-link.halo {
   stroke: #ffffff;
   stroke-width: 7;
@@ -873,6 +1111,16 @@ p {
 .graph-link-label.cross {
   fill: #1f638c;
   font-size: 12px;
+}
+
+.graph-link-label.relation-misconception {
+  fill: #a85b23;
+}
+
+.graph-link-label.relation-exam,
+.graph-link-label.relation-assessment,
+.graph-link-label.relation-examines {
+  fill: #6650a3;
 }
 
 .graph-node circle {
@@ -922,6 +1170,36 @@ p {
   stroke: #ffffff;
 }
 
+.graph-node circle.method,
+.graph-node rect.method {
+  fill: #4fb879;
+  stroke: #ffffff;
+}
+
+.graph-node circle.formula,
+.graph-node rect.formula {
+  fill: #7d5bc4;
+  stroke: #ffffff;
+}
+
+.graph-node circle.question,
+.graph-node rect.question {
+  fill: #1f9aaa;
+  stroke: #ffffff;
+}
+
+.graph-node circle.resource,
+.graph-node rect.resource {
+  fill: #5d7890;
+  stroke: #ffffff;
+}
+
+.graph-node circle.misconception,
+.graph-node rect.misconception {
+  fill: #df8b3d;
+  stroke: #ffffff;
+}
+
 .graph-node circle.topic,
 .graph-node rect.topic {
   fill: #2f88c8;
@@ -944,6 +1222,17 @@ p {
 
 .graph-node.dragging {
   cursor: grabbing;
+}
+
+.graph-node.selected circle:not(.mastery-ring),
+.graph-node.focused circle:not(.mastery-ring) {
+  stroke: #154a67;
+  stroke-width: 4.5px;
+}
+
+.graph-node.focused circle.mastery-ring {
+  stroke: #1f9aaa;
+  stroke-width: 8px;
 }
 
 .graph-node circle.root {
@@ -1023,6 +1312,38 @@ p {
 
 .graph-node text.count.root {
   fill: rgba(255, 255, 255, 0.86);
+}
+
+.node-badge circle {
+  fill: #ffffff;
+  stroke: #174f72;
+  stroke-width: 1.5px;
+}
+
+.node-badge text {
+  fill: #174f72;
+  font-size: 10px;
+  font-weight: 900;
+  stroke: none;
+}
+
+.graph-svg.zoom-global .graph-link-label,
+.graph-svg.zoom-global .graph-node.level-3,
+.graph-svg.zoom-global .node-badge {
+  display: none;
+}
+
+.graph-svg.zoom-global .graph-node.level-2 text {
+  display: none;
+}
+
+.graph-svg.zoom-mid .graph-link-label.cross,
+.graph-svg.zoom-mid .graph-link.relation-semantic:not(.halo) {
+  display: none;
+}
+
+.graph-svg.zoom-mid .graph-node.level-3 text {
+  display: none;
 }
 
 .graph-node-modal {
