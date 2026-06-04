@@ -5,7 +5,9 @@
   "description": "智慧教育智能体平台前后端原型",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app.js",
+    "test": "node scripts/release_smoke_test.js"
   },
   "engines": {
     "node": ">=20"

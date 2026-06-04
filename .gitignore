@@ -3,6 +3,7 @@ data/
 logs/
 .env
 .env.*
+!.env.example
 *.log
 *.pdf
 .DS_Store

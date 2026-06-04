@@ -21,12 +21,41 @@ $env:PORT=5108
 node server.js
 ```
 
+项目启动时会自动读取根目录 `.env`。建议复制 `.env.example` 为 `.env`，至少设置强随机 `SESSION_SECRET`。如果通过 HTTPS 反向代理公开访问，请设置 `COOKIE_SECURE=true`。
+
 ## 内置账号
 
+- 管理员：`20260000` / `123456`
 - 教师：`20260001` / `123456`
 - 学生：`20260002` / `123456`
 
 注册新账号时会自动分配 8 位 ID。
+
+## 发行基线
+
+当前版本已补齐小范围内测所需的第一批安全与运维基线：
+
+- 登录态使用后端签名的 `HttpOnly` session cookie，后端不再信任前端伪造的 `userId`。
+- 密码使用 Node 内置 `scrypt` 哈希存储，旧明文密码会自动迁移。
+- 后端执行基础 RBAC，支持 `admin`、`teacher`、`student` 角色。
+- 登录失败次数限制和冷却保护。
+- 敏感操作审计日志写入 `data/db.json` 的 `auditLogs`，同时追加到 `logs/audit.log`。
+- API 和静态资源带基础安全响应头。
+- 健康检查接口：`/api/healthz`、`/api/readyz`。
+- `data/db.json` 写入改为临时文件 + rename 的原子写入方式。
+- 上传入口增加后端文件格式白名单和基础文件头校验，阻断可执行文件、脚本类文件和伪装格式。
+- 增加 Dockerfile、Docker Compose 和部署说明，便于局域网小范围内测。
+
+检查和烟测：
+
+```powershell
+npm run check
+npm test
+```
+
+`npm test` 会临时启动一个测试端口，验证健康检查、登录 cookie、会话恢复、越权阻断和 AI 对话结构。
+
+部署说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。小范围内测可以使用 `HOST=0.0.0.0` 暴露到局域网；公网访问必须放在 HTTPS 反向代理后。
 
 ## 已实现模块
 
@@ -45,5 +74,7 @@ node server.js
 - 作业：发布文字/图片/视频作业与答案，学生提交多媒体答案，教师 AI 批改或手动批改。
 
 数据保存在 `data/db.json`，首次启动会自动生成演示数据。
+
+正式多班级、多学校长期运行前，仍建议把 `data/db.json` 迁移到 SQLite WAL 或 PostgreSQL，并引入任务队列、真实向量检索、真实 LLM、备份恢复、监控和端到端测试。发行路线和剩余清单见 [RELEASE_CHECKLIST.md](./RELEASE_CHECKLIST.md)。
 
 说明：项目已忽略 `*.pdf`，避免把教材文件误提交到 GitHub。默认 AI 自动图谱智能体不限制总文件大小，但仍采用 6MB 分块上传和有限文本/OCR 处理来防止浏览器或后端崩溃；如需人为设置总上传上限，可配置 `MAX_UPLOAD_SIZE_BYTES`。扫描版 PDF 的高级 OCR 工具默认最多识别 80 页，其中优先识别前 40 页并抽样后续页面，可通过 `PDF_AGENT_OCR_MAX_PAGES`、`PDF_AGENT_OCR_LEADING_PAGES`、`PDF_AGENT_OCR_SCALE`、`PDF_AGENT_TIMEOUT_MS` 调整；AI 自动图谱智能体可通过 `AI_PDF_AGENT_OCR_MAX_PAGES`、`AI_PDF_AGENT_OCR_LEADING_PAGES`、`AI_PDF_AGENT_TIMEOUT_MS` 单独调节。

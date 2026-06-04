@@ -5,13 +5,35 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn } = require("child_process");
 
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const clean = line.trim();
+    if (!clean || clean.startsWith("#")) return;
+    const index = clean.indexOf("=");
+    if (index <= 0) return;
+    const key = clean.slice(0, index).trim();
+    let value = clean.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) process.env[key] = value;
+  });
+}
+
+loadEnvFile();
+
 const PORT = Number(process.env.PORT || 5107);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+const LOG_DIR = path.join(ROOT, "logs");
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const AUDIT_LOG_PATH = path.join(LOG_DIR, "audit.log");
 const MAX_BODY_SIZE = 30 * 1024 * 1024;
 const MAX_UPLOAD_SIZE = Number(process.env.MAX_UPLOAD_SIZE_BYTES || Number.MAX_SAFE_INTEGER);
 const MAX_UPLOAD_CHUNK_SIZE = 12 * 1024 * 1024;
@@ -30,8 +52,26 @@ const PDF_LIMITS = {
   maxExtractedTextChars: 260000
 };
 const PDF_AGENT_TIMEOUT_MS = Math.max(4 * 60 * 1000, Number(process.env.PDF_AGENT_TIMEOUT_MS || 20 * 60 * 1000));
+const SESSION_COOKIE = process.env.SESSION_COOKIE_NAME || "edu_session";
+const SESSION_SECRET_CONFIGURED = Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== "replace-with-a-long-random-secret");
+const SESSION_SECRET = SESSION_SECRET_CONFIGURED ? process.env.SESSION_SECRET : crypto.createHash("sha256").update(`${ROOT}:education-agent-dev-secret`).digest("hex");
+const SESSION_TTL_MS = Math.max(30 * 60 * 1000, Number(process.env.SESSION_TTL_MS || 7 * 24 * 60 * 60 * 1000));
+const LOGIN_MAX_FAILURES = Math.max(3, Number(process.env.LOGIN_MAX_FAILURES || 5));
+const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_MS || 10 * 60 * 1000));
+const SUPPORTED_UPLOAD_EXTENSIONS = new Set([".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const TEXT_UPLOAD_EXTENSIONS = new Set([".txt", ".md", ".csv", ".json"]);
+const ZIP_OFFICE_EXTENSIONS = new Set([".docx", ".pptx", ".xlsx"]);
+const BINARY_OFFICE_EXTENSIONS = new Set([".doc", ".ppt", ".xls"]);
+const IMAGE_UPLOAD_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "same-origin",
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "content-security-policy": "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+};
 const graphJobs = new Map();
 const uploadSessions = new Map();
 
@@ -43,9 +83,115 @@ function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 }
 
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(String(value || ""), "base64url").toString("utf8");
+}
+
+function timingSafeEqualText(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
+  const hash = crypto.scryptSync(String(password || ""), salt, 64).toString("hex");
+  return `scrypt$${salt}$${hash}`;
+}
+
+function verifyPassword(user, password) {
+  if (!user) return false;
+  if (user.passwordHash && String(user.passwordHash).startsWith("scrypt$")) {
+    const [, salt, expected] = String(user.passwordHash).split("$");
+    if (!salt || !expected) return false;
+    const actual = crypto.scryptSync(String(password || ""), salt, 64).toString("hex");
+    return timingSafeEqualText(actual, expected);
+  }
+  return user.password !== undefined && String(user.password) === String(password);
+}
+
+function migratePasswordIfNeeded(user, password) {
+  if (!user.passwordHash) user.passwordHash = hashPassword(password);
+  delete user.password;
+  user.passwordUpdatedAt = user.passwordUpdatedAt || now();
+  return user;
+}
+
+function signSessionPayload(payload) {
+  const body = base64UrlEncode(JSON.stringify(payload));
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  const [body, signature] = String(token || "").split(".");
+  if (!body || !signature) return null;
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  if (!timingSafeEqualText(signature, expected)) return null;
+  try {
+    const payload = JSON.parse(base64UrlDecode(body));
+    if (!payload.sub || Number(payload.exp || 0) < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function createSessionToken(user) {
+  return signSessionPayload({
+    sub: user.id,
+    role: user.role,
+    iat: Date.now(),
+    exp: Date.now() + SESSION_TTL_MS,
+    jti: crypto.randomBytes(12).toString("hex")
+  });
+}
+
+function cookieOptions(maxAgeMs = SESSION_TTL_MS) {
+  const secure = process.env.COOKIE_SECURE === "true" ? "; Secure" : "";
+  return `HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.max(0, Math.floor(maxAgeMs / 1000))}${secure}`;
+}
+
+function sessionCookie(user) {
+  return `${SESSION_COOKIE}=${createSessionToken(user)}; ${cookieOptions()}`;
+}
+
+function clearSessionCookie() {
+  return `${SESSION_COOKIE}=; ${cookieOptions(0)}`;
+}
+
+function parseCookies(req) {
+  return String(req.headers.cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const index = part.indexOf("=");
+      if (index > 0) cookies[part.slice(0, index)] = decodeURIComponent(part.slice(index + 1));
+      return cookies;
+    }, {});
+}
+
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function checkDataDirWritable() {
+  try {
+    ensureDataDir();
+    const probePath = path.join(DATA_DIR, `.ready-${process.pid}-${Date.now()}.tmp`);
+    fs.writeFileSync(probePath, "ok", "utf8");
+    fs.unlinkSync(probePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sampleGraph(ownerId, subject, title, global = false) {
@@ -84,6 +230,7 @@ function sampleGraph(ownerId, subject, title, global = false) {
 }
 
 function createInitialDb() {
+  const adminId = "20260000";
   const teacherId = "20260001";
   const studentId = "20260002";
   const classId = "class_seed";
@@ -96,12 +243,24 @@ function createInitialDb() {
   return {
     users: [
       {
+        id: adminId,
+        name: "平台管理员",
+        role: "admin",
+        passwordHash: hashPassword("123456"),
+        subject: "",
+        className: "",
+        classIds: [],
+        avatar: "管",
+        createdAt: now()
+      },
+      {
         id: teacherId,
         name: "黄豆",
         role: "teacher",
-        password: "123456",
+        passwordHash: hashPassword("123456"),
         subject: "数学",
         className: "",
+        classIds: [],
         avatar: "黄",
         createdAt: now()
       },
@@ -109,7 +268,7 @@ function createInitialDb() {
         id: studentId,
         name: "绿豆",
         role: "student",
-        password: "123456",
+        passwordHash: hashPassword("123456"),
         subject: "",
         className: "豆1班",
         classIds: [classId],
@@ -200,7 +359,9 @@ function readDb() {
 
 function writeDb(db) {
   ensureDataDir();
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+  const tmpPath = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2), "utf8");
+  fs.renameSync(tmpPath, DB_PATH);
 }
 
 function createLearningProfile(userId, role = "student") {
@@ -337,8 +498,32 @@ function ensureDbShape(db) {
       changed = true;
     }
   };
-  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions"].forEach(ensureArray);
+  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions", "auditLogs"].forEach(ensureArray);
+  db.users = Array.isArray(db.users) ? db.users : [];
+  if (!db.users.some((user) => user.role === "admin")) {
+    db.users.unshift({
+      id: "20260000",
+      name: "平台管理员",
+      role: "admin",
+      passwordHash: hashPassword("123456"),
+      subject: "",
+      className: "",
+      classIds: [],
+      avatar: "管",
+      createdAt: now()
+    });
+    changed = true;
+  }
   (db.users || []).forEach((user) => {
+    if (!user.passwordHash && user.password !== undefined) {
+      migratePasswordIfNeeded(user, user.password);
+      changed = true;
+    }
+    if (!["admin", "teacher", "student"].includes(user.role)) {
+      user.role = "student";
+      changed = true;
+    }
+    user.classIds = Array.isArray(user.classIds) ? user.classIds : [];
     const before = db.learningProfiles.length;
     ensureLearningProfile(db, user.id);
     if (db.learningProfiles.length !== before) changed = true;
@@ -359,7 +544,15 @@ function ensureDbShape(db) {
 
 function publicUser(user) {
   if (!user) return null;
-  const { password, ...safe } = user;
+  const {
+    password,
+    passwordHash,
+    passwordUpdatedAt,
+    failedLoginCount,
+    lockUntil,
+    lastLoginIp,
+    ...safe
+  } = user;
   return safe;
 }
 
@@ -382,11 +575,17 @@ function readBody(req) {
       }
     });
     req.on("end", () => {
-      if (!body) return resolve({});
+      if (!body) return resolve(enforceBodyPrincipal({}, req.actor));
+      let parsed;
       try {
-        resolve(JSON.parse(body));
+        parsed = JSON.parse(body);
       } catch (error) {
-        reject(Object.assign(new Error("JSON 格式不正确"), { status: 400 }));
+        return reject(Object.assign(new Error("JSON 格式不正确"), { status: 400 }));
+      }
+      try {
+        resolve(enforceBodyPrincipal(parsed, req.actor));
+      } catch (error) {
+        reject(error);
       }
     });
     req.on("error", reject);
@@ -411,8 +610,89 @@ function readBinaryBody(req, limit = MAX_UPLOAD_SIZE) {
   });
 }
 
+function requestIp(req) {
+  return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+    .split(",")[0]
+    .trim();
+}
+
+function recordAudit(db, actor, action, detail = {}, req = null) {
+  db.auditLogs = Array.isArray(db.auditLogs) ? db.auditLogs : [];
+  const entry = {
+    id: uid("audit"),
+    actorId: actor?.id || detail.actorId || "",
+    actorRole: actor?.role || detail.actorRole || "",
+    action,
+    resourceType: detail.resourceType || "",
+    resourceId: detail.resourceId || "",
+    ip: req ? requestIp(req) : "",
+    userAgent: req ? String(req.headers["user-agent"] || "").slice(0, 180) : "",
+    meta: detail.meta || {},
+    createdAt: now()
+  };
+  db.auditLogs.unshift(entry);
+  db.auditLogs = db.auditLogs.slice(0, 1000);
+  try {
+    ensureDataDir();
+    fs.appendFileSync(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (error) {
+    console.warn("audit log write failed", error.message);
+  }
+  return entry;
+}
+
+function getSessionUser(req, db) {
+  const cookies = parseCookies(req);
+  const payload = verifySessionToken(cookies[SESSION_COOKIE]);
+  if (!payload) return null;
+  return getUser(db, payload.sub) || null;
+}
+
+function requireActor(req, db) {
+  const user = getSessionUser(req, db);
+  if (!user) throw Object.assign(new Error("登录已过期，请重新登录"), { status: 401 });
+  req.actor = user;
+  return user;
+}
+
+function ensureActorCanUseId(actor, id, role = "") {
+  if (!id) return;
+  if (actor.role === "admin") return;
+  if (String(id) !== actor.id) throw Object.assign(new Error("无权使用其他用户身份操作"), { status: 403 });
+  if (role && actor.role !== role) throw Object.assign(new Error(`当前账号不是${role === "teacher" ? "教师" : "学生"}身份`), { status: 403 });
+}
+
+function enforceBodyPrincipal(body, actor) {
+  if (!actor || !body || typeof body !== "object" || Array.isArray(body) || actor.role === "admin") return body;
+  [
+    ["userId", ""],
+    ["ownerId", ""],
+    ["fromUserId", ""],
+    ["teacherId", "teacher"],
+    ["studentId", "student"]
+  ].forEach(([key, role]) => {
+    if (body[key] !== undefined && body[key] !== null && body[key] !== "") {
+      ensureActorCanUseId(actor, body[key], role);
+    }
+  });
+  return body;
+}
+
+function queryUserId(searchParams, actor, key = "userId", role = "") {
+  const requested = searchParams.get(key);
+  ensureActorCanUseId(actor, requested || actor.id, role);
+  return actor.role === "admin" && requested ? requested : actor.id;
+}
+
+function requireRole(actor, roles) {
+  const allowed = Array.isArray(roles) ? roles : [roles];
+  if (!allowed.includes(actor.role)) {
+    throw Object.assign(new Error("当前账号无权执行该操作"), { status: 403 });
+  }
+}
+
 function send(res, status, payload, headers = {}) {
-  res.writeHead(status, { ...JSON_HEADERS, ...headers });
+  res.writeHead(status, { ...SECURITY_HEADERS, ...JSON_HEADERS, ...headers });
   res.end(JSON.stringify(payload));
 }
 
@@ -562,8 +842,96 @@ function sanitizeFileName(name) {
   return String(name || "upload.pdf").replace(/[\\/:*?"<>|]/g, "_").slice(0, 160);
 }
 
+function uploadExtension(name = "") {
+  return path.extname(String(name || "").toLowerCase());
+}
+
+function uploadExpectedKinds(name = "", type = "") {
+  const ext = uploadExtension(name);
+  const mime = String(type || "").toLowerCase();
+  const kinds = new Set();
+  if (ext === ".pdf" || mime.includes("pdf")) kinds.add("pdf");
+  if (ZIP_OFFICE_EXTENSIONS.has(ext) || /officedocument|wordprocessingml|presentationml|spreadsheetml/.test(mime)) kinds.add("office-zip");
+  if (BINARY_OFFICE_EXTENSIONS.has(ext) || /msword|ms-powerpoint|ms-excel/.test(mime)) kinds.add("office-binary");
+  if (TEXT_UPLOAD_EXTENSIONS.has(ext) || /^text\//.test(mime)) kinds.add("text");
+  if (IMAGE_UPLOAD_EXTENSIONS.has(ext) || /^image\//.test(mime)) kinds.add("image");
+  return kinds;
+}
+
+function assertSupportedUploadDeclaration(name = "", type = "") {
+  const ext = uploadExtension(name);
+  const mime = String(type || "").toLowerCase();
+  const blockedMime = /x-msdownload|x-dosexec|octet-stream-exe|shellscript/.test(mime);
+  if (blockedMime) {
+    throw Object.assign(new Error("不支持上传可执行或脚本类文件"), { status: 415 });
+  }
+  if (ext && !SUPPORTED_UPLOAD_EXTENSIONS.has(ext)) {
+    throw Object.assign(new Error(`不支持的文件格式：${ext}。请上传 PDF、Word、PPT、Excel、TXT、Markdown、CSV 或常见图片格式。`), { status: 415 });
+  }
+}
+
+function isProbablyTextBuffer(buffer) {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  if (!sample.length) return true;
+  let control = 0;
+  for (const byte of sample) {
+    if (byte === 0) return false;
+    if (byte < 9 || (byte > 13 && byte < 32)) control += 1;
+  }
+  return control / sample.length < 0.08;
+}
+
+function sniffUploadKind(buffer) {
+  if (!buffer || !buffer.length) return "empty";
+  const hex8 = buffer.subarray(0, 8).toString("hex").toLowerCase();
+  const ascii5 = buffer.subarray(0, 5).toString("latin1");
+  const ascii4 = buffer.subarray(0, 4).toString("latin1");
+  const ascii12 = buffer.subarray(0, 12).toString("latin1");
+  if (ascii5 === "%PDF-") return "pdf";
+  if (ascii4 === "PK\u0003\u0004" || ascii4 === "PK\u0005\u0006" || ascii4 === "PK\u0007\b") return "office-zip";
+  if (hex8 === "d0cf11e0a1b11ae1") return "office-binary";
+  if (hex8 === "89504e470d0a1a0a") return "image";
+  if (hex8.startsWith("ffd8ff")) return "image";
+  if (ascii4 === "GIF8" || (ascii4 === "RIFF" && ascii12.slice(8, 12) === "WEBP")) return "image";
+  if (isProbablyTextBuffer(buffer)) return "text";
+  return "unknown-binary";
+}
+
+function assertUploadContent({ name = "", type = "", buffer }) {
+  assertSupportedUploadDeclaration(name, type);
+  const sample = buffer || Buffer.alloc(0);
+  const actual = sniffUploadKind(sample);
+  if (actual === "empty") {
+    throw Object.assign(new Error("上传文件为空"), { status: 400 });
+  }
+  const expected = uploadExpectedKinds(name, type);
+  if (!expected.size) {
+    if (actual === "unknown-binary") {
+      throw Object.assign(new Error("未能识别上传文件类型，请使用带扩展名的 PDF、Word、PPT、Excel、TXT 或图片文件"), { status: 415 });
+    }
+    return;
+  }
+  if (expected.has(actual)) return;
+  if (expected.has("text") && actual === "text") return;
+  if (expected.has("image") && actual === "image") return;
+  throw Object.assign(new Error("上传文件内容与声明格式不一致，请检查文件是否损坏或伪装成其他格式"), { status: 415 });
+}
+
+function assertStoredUploadSafe(session) {
+  const size = fs.statSync(session.filePath).size;
+  const fd = fs.openSync(session.filePath, "r");
+  try {
+    const buffer = Buffer.alloc(Math.min(size, 8192));
+    fs.readSync(fd, buffer, 0, buffer.length, 0);
+    assertUploadContent({ name: session.fileName, type: session.fileType, buffer });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function createUploadSession({ userId, fileName, fileType, size }) {
   ensureDataDir();
+  assertSupportedUploadDeclaration(fileName, fileType);
   const uploadId = uid("upload");
   const safeName = sanitizeFileName(fileName);
   const filePath = path.join(UPLOAD_DIR, `${uploadId}_${safeName}`);
@@ -844,6 +1212,7 @@ function extractUploadedBookText(file, onProgress = () => {}) {
 
 function extractUploadedBookBuffer({ name = "上传书本", type = "", buffer }, onProgress = () => {}) {
   if (!buffer || !buffer.length) return { text: "", meta: { name, type, method: "empty-upload", characters: 0 } };
+  assertUploadContent({ name, type, buffer: buffer.subarray(0, Math.min(buffer.length, 8192)) });
   const lowerName = name.toLowerCase();
   let text = "";
   let method = "text-reader";
@@ -1051,6 +1420,7 @@ function runAdvancedPdfAgent({ filePath, maxChars, jobId, envOverrides = {}, tim
 
 async function extractUploadedBookFile({ name = "上传书本", type = "", filePath, extractor = "", subject = "", sourceText = "" }, onProgress = () => {}, jobId = null) {
   const size = fs.statSync(filePath).size;
+  assertStoredUploadSafe({ fileName: name, fileType: type, filePath });
   const lowerName = name.toLowerCase();
   const aiUnlimited = isAiUnlimitedExtractor(extractor);
   if (type.includes("pdf") || lowerName.endsWith(".pdf")) {
@@ -3630,9 +4000,21 @@ function getRelevantState(db, userId) {
   const classIds = user.role === "teacher"
     ? db.classes.filter((item) => item.teacherId === userId).map((item) => item.id)
     : (user.classIds || []);
+  const visibleUserIds = new Set([userId]);
+  db.friendships.filter((item) => item.userId === userId).forEach((item) => visibleUserIds.add(item.friendId));
+  db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).forEach((thread) => thread.memberIds.forEach((id) => visibleUserIds.add(id)));
+  db.classes
+    .filter((item) => item.teacherId === userId || item.studentIds.includes(userId))
+    .forEach((klass) => {
+      visibleUserIds.add(klass.teacherId);
+      klass.studentIds.forEach((id) => visibleUserIds.add(id));
+    });
+  db.submissions
+    .filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId))
+    .forEach((item) => visibleUserIds.add(item.studentId));
   return {
     user: publicUser(user),
-    users: db.users.map(publicUser),
+    users: (user.role === "admin" ? db.users : db.users.filter((item) => visibleUserIds.has(item.id))).map(publicUser),
     knowledgeGraphs: db.knowledgeGraphs
       .filter((graph) => graph.ownerId === userId || graph.global)
       .map((graph) => enhanceGraphForEducation(graph)),
@@ -3658,15 +4040,47 @@ async function handleApi(req, res, pathname, searchParams) {
   const method = req.method;
   const db = readDb();
 
+  if (method === "GET" && pathname === "/api/healthz") {
+    return send(res, 200, {
+      ok: true,
+      status: "ok",
+      version: process.env.npm_package_version || "1.0.0",
+      time: now(),
+      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing"
+    });
+  }
+
+  if (method === "GET" && pathname === "/api/readyz") {
+    const checks = {
+      dataDirWritable: checkDataDirWritable(),
+      sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
+      cookieSecure: process.env.COOKIE_SECURE === "true",
+      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing"
+    };
+    const warnings = [];
+    if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
+    if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
+    const ready = checks.dataDirWritable && (process.env.NODE_ENV !== "production" || (checks.sessionSecretConfigured && checks.cookieSecure));
+    return send(res, ready ? 200 : 503, {
+      ok: ready,
+      status: ready ? "ready" : "not-ready",
+      version: process.env.npm_package_version || "1.0.0",
+      time: now(),
+      checks,
+      warnings
+    });
+  }
+
   if (method === "POST" && pathname === "/api/auth/register") {
     const body = await readBody(req);
     assertRequired(body, ["name", "password", "role"]);
     if (!["teacher", "student"].includes(body.role)) throw Object.assign(new Error("身份必须是 teacher 或 student"), { status: 400 });
+    if (String(body.password).length < 6) return sendError(res, 400, "密码至少 6 位");
     const user = {
       id: generateUserId(db),
       name: String(body.name).trim(),
       role: body.role,
-      password: String(body.password),
+      passwordHash: hashPassword(body.password),
       subject: body.role === "teacher" ? String(body.subject || "") : "",
       className: String(body.className || ""),
       classIds: [],
@@ -3674,6 +4088,7 @@ async function handleApi(req, res, pathname, searchParams) {
       createdAt: now()
     };
     db.users.push(user);
+    recordAudit(db, user, "auth.register", { resourceType: "user", resourceId: user.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, user: publicUser(user), message: `注册成功，系统分配 ID：${user.id}` });
   }
@@ -3682,17 +4097,57 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["account", "password"]);
     const account = String(body.account).trim();
-    const user = db.users.find((item) => (item.id === account || item.name === account) && item.password === String(body.password));
-    if (!user) return sendError(res, 401, "账号或密码错误");
-    return send(res, 200, { ok: true, user: publicUser(user), state: getRelevantState(db, user.id) });
+    const user = db.users.find((item) => item.id === account || item.name === account);
+    if (!user) {
+      recordAudit(db, null, "auth.login_failed", { meta: { account, reason: "not_found" } }, req);
+      writeDb(db);
+      return sendError(res, 401, "账号或密码错误");
+    }
+    if (user.lockUntil && new Date(user.lockUntil).getTime() > Date.now()) {
+      return sendError(res, 429, "登录失败次数过多，请稍后再试");
+    }
+    if (!verifyPassword(user, body.password)) {
+      user.failedLoginCount = Number(user.failedLoginCount || 0) + 1;
+      if (user.failedLoginCount >= LOGIN_MAX_FAILURES) {
+        user.lockUntil = new Date(Date.now() + LOGIN_COOLDOWN_MS).toISOString();
+      }
+      recordAudit(db, user, "auth.login_failed", { resourceType: "user", resourceId: user.id, meta: { failedLoginCount: user.failedLoginCount } }, req);
+      writeDb(db);
+      return sendError(res, 401, "账号或密码错误");
+    }
+    migratePasswordIfNeeded(user, body.password);
+    user.failedLoginCount = 0;
+    user.lockUntil = "";
+    user.lastLoginAt = now();
+    user.lastLoginIp = requestIp(req);
+    recordAudit(db, user, "auth.login", { resourceType: "user", resourceId: user.id }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, user: publicUser(user), state: getRelevantState(db, user.id) }, { "set-cookie": sessionCookie(user) });
   }
 
+  if (method === "POST" && pathname === "/api/auth/logout") {
+    const actor = getSessionUser(req, db);
+    if (actor) {
+      recordAudit(db, actor, "auth.logout", { resourceType: "user", resourceId: actor.id }, req);
+      writeDb(db);
+    }
+    return send(res, 200, { ok: true }, { "set-cookie": clearSessionCookie() });
+  }
+
+  if (method === "GET" && pathname === "/api/session") {
+    const actor = getSessionUser(req, db);
+    if (!actor) return sendError(res, 401, "未登录");
+    return send(res, 200, { ok: true, user: publicUser(actor), state: getRelevantState(db, actor.id) });
+  }
+
+  const actor = requireActor(req, db);
+
   if (method === "GET" && pathname === "/api/state") {
-    return send(res, 200, { ok: true, state: getRelevantState(db, searchParams.get("userId")) });
+    return send(res, 200, { ok: true, state: getRelevantState(db, actor.id) });
   }
 
   if (method === "GET" && pathname === "/api/users/search") {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const query = String(searchParams.get("query") || "").trim().toLowerCase();
     const role = searchParams.get("role");
     const users = db.users
@@ -3706,6 +4161,7 @@ async function handleApi(req, res, pathname, searchParams) {
 
   let params = routePattern(pathname, "/api/users/:id");
   if (method === "PUT" && params) {
+    if (actor.role !== "admin" && params.id !== actor.id) return sendError(res, 403, "只能修改自己的个人信息");
     const body = await readBody(req);
     const user = ensureUser(db, params.id);
     ["name", "subject", "className", "email", "phone"].forEach((key) => {
@@ -3713,14 +4169,14 @@ async function handleApi(req, res, pathname, searchParams) {
     });
     if (body.classIds && Array.isArray(body.classIds)) user.classIds = body.classIds.map(String);
     user.updatedAt = now();
+    recordAudit(db, actor, "user.update", { resourceType: "user", resourceId: user.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, user: publicUser(user) });
   }
 
   if (method === "GET" && pathname === "/api/graphs") {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const subject = searchParams.get("subject");
-    ensureUser(db, userId);
     let graphs = db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global);
     if (subject) graphs = graphs.filter((graph) => graph.subject === subject);
     return send(res, 200, { ok: true, graphs: graphs.map((graph) => enhanceGraphForEducation(graph)) });
@@ -3730,7 +4186,6 @@ async function handleApi(req, res, pathname, searchParams) {
     cleanupUploadSessions();
     const body = await readBody(req);
     assertRequired(body, ["userId", "fileName", "size"]);
-    ensureUser(db, body.userId);
     const size = Number(body.size || 0);
     if (!Number.isFinite(size) || size <= 0) return sendError(res, 400, "文件大小不正确");
     if (hasConfiguredUploadLimit() && size > MAX_UPLOAD_SIZE) {
@@ -3742,12 +4197,14 @@ async function handleApi(req, res, pathname, searchParams) {
       fileType: body.fileType,
       size
     });
+    recordAudit(db, actor, "upload.start", { resourceType: "upload", resourceId: session.id, meta: { fileName: session.fileName, size } }, req);
     return send(res, 201, { ok: true, upload: publicUploadSession(session) });
   }
 
   params = routePattern(pathname, "/api/uploads/:id/chunk");
   if (method === "POST" && params) {
     const session = getUploadSession(params.id);
+    if (actor.role !== "admin" && session.userId !== actor.id) return sendError(res, 403, "不能上传其他账号的文件");
     const index = Number(searchParams.get("index") || session.chunks);
     const offset = Number(searchParams.get("offset") || session.received);
     if (offset !== session.received) return sendError(res, 409, "上传分块顺序不一致，请重新上传");
@@ -3764,15 +4221,16 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/graphs/generate-upload") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "uploadId", "subject"]);
-    ensureUser(db, body.userId);
     const session = getUploadSession(body.uploadId);
     if (session.userId !== body.userId) return sendError(res, 403, "不能使用其他账号的上传文件");
     if (session.received !== session.size) return sendError(res, 400, "文件尚未上传完成");
+    assertStoredUploadSafe(session);
     const subject = normalizeSubject(body.subject);
     const title = body.title || `${subject}知识图谱`;
     const sourceName = body.sourceName || session.fileName;
     const extractor = body.extractor || AI_UNLIMITED_EXTRACTOR;
     const job = createGraphJob({
+      userId: body.userId,
       subject,
       title,
       sourceName,
@@ -3780,6 +4238,7 @@ async function handleApi(req, res, pathname, searchParams) {
       extractor,
       uploadId: session.id
     });
+    recordAudit(db, actor, "graph.generate_upload", { resourceType: "graphJob", resourceId: job.id, meta: { subject, title, sourceName } }, req);
     send(res, 202, { ok: true, job: publicGraphJob(job) });
     processGraphGenerationJob(job.id, {
       userId: body.userId,
@@ -3803,6 +4262,7 @@ async function handleApi(req, res, pathname, searchParams) {
     cleanupGraphJobs();
     const job = graphJobs.get(params.id);
     if (!job) return notFound(res);
+    if (actor.role !== "admin" && job.meta?.userId !== actor.id) return sendError(res, 403, "无权查看该任务");
     return send(res, 200, { ok: true, job: publicGraphJob(job) });
   }
 
@@ -3810,28 +4270,33 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && params) {
     const job = graphJobs.get(params.id);
     if (!job) return notFound(res);
+    if (actor.role !== "admin" && job.meta?.userId !== actor.id) return sendError(res, 403, "无权终止该任务");
     const canceled = cancelGraphJob(params.id);
+    recordAudit(db, actor, "graph.job_cancel", { resourceType: "graphJob", resourceId: params.id }, req);
     return send(res, 200, { ok: true, job: publicGraphJob(canceled) });
   }
 
   if (method === "POST" && pathname === "/api/graphs/generate-file") {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const subject = normalizeSubject(searchParams.get("subject"));
     const title = searchParams.get("title") || `${subject}知识图谱`;
     const sourceText = searchParams.get("sourceText") || "";
     const sourceName = searchParams.get("sourceName") || "上传书本";
     const extractor = searchParams.get("extractor") || AI_UNLIMITED_EXTRACTOR;
     assertRequired({ userId, subject }, ["userId", "subject"]);
-    ensureUser(db, userId);
     const buffer = await readBinaryBody(req, MAX_UPLOAD_SIZE);
     if (!buffer.length) return sendError(res, 400, "上传文件为空");
+    const fileType = searchParams.get("fileType") || req.headers["content-type"] || "";
+    assertUploadContent({ name: sourceName, type: fileType, buffer: buffer.subarray(0, Math.min(buffer.length, 8192)) });
     const job = createGraphJob({
+      userId,
       subject,
       title,
       sourceName,
       fileSize: buffer.length,
       extractor
     });
+    recordAudit(db, actor, "graph.generate_file", { resourceType: "graphJob", resourceId: job.id, meta: { subject, title, sourceName } }, req);
     send(res, 202, { ok: true, job: publicGraphJob(job) });
     processGraphGenerationJob(job.id, {
       userId,
@@ -3842,7 +4307,7 @@ async function handleApi(req, res, pathname, searchParams) {
       extractor,
       file: {
         name: sourceName,
-        type: searchParams.get("fileType") || req.headers["content-type"] || "",
+        type: fileType,
         buffer
       }
     });
@@ -3852,7 +4317,6 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/graphs/generate") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "subject"]);
-    ensureUser(db, body.userId);
     const uploaded = body.file?.dataUrl ? await extractCourseMaterialUpload(body.file) : { text: "", meta: null };
     const sourceText = [uploaded.text, requestText(body.sourceText)].filter(Boolean).join("\n\n");
     const graph = buildGraphFromText({
@@ -3864,6 +4328,7 @@ async function handleApi(req, res, pathname, searchParams) {
       extraction: uploaded.meta ? { ...uploaded.meta, agent: body.extractor || "local-pdf-text-agent" } : null
     });
     db.knowledgeGraphs.push(graph);
+    recordAudit(db, actor, "graph.generate", { resourceType: "graph", resourceId: graph.id, meta: { subject: graph.subject, title: graph.title } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, graph });
   }
@@ -3871,7 +4336,6 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/graphs/import") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "graph"]);
-    ensureUser(db, body.userId);
     const graph = validateGraph(body.graph, {
       ownerId: body.userId,
       subject: body.subject,
@@ -3879,6 +4343,7 @@ async function handleApi(req, res, pathname, searchParams) {
       sourceName: body.sourceName
     });
     db.knowledgeGraphs.push(graph);
+    recordAudit(db, actor, "graph.import", { resourceType: "graph", resourceId: graph.id, meta: { subject: graph.subject, title: graph.title } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, graph });
   }
@@ -3888,9 +4353,10 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
     if (!graph) return notFound(res);
-    if (graph.ownerId !== body.userId) return sendError(res, 403, "只能上传自己的图谱");
+    if (actor.role !== "admin" && graph.ownerId !== body.userId) return sendError(res, 403, "只能上传自己的图谱");
     graph.global = true;
     graph.updatedAt = now();
+    recordAudit(db, actor, "graph.upload_global", { resourceType: "graph", resourceId: graph.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
@@ -3899,21 +4365,22 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "GET" && params) {
     const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
     if (!graph) return notFound(res);
+    if (!graph.global && graph.ownerId !== actor.id && actor.role !== "admin") return sendError(res, 403, "无权查看该图谱");
     return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
   if (method === "DELETE" && params) {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const index = db.knowledgeGraphs.findIndex((item) => item.id === params.id);
     if (index < 0) return notFound(res);
-    if (db.knowledgeGraphs[index].ownerId !== userId) return sendError(res, 403, "只能删除自己的图谱");
+    if (actor.role !== "admin" && db.knowledgeGraphs[index].ownerId !== userId) return sendError(res, 403, "只能删除自己的图谱");
+    recordAudit(db, actor, "graph.delete", { resourceType: "graph", resourceId: params.id }, req);
     db.knowledgeGraphs.splice(index, 1);
     writeDb(db);
     return send(res, 200, { ok: true });
   }
 
   if (method === "GET" && pathname === "/api/materials") {
-    const userId = searchParams.get("userId");
-    ensureUser(db, userId);
+    const userId = queryUserId(searchParams, actor);
     const subject = searchParams.get("subject");
     let materials = visibleCourseMaterials(db, userId);
     if (subject) materials = materials.filter((item) => item.subject === normalizeSubject(subject));
@@ -3924,6 +4391,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["userId", "subject"]);
     const user = ensureUser(db, body.userId);
+    if (body.global && user.role !== "teacher" && user.role !== "admin") return sendError(res, 403, "只有教师可以发布学生可检索资料");
     let uploaded = { text: "", meta: null };
     if (body.file?.dataUrl) {
       uploaded = await extractCourseMaterialUpload(body.file);
@@ -3937,11 +4405,12 @@ async function handleApi(req, res, pathname, searchParams) {
       sourceName: body.sourceName || body.file?.name || "手动录入",
       type: body.file?.type || "text/plain",
       text: sourceText,
-      global: user.role === "teacher" ? Boolean(body.global) : false,
+      global: ["teacher", "admin"].includes(user.role) ? Boolean(body.global) : false,
       classId: body.classId
     });
     material.extraction = uploaded.meta ? { ...uploaded.meta, agent: "course-rag-material-agent" } : null;
     db.courseMaterials.unshift(material);
+    recordAudit(db, actor, "material.create", { resourceType: "courseMaterial", resourceId: material.id, meta: { title: material.title, subject: material.subject } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, material: publicCourseMaterial(material) });
   }
@@ -3953,6 +4422,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const session = getUploadSession(body.uploadId);
     if (session.userId !== body.userId) return sendError(res, 403, "不能使用其他账号的上传文件");
     if (session.received !== session.size) return sendError(res, 400, "文件尚未上传完成");
+    assertStoredUploadSafe(session);
     let uploaded = { text: "", meta: null };
     try {
       uploaded = await extractCourseMaterialUpload({
@@ -3969,11 +4439,12 @@ async function handleApi(req, res, pathname, searchParams) {
         sourceName: body.sourceName || session.fileName || "上传资料",
         type: session.fileType || "application/octet-stream",
         text: sourceText,
-        global: user.role === "teacher" ? Boolean(body.global) : false,
+        global: ["teacher", "admin"].includes(user.role) ? Boolean(body.global) : false,
         classId: body.classId
       });
       material.extraction = uploaded.meta ? { ...uploaded.meta, agent: "course-rag-material-agent" } : null;
       db.courseMaterials.unshift(material);
+      recordAudit(db, actor, "material.create_from_upload", { resourceType: "courseMaterial", resourceId: material.id, meta: { title: material.title, subject: material.subject } }, req);
       writeDb(db);
       return send(res, 201, { ok: true, material: publicCourseMaterial(material) });
     } finally {
@@ -3983,18 +4454,18 @@ async function handleApi(req, res, pathname, searchParams) {
 
   params = routePattern(pathname, "/api/materials/:id");
   if (method === "DELETE" && params) {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const index = db.courseMaterials.findIndex((item) => item.id === params.id);
     if (index < 0) return notFound(res);
-    if (db.courseMaterials[index].ownerId !== userId) return sendError(res, 403, "只能删除自己上传的课程资料");
+    if (actor.role !== "admin" && db.courseMaterials[index].ownerId !== userId) return sendError(res, 403, "只能删除自己上传的课程资料");
+    recordAudit(db, actor, "material.delete", { resourceType: "courseMaterial", resourceId: params.id }, req);
     db.courseMaterials.splice(index, 1);
     writeDb(db);
     return send(res, 200, { ok: true });
   }
 
   if (method === "GET" && pathname === "/api/conversations") {
-    const userId = searchParams.get("userId");
-    ensureUser(db, userId);
+    const userId = queryUserId(searchParams, actor);
     return send(res, 200, { ok: true, conversations: db.conversations.filter((item) => item.userId === userId) });
   }
 
@@ -4013,6 +4484,7 @@ async function handleApi(req, res, pathname, searchParams) {
       updatedAt: now()
     };
     db.conversations.unshift(conv);
+    recordAudit(db, actor, "conversation.create", { resourceType: "conversation", resourceId: conv.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, conversation: conv });
   }
@@ -4020,7 +4492,6 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/wrong-notes") {
     const body = await readBody(req);
     assertRequired(body, ["userId"]);
-    ensureUser(db, body.userId);
     const note = addWrongNote(db, body.userId, {
       source: body.source || "对话操作",
       topic: String(body.topic || "待归类").slice(0, 60),
@@ -4029,6 +4500,7 @@ async function handleApi(req, res, pathname, searchParams) {
       analysis: String(body.analysis || "用户从智能体回答中加入错题本。").slice(0, 500),
       recommendation: String(body.recommendation || "建议生成同类题，并复盘前置知识。").slice(0, 500)
     });
+    recordAudit(db, actor, "wrong_note.create", { resourceType: "wrongNote", resourceId: note.id, meta: { topic: note.topic } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, wrongNote: note, learningAnalytics: learningAnalytics(db, body.userId) });
   }
@@ -4036,10 +4508,10 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/mastery/update") {
     const body = await readBody(req);
     assertRequired(body, ["userId"]);
-    ensureUser(db, body.userId);
     const topics = Array.isArray(body.topics) ? body.topics.map(String) : [String(body.topic || "")];
     const delta = Number.isFinite(Number(body.delta)) ? Number(body.delta) : 0.08;
     const profile = updateTopicMastery(db, body.userId, topics, delta, String(body.evidence || "用户在对话中标记掌握"));
+    recordAudit(db, actor, "mastery.update", { resourceType: "learningProfile", resourceId: body.userId, meta: { topics } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, profile, learningAnalytics: learningAnalytics(db, body.userId) });
   }
@@ -4111,24 +4583,25 @@ async function handleApi(req, res, pathname, searchParams) {
       createdAt: now()
     });
     db.agentRuns = db.agentRuns.slice(0, 200);
+    recordAudit(db, actor, "ai.chat", { resourceType: "conversation", resourceId: conv.id, meta: { mode: conv.mode, confidence: agentAnswer.confidence } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, conversation: conv, messages: [userMessage, assistantMessage] });
   }
 
   params = routePattern(pathname, "/api/conversations/:id");
   if (method === "DELETE" && params) {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const index = db.conversations.findIndex((item) => item.id === params.id && item.userId === userId);
     if (index < 0) return notFound(res);
+    recordAudit(db, actor, "conversation.delete", { resourceType: "conversation", resourceId: params.id }, req);
     db.conversations.splice(index, 1);
     writeDb(db);
     return send(res, 200, { ok: true });
   }
 
   if (method === "GET" && pathname === "/api/models") {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const subject = searchParams.get("subject");
-    ensureUser(db, userId);
     let models = db.models.filter((item) => item.ownerId === userId);
     if (subject) models = models.filter((item) => item.subject === subject);
     return send(res, 200, { ok: true, models });
@@ -4137,7 +4610,6 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/models") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "name", "subject"]);
-    ensureUser(db, body.userId);
     const existing = body.id ? db.models.find((item) => item.id === body.id && item.ownerId === body.userId) : null;
     const payload = {
       ownerId: body.userId,
@@ -4150,28 +4622,30 @@ async function handleApi(req, res, pathname, searchParams) {
     };
     if (existing) {
       Object.assign(existing, payload);
+      recordAudit(db, actor, "model.update", { resourceType: "model", resourceId: existing.id }, req);
       writeDb(db);
       return send(res, 200, { ok: true, model: existing });
     }
     const model = { id: uid("model"), ...payload, createdAt: now() };
     db.models.unshift(model);
+    recordAudit(db, actor, "model.create", { resourceType: "model", resourceId: model.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, model });
   }
 
   params = routePattern(pathname, "/api/models/:id");
   if (method === "DELETE" && params) {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     const index = db.models.findIndex((item) => item.id === params.id && item.ownerId === userId);
     if (index < 0) return notFound(res);
+    recordAudit(db, actor, "model.delete", { resourceType: "model", resourceId: params.id }, req);
     db.models.splice(index, 1);
     writeDb(db);
     return send(res, 200, { ok: true });
   }
 
   if (method === "GET" && pathname === "/api/chat") {
-    const userId = searchParams.get("userId");
-    ensureUser(db, userId);
+    const userId = queryUserId(searchParams, actor);
     return send(res, 200, {
       ok: true,
       friends: db.friendships.filter((item) => item.userId === userId).map((item) => publicUser(getUser(db, item.friendId))).filter(Boolean),
@@ -4185,19 +4659,20 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/friends") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "target"]);
-    ensureUser(db, body.userId);
     const targetText = String(body.target).trim();
     const friend = db.users.find((user) => user.id === targetText || user.name === targetText || `${user.id}-${user.name}` === targetText);
     if (!friend) return sendError(res, 404, "未找到用户，请检查 ID 或姓名");
     const thread = addFriendship(db, body.userId, friend.id);
+    recordAudit(db, actor, "friend.add", { resourceType: "user", resourceId: friend.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, friend: publicUser(friend), thread });
   }
 
   params = routePattern(pathname, "/api/friends/:friendId");
   if (method === "DELETE" && params) {
-    const userId = searchParams.get("userId");
+    const userId = queryUserId(searchParams, actor);
     db.friendships = db.friendships.filter((item) => !(item.userId === userId && item.friendId === params.friendId) && !(item.userId === params.friendId && item.friendId === userId));
+    recordAudit(db, actor, "friend.delete", { resourceType: "user", resourceId: params.friendId }, req);
     writeDb(db);
     return send(res, 200, { ok: true });
   }
@@ -4205,7 +4680,6 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/chat/groups") {
     const body = await readBody(req);
     assertRequired(body, ["ownerId", "name"]);
-    ensureUser(db, body.ownerId);
     const memberIds = Array.from(new Set([body.ownerId].concat(Array.isArray(body.memberIds) ? body.memberIds : []))).filter((id) => getUser(db, id));
     if (memberIds.length < 2) return sendError(res, 400, "群聊至少需要 2 名成员");
     const thread = {
@@ -4218,6 +4692,7 @@ async function handleApi(req, res, pathname, searchParams) {
       updatedAt: now()
     };
     db.chatThreads.unshift(thread);
+    recordAudit(db, actor, "chat.group_create", { resourceType: "chatThread", resourceId: thread.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, thread });
   }
@@ -4230,6 +4705,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const message = { id: uid("chat"), fromUserId: body.fromUserId, content: String(body.content), createdAt: now(), deletedFor: [] };
     thread.messages.push(message);
     thread.updatedAt = now();
+    recordAudit(db, actor, "chat.message_send", { resourceType: "chatThread", resourceId: thread.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, message, thread });
   }
@@ -4245,13 +4721,14 @@ async function handleApi(req, res, pathname, searchParams) {
       }
     });
     thread.updatedAt = now();
+    recordAudit(db, actor, "chat.message_delete", { resourceType: "chatThread", resourceId: thread.id, meta: { count: body.messageIds.length } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, thread });
   }
 
   if (method === "GET" && pathname === "/api/classes") {
-    const teacherId = searchParams.get("teacherId");
-    const studentId = searchParams.get("studentId");
+    const teacherId = actor.role === "teacher" ? actor.id : (actor.role === "admin" ? searchParams.get("teacherId") : "");
+    const studentId = actor.role === "student" ? actor.id : (actor.role === "admin" ? searchParams.get("studentId") : "");
     let classes = db.classes;
     if (teacherId) classes = classes.filter((item) => item.teacherId === teacherId);
     if (studentId) classes = classes.filter((item) => item.studentIds.includes(studentId));
@@ -4262,7 +4739,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["teacherId", "name", "subject"]);
     const teacher = ensureUser(db, body.teacherId);
-    if (teacher.role !== "teacher") return sendError(res, 403, "只有教师可以创建班级");
+    if (!["teacher", "admin"].includes(teacher.role)) return sendError(res, 403, "只有教师可以创建班级");
     const klass = {
       id: uid("class"),
       teacherId: teacher.id,
@@ -4276,6 +4753,7 @@ async function handleApi(req, res, pathname, searchParams) {
       updatedAt: now()
     };
     db.classes.unshift(klass);
+    recordAudit(db, actor, "class.create", { resourceType: "class", resourceId: klass.id, meta: { name: klass.name, subject: klass.subject } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, class: klass });
   }
@@ -4298,7 +4776,7 @@ async function handleApi(req, res, pathname, searchParams) {
           id: studentNo && /^\d{8}$/.test(studentNo) && !db.users.some((item) => item.id === studentNo) ? studentNo : generateUserId(db),
           name: name || `学生${studentNo || db.users.length + 1}`,
           role: "student",
-          password: "123456",
+          passwordHash: hashPassword("123456"),
           subject: "",
           className: klass.name,
           classIds: [],
@@ -4316,6 +4794,7 @@ async function handleApi(req, res, pathname, searchParams) {
       added.push(publicUser(user));
     });
     klass.updatedAt = now();
+    recordAudit(db, actor, "class.import_students", { resourceType: "class", resourceId: klass.id, meta: { count: added.length } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, added, class: klass });
   }
@@ -4324,6 +4803,7 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && params) {
     const body = await readBody(req);
     assertRequired(body, ["studentId"]);
+    requireRole(actor, ["student", "admin"]);
     const klass = db.classes.find((item) => item.id === params.id || item.inviteCode === params.id);
     if (!klass) return notFound(res);
     const student = ensureUser(db, body.studentId);
@@ -4342,13 +4822,14 @@ async function handleApi(req, res, pathname, searchParams) {
     };
     klass.applications.unshift(application);
     klass.updatedAt = now();
+    recordAudit(db, actor, "class.apply", { resourceType: "class", resourceId: klass.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, application, class: klass });
   }
 
   if (method === "GET" && pathname === "/api/homework") {
-    const teacherId = searchParams.get("teacherId");
-    const studentId = searchParams.get("studentId");
+    const teacherId = actor.role === "teacher" ? actor.id : (actor.role === "admin" ? searchParams.get("teacherId") : "");
+    const studentId = actor.role === "student" ? actor.id : (actor.role === "admin" ? searchParams.get("studentId") : "");
     let homework = db.homework;
     if (teacherId) homework = homework.filter((item) => item.teacherId === teacherId);
     if (studentId) {
@@ -4356,12 +4837,20 @@ async function handleApi(req, res, pathname, searchParams) {
       const ids = user.classIds || [];
       homework = homework.filter((item) => ids.includes(item.classId));
     }
-    return send(res, 200, { ok: true, homework, submissions: db.submissions });
+    const homeworkIds = new Set(homework.map((item) => item.id));
+    const submissions = db.submissions.filter((item) => {
+      if (!homeworkIds.has(item.homeworkId)) return false;
+      if (actor.role === "student") return item.studentId === actor.id;
+      if (actor.role === "teacher") return db.homework.some((homeworkItem) => homeworkItem.id === item.homeworkId && homeworkItem.teacherId === actor.id);
+      return true;
+    });
+    return send(res, 200, { ok: true, homework, submissions });
   }
 
   if (method === "POST" && pathname === "/api/homework") {
     const body = await readBody(req);
     assertRequired(body, ["teacherId", "classId", "title"]);
+    requireRole(actor, ["teacher", "admin"]);
     const klass = db.classes.find((item) => item.id === body.classId && item.teacherId === body.teacherId);
     if (!klass) return sendError(res, 404, "班级不存在或无权限");
     const homework = {
@@ -4376,6 +4865,7 @@ async function handleApi(req, res, pathname, searchParams) {
       updatedAt: now()
     };
     db.homework.unshift(homework);
+    recordAudit(db, actor, "homework.create", { resourceType: "homework", resourceId: homework.id, meta: { title: homework.title, classId: homework.classId } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, homework });
   }
@@ -4396,6 +4886,7 @@ async function handleApi(req, res, pathname, searchParams) {
     if (body.answer !== undefined) homework.answer = String(body.answer || "");
     if (Array.isArray(body.attachments) && body.attachments.length) homework.attachments = body.attachments;
     homework.updatedAt = now();
+    recordAudit(db, actor, "homework.update", { resourceType: "homework", resourceId: homework.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, homework });
   }
@@ -4405,6 +4896,7 @@ async function handleApi(req, res, pathname, searchParams) {
     const homework = db.homework.find((item) => item.id === params.id);
     if (!homework) return notFound(res);
     if (homework.teacherId !== body.teacherId) return sendError(res, 403, "无权删除该作业");
+    recordAudit(db, actor, "homework.delete", { resourceType: "homework", resourceId: homework.id }, req);
     db.homework = db.homework.filter((item) => item.id !== homework.id);
     db.submissions = db.submissions.filter((item) => item.homeworkId !== homework.id);
     writeDb(db);
@@ -4415,6 +4907,7 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && params) {
     const body = await readBody(req);
     assertRequired(body, ["studentId"]);
+    requireRole(actor, ["student", "admin"]);
     const homework = db.homework.find((item) => item.id === params.id);
     if (!homework) return notFound(res);
     const student = ensureUser(db, body.studentId);
@@ -4434,6 +4927,7 @@ async function handleApi(req, res, pathname, searchParams) {
       submission = { id: uid("submission"), ...payload, createdAt: now() };
       db.submissions.unshift(submission);
     }
+    recordAudit(db, actor, "homework.submit", { resourceType: "submission", resourceId: submission.id, meta: { homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, submission });
   }
@@ -4441,6 +4935,7 @@ async function handleApi(req, res, pathname, searchParams) {
   params = routePattern(pathname, "/api/submissions/:id/ai-grade");
   if (method === "POST" && params) {
     const body = await readBody(req);
+    requireRole(actor, ["teacher", "admin"]);
     const submission = db.submissions.find((item) => item.id === params.id);
     if (!submission) return notFound(res);
     const homework = db.homework.find((item) => item.id === submission.homeworkId);
@@ -4480,6 +4975,7 @@ async function handleApi(req, res, pathname, searchParams) {
         recommendation: "先补齐缺失要点，再生成 2 道同类题练习。"
       });
     }
+    recordAudit(db, actor, "submission.ai_grade", { resourceType: "submission", resourceId: submission.id, meta: { score: submission.score, homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, submission });
   }
@@ -4487,6 +4983,7 @@ async function handleApi(req, res, pathname, searchParams) {
   params = routePattern(pathname, "/api/submissions/:id/manual-grade");
   if (method === "POST" && params) {
     const body = await readBody(req);
+    requireRole(actor, ["teacher", "admin"]);
     const submission = db.submissions.find((item) => item.id === params.id);
     if (!submission) return notFound(res);
     const homework = db.homework.find((item) => item.id === submission.homeworkId);
@@ -4499,6 +4996,7 @@ async function handleApi(req, res, pathname, searchParams) {
     submission.updatedAt = now();
     const topics = inferQuestionTopics(`${homework.title} ${homework.description}`, "");
     updateTopicMastery(db, submission.studentId, topics, Number(body.score) >= 80 ? 0.06 : Number(body.score) >= 60 ? 0.01 : -0.06, `教师手动批改：${homework.title}`);
+    recordAudit(db, actor, "submission.manual_grade", { resourceType: "submission", resourceId: submission.id, meta: { score: submission.score, homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, submission });
   }
@@ -4525,7 +5023,7 @@ function serveStatic(req, res, pathname) {
   const safePath = pathname === "/" ? "/index.html" : pathname;
   const filePath = path.normalize(path.join(PUBLIC_DIR, safePath));
   if (!filePath.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403);
+    res.writeHead(403, SECURITY_HEADERS);
     res.end("Forbidden");
     return;
   }
@@ -4533,16 +5031,16 @@ function serveStatic(req, res, pathname) {
     if (error) {
       fs.readFile(path.join(PUBLIC_DIR, "index.html"), (fallbackError, fallback) => {
         if (fallbackError) {
-          res.writeHead(404);
+          res.writeHead(404, SECURITY_HEADERS);
           res.end("Not found");
         } else {
-          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          res.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8" });
           res.end(fallback);
         }
       });
       return;
     }
-    res.writeHead(200, { "content-type": contentType(filePath) });
+    res.writeHead(200, { ...SECURITY_HEADERS, "content-type": contentType(filePath) });
     res.end(data);
   });
 }

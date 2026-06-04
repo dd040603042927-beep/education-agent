@@ -481,7 +481,11 @@ function formatBytes(bytes) {
 }
 
 function roleName(role) {
-  return role === "teacher" ? "教师" : "学生";
+  return role === "admin" ? "管理员" : role === "teacher" ? "教师" : "学生";
+}
+
+function isTeacherLike() {
+  return state.user?.role === "teacher" || state.user?.role === "admin";
 }
 
 function showToast(message, type = "ok") {
@@ -493,7 +497,8 @@ function showToast(message, type = "ok") {
 async function api(path, options = {}) {
   const init = {
     method: options.method || "GET",
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin"
   };
   if (options.body !== undefined) init.body = JSON.stringify(options.body);
   const res = await fetch(path, init);
@@ -544,7 +549,7 @@ function getCurrentUser() {
 
 async function loadState() {
   if (!state.user) return;
-  const payload = await api(`/api/state?userId=${encodeURIComponent(state.user.id)}`);
+  const payload = await api("/api/state");
   state.data = payload.state;
   state.user = payload.state.user;
   localStorage.setItem("edu-user", JSON.stringify(state.user));
@@ -556,7 +561,15 @@ async function loadState() {
 async function boot() {
   state.user = getCurrentUser();
   if (!state.user) {
-    renderAuth();
+    try {
+      const payload = await api("/api/session");
+      state.user = payload.user;
+      state.data = payload.state;
+      localStorage.setItem("edu-user", JSON.stringify(state.user));
+      renderShell();
+    } catch {
+      renderAuth();
+    }
     return;
   }
   try {
@@ -697,18 +710,19 @@ function renderAuth() {
 }
 
 function renderShell() {
-  const menus = state.user.role === "teacher" ? teacherMenus : studentMenus;
+  const teacherSide = isTeacherLike();
+  const menus = teacherSide ? teacherMenus : studentMenus;
   const classes = state.data?.classes || [];
   if (state.page === "history") state.page = "ai";
   app.innerHTML = `
     <div class="layout">
       <aside class="sidebar">
         <div class="side-brand">
-          <strong>${state.user.role === "teacher" ? "📖 教学中枢" : "📚 学习索引"}</strong>
+          <strong>${teacherSide ? "📖 教学中枢" : "📚 学习索引"}</strong>
           <span>${escapeHtml(state.user.name)}（${roleName(state.user.role)}）</span>
           <small>ID：${state.user.id}</small>
         </div>
-        <div class="section-label">${state.user.role === "teacher" ? "教师端" : "学生端"}</div>
+        <div class="section-label">${teacherSide ? "教师端" : "学生端"}</div>
         <nav class="nav">
           ${menus.map((item) => `
             <button class="nav-item ${state.page === item.key ? "active" : ""}" data-page="${item.key}">
@@ -718,11 +732,11 @@ function renderShell() {
           `).join("")}
         </nav>
         <div class="profile-mini">
-          <strong>${state.user.role === "teacher" ? "🏫 我的信息" : "👤 我的信息"}</strong>
+          <strong>${teacherSide ? "🏫 我的信息" : "👤 我的信息"}</strong>
           <dl>
             <dt>姓名：</dt><dd>${escapeHtml(state.user.name)}</dd>
-            <dt>${state.user.role === "teacher" ? "学科：" : "班级："}</dt><dd>${escapeHtml(state.user.role === "teacher" ? (state.user.subject || "未设置") : (state.user.className || "未加入"))}</dd>
-            <dt>${state.user.role === "teacher" ? "班级数：" : "班级数："}</dt><dd>${classes.length || 0}</dd>
+            <dt>${teacherSide ? "学科：" : "班级："}</dt><dd>${escapeHtml(teacherSide ? (state.user.subject || "未设置") : (state.user.className || "未加入"))}</dd>
+            <dt>班级数：</dt><dd>${classes.length || 0}</dd>
           </dl>
         </div>
         <button id="logoutBtn" class="ghost wide">退出登录</button>
@@ -731,7 +745,7 @@ function renderShell() {
         <header class="topbar">
           <div>
             <strong>🧠 智慧教育智能体平台</strong>
-            <span>${state.user.role === "teacher" ? "面向备课、授课、班级与作业闭环" : "面向学习、练习、模型与作业提交"}</span>
+            <span>${teacherSide ? "面向备课、授课、班级与作业闭环" : "面向学习、练习、模型与作业提交"}</span>
           </div>
         </header>
         <section id="content" class="content"></section>
@@ -790,15 +804,17 @@ function renderShell() {
     renderShell();
   }, { once: true });
   document.getElementById("logoutBtn").addEventListener("click", () => {
-    localStorage.removeItem("edu-user");
-    Object.assign(state, {
-      user: null,
-      data: null,
-      page: "graph",
-      activeConversationId: null,
-      activeThreadId: null
+    api("/api/auth/logout", { method: "POST", body: {} }).catch(() => null).finally(() => {
+      localStorage.removeItem("edu-user");
+      Object.assign(state, {
+        user: null,
+        data: null,
+        page: "graph",
+        activeConversationId: null,
+        activeThreadId: null
+      });
+      renderAuth();
     });
-    renderAuth();
   });
   document.getElementById("refreshBtn").addEventListener("click", async () => {
     await loadState();
@@ -831,7 +847,7 @@ function renderContent() {
     models: renderModelPage,
     chat: renderChatPage,
     classes: renderClassPage,
-    homework: state.user.role === "teacher" ? renderTeacherHomeworkPage : renderStudentHomeworkPage,
+    homework: isTeacherLike() ? renderTeacherHomeworkPage : renderStudentHomeworkPage,
     profile: renderProfilePage
   };
   const renderer = pageMap[state.page] || renderGraphPage;
@@ -847,7 +863,7 @@ function bindCurrentPage() {
     models: bindModelPage,
     chat: bindChatPage,
     classes: bindClassPage,
-    homework: state.user.role === "teacher" ? bindTeacherHomeworkPage : bindStudentHomeworkPage,
+    homework: isTeacherLike() ? bindTeacherHomeworkPage : bindStudentHomeworkPage,
     profile: bindProfilePage
   };
   (binders[state.page] || bindGraphPage)();
@@ -862,7 +878,7 @@ function graphListForCurrentRole() {
 }
 
 function renderGraphPage() {
-  return state.user.role === "teacher" ? renderTeacherGraphPage() : renderStudentGraphPage();
+  return isTeacherLike() ? renderTeacherGraphPage() : renderStudentGraphPage();
 }
 
 function graphCard(graph) {
@@ -2726,7 +2742,8 @@ async function uploadFileInChunks(file, onProgress = () => {}, signal = null) {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: chunk,
-      signal
+      signal,
+      credentials: "same-origin"
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) throw new Error(payload.error || `第 ${index + 1} 个分块上传失败`);
@@ -3301,7 +3318,7 @@ function renderMaterialsPage() {
           </div>
           <label>上传资料<input name="file" type="file" accept="${COURSE_MATERIAL_ACCEPT}" /></label>
           <label>或粘贴资料内容<textarea name="sourceText" rows="8" placeholder="可粘贴教材章节、讲义、习题解析、实验文档内容"></textarea></label>
-          ${state.user.role === "teacher" ? `<label class="check-line"><input name="global" type="checkbox" /> 学生可检索这份资料</label>` : ""}
+          ${isTeacherLike() ? `<label class="check-line"><input name="global" type="checkbox" /> 学生可检索这份资料</label>` : ""}
           <p class="hint">支持 PDF、扫描版图片 PDF、Word、PPTX、Excel、Markdown、TXT、CSV、JSON 等格式；大文件会分块上传，扫描版 PDF 会尝试 OCR。</p>
           <button class="primary" type="submit">入库并建立 RAG 索引</button>
           <p id="materialUploadStatus" class="hint"></p>
@@ -3565,7 +3582,7 @@ function inferAiModeFromPrompt(prompt, isTeacher) {
 }
 
 function renderAiPage() {
-  const isTeacher = state.user.role === "teacher";
+  const isTeacher = isTeacherLike();
   const conversations = state.data.conversations || [];
   const active = conversations.find((conv) => conv.id === state.activeConversationId) || conversations[0];
   if (active && !state.activeConversationId) {
@@ -3643,7 +3660,7 @@ function bindAiPage() {
     const cleanPrompt = String(prompt || "").trim();
     if (!cleanPrompt) return;
     syncAiControls();
-    const inferredMode = inferAiModeFromPrompt(cleanPrompt, state.user.role === "teacher");
+    const inferredMode = inferAiModeFromPrompt(cleanPrompt, isTeacherLike());
     const selectedMode = normalizeAiModeClient(explicitMode || state.aiMode);
     const mode = explicitMode ? selectedMode : (selectedMode && selectedMode !== "qa" ? selectedMode : inferredMode);
     state.aiMode = mode;
