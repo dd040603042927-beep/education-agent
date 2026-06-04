@@ -6,7 +6,7 @@ const zlib = require("zlib");
 const { spawn } = require("child_process");
 
 const PORT = Number(process.env.PORT || 5107);
-const HOST = "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
@@ -2775,8 +2775,197 @@ function isAcademicMisuse(prompt) {
   return /直接.*(写|生成|完成).*(作业|论文|实验报告|考试|答案)|代写|替我写|帮我作弊|考试.*答案|不要解释.*只给答案/.test(String(prompt || ""));
 }
 
+const AI_MODE_META = {
+  qa: {
+    label: "问答模式",
+    strategy: "课程 RAG 问答",
+    structure: "结论、依据、补充推理、下一步"
+  },
+  explain: {
+    label: "讲解模式",
+    strategy: "分层讲解",
+    structure: "定义、通俗解释、资料依据、例子、误区、练习"
+  },
+  guided: {
+    label: "引导模式",
+    strategy: "苏格拉底式引导",
+    structure: "关键提示、追问、前置知识、下一步作答"
+  },
+  practice: {
+    label: "练习模式",
+    strategy: "自适应练习",
+    structure: "知识点、分层题目、答案解析、错因提醒"
+  },
+  grade: {
+    label: "批改模式",
+    strategy: "错因诊断",
+    structure: "总体评价、正确点、错误点、修改建议、复习建议"
+  },
+  plan: {
+    label: "规划模式",
+    strategy: "学习路径规划",
+    structure: "目标、优先级、每日任务、练习安排、检测方式"
+  }
+};
+
+function aiModeAlias(mode) {
+  const raw = String(mode || "").trim().toLowerCase();
+  const aliases = {
+    rag: "qa",
+    answer: "qa",
+    question: "qa",
+    questions: "practice",
+    quiz: "practice",
+    socratic: "guided",
+    hint: "guided",
+    guide: "guided",
+    guided_tutoring: "guided",
+    "study-plan": "plan",
+    "teacher-plan": "plan",
+    correction: "grade",
+    grading: "grade",
+    qa: "qa",
+    explain: "explain",
+    guided: "guided",
+    practice: "practice",
+    grade: "grade",
+    plan: "plan"
+  };
+  return aliases[raw] || null;
+}
+
+function detectTeachingIntent(prompt, requestedMode, role = "student") {
+  const text = String(prompt || "");
+  let mode = aiModeAlias(requestedMode);
+  if (!mode || String(requestedMode || "").trim().toLowerCase() === "auto") {
+    if (/批改|评分|看看.*答案|哪里错|错因|修改建议|改作业|检查代码|实验报告反馈/.test(text)) mode = "grade";
+    else if (/苏格拉底|追问|引导|提示模式|只给.*提示|分步提示|不要直接给答案|先问我|一步步/.test(text)) mode = "guided";
+    else if (/出题|生成.*题|练习|测验|选择题|填空题|简答题|计算题|编程题|错题|类似题|同类题/.test(text)) mode = "practice";
+    else if (/复习|学习路径|复习路径|学习计划|规划|薄弱点|掌握度|推荐顺序|每日|每周|考试|教案|教学设计|课堂设计|授课方案/.test(text)) mode = "plan";
+    else if (/讲解|解释|是什么|为什么|原理|通俗|推导|举例|对比|区别/.test(text)) mode = "explain";
+    else mode = "qa";
+  }
+  const teacherDesign = role === "teacher" && /教学设计|教案|课堂设计|授课方案|教学目标|重难点|课堂流程|评分标准/.test(text);
+  const strategy = teacherDesign
+    ? "教师助手：教学设计生成"
+    : AI_MODE_META[mode]?.strategy || "课程 RAG 问答";
+  const intent = teacherDesign ? "teacher-design" : mode;
+  return {
+    mode,
+    label: AI_MODE_META[mode]?.label || "问答模式",
+    intent,
+    strategy,
+    answerStructure: AI_MODE_META[mode]?.structure || AI_MODE_META.qa.structure
+  };
+}
+
 function inferQuestionTopics(text, subject = "") {
   return extractKeywords(text, subject).slice(0, 6);
+}
+
+function linkEndpointId(value) {
+  if (value && typeof value === "object") return String(value.id || value.key || value.label || "");
+  return String(value || "");
+}
+
+function relationBucket(label = "") {
+  const text = String(label || "");
+  if (/前置|依赖|先修|基础/.test(text)) return "prerequisite";
+  if (/混淆|误区|迷思|区别|对比/.test(text)) return "misconception";
+  if (/考|题|测|评分|难度/.test(text)) return "assessment";
+  if (/资源|视频|讲义|实验|资料/.test(text)) return "resource";
+  if (/复习|路径|推荐/.test(text)) return "review";
+  return "related";
+}
+
+function graphNodeText(node) {
+  return [
+    node.label,
+    node.details,
+    node.summary,
+    node.description,
+    node.ontology?.layer,
+    node.ontology?.parent,
+    ...(node.knowledgePoints || []),
+    ...(node.misconceptions || [])
+  ].filter(Boolean).join(" ");
+}
+
+function findGraphContext(db, userId, subject, prompt, topics = [], hits = []) {
+  const queryText = [prompt, subject, ...topics].filter(Boolean).join(" ");
+  const queryTokens = new Set(tokenizeForSearch(queryText));
+  const graphHitNodeIds = new Set(hits.filter((hit) => hit.type === "graph").map((hit) => `${hit.graphId}:${hit.nodeId}`));
+  const graphs = (db.knowledgeGraphs || []).filter((graph) => {
+    return graph.ownerId === userId || graph.global || !subject || subject === "通用" || graph.subject === subject || String(prompt).includes(graph.subject);
+  });
+  const candidates = [];
+  graphs.forEach((graph) => {
+    (graph.nodes || []).forEach((node) => {
+      const nodeText = graphNodeText(node);
+      const tokens = tokenizeForSearch(nodeText);
+      const overlap = tokens.filter((token) => queryTokens.has(token)).length;
+      const exact = String(prompt).includes(node.label) ? 8 : 0;
+      const hitBoost = graphHitNodeIds.has(`${graph.id}:${node.id}`) ? 6 : 0;
+      const score = overlap * 2 + exact + hitBoost;
+      if (score > 0) candidates.push({ graph, node, score });
+    });
+  });
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  if (!best) {
+    return {
+      focusNode: null,
+      relatedNodes: topics.slice(0, 6).map((topic) => ({ label: topic })),
+      prerequisiteNodes: [],
+      misconceptionNodes: [],
+      path: [],
+      graphTitle: "",
+      graphId: ""
+    };
+  }
+  const nodeMap = new Map((best.graph.nodes || []).map((node) => [String(node.id), node]));
+  const related = [];
+  const prerequisite = [];
+  const misconception = [];
+  (best.graph.links || []).forEach((link) => {
+    const source = linkEndpointId(link.source);
+    const target = linkEndpointId(link.target);
+    const touches = source === String(best.node.id) || target === String(best.node.id);
+    if (!touches) return;
+    const otherId = source === String(best.node.id) ? target : source;
+    const other = nodeMap.get(otherId);
+    if (!other) return;
+    const item = {
+      id: other.id,
+      label: other.label,
+      relation: link.label || "关联",
+      direction: target === String(best.node.id) ? "incoming" : "outgoing"
+    };
+    const bucket = relationBucket(link.label);
+    if (bucket === "prerequisite" || (target === String(best.node.id) && /包含|细分|支撑/.test(String(link.label || "")))) prerequisite.push(item);
+    else if (bucket === "misconception") misconception.push(item);
+    else related.push(item);
+  });
+  const parentLabel = best.node.ontology?.parent || "";
+  const path = [best.graph.subject, parentLabel, best.node.label].filter(Boolean);
+  return {
+    graphId: best.graph.id,
+    graphTitle: best.graph.title,
+    focusNode: {
+      id: best.node.id,
+      label: best.node.label,
+      details: best.node.details || best.node.summary || "",
+      layer: best.node.ontology?.layer || best.node.group || "知识点"
+    },
+    relatedNodes: related.concat(candidates.slice(1, 7).map((item) => ({
+      id: item.node.id,
+      label: item.node.label,
+      relation: "相邻知识点"
+    }))).slice(0, 8),
+    prerequisiteNodes: prerequisite.slice(0, 6),
+    misconceptionNodes: misconception.concat((best.node.misconceptions || []).map((label) => ({ label, relation: "常见误区" }))).slice(0, 6),
+    path
+  };
 }
 
 function profileMasterySummary(profile) {
@@ -2855,15 +3044,144 @@ function formatCitations(citations) {
   return lines.join("\n");
 }
 
-function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
+function answerDepthLabel(depth) {
+  return {
+    brief: "简洁解释",
+    layered: "分层讲解",
+    full: "完整解析",
+    exam: "考试版"
+  }[String(depth || "layered")] || "分层讲解";
+}
+
+function citationEvidenceLines(hits, max = 3) {
+  return hits.slice(0, max).map((hit, index) => `依据 [S${index + 1}]：${String(hit.text || hit.quote || "").replace(/\s+/g, " ").slice(0, 150)}`);
+}
+
+function masteryItemsForTopics(profile, topics) {
+  return topics.slice(0, 8).map((topic) => {
+    const item = profile.mastery?.[topic] || {};
+    return {
+      topic,
+      score: item.score === undefined ? null : Number(item.score),
+      status: item.status || "待诊断"
+    };
+  });
+}
+
+function buildRecommendedExercises(mode, topics, graphContext) {
+  const topic = topics[0] || graphContext?.focusNode?.label || "当前知识点";
+  if (mode === "practice") {
+    return [
+      `基础题：用一句话解释「${topic}」并列出适用条件。`,
+      `提高题：比较「${topic}」和一个相邻知识点的区别。`,
+      `迁移题：设计一个需要应用「${topic}」解决的小题并写出评分点。`
+    ];
+  }
+  if (mode === "grade") {
+    return [
+      `复盘题：重新写出「${topic}」的定义、条件和解题步骤。`,
+      "错因题：把本次错误归类为概念、条件、步骤或表达问题。",
+      "同类题：换一组条件再完成一次，并标出每一步依据。"
+    ];
+  }
+  if (mode === "plan") {
+    return [
+      `今天：整理「${topic}」的定义和前置知识。`,
+      "明天：完成 3 道基础题和 1 道迁移题。",
+      "复盘：24 小时后重做错题并更新掌握度。"
+    ];
+  }
+  if (mode === "guided") {
+    return [
+      `先回答：你认为「${topic}」最关键的条件是什么？`,
+      "再写出第一步依据，不要直接跳到结论。",
+      "如果卡住，只补充你不确定的那一步。"
+    ];
+  }
+  return [
+    `复述「${topic}」的定义并举一个例子。`,
+    `列出「${topic}」的一个易错点。`,
+    "做 1 道基础题检验是否真正理解。"
+  ];
+}
+
+function buildAgentActions(mode, topics) {
+  const topic = topics[0] || "当前知识点";
+  const common = [
+    { type: "simplify", label: "讲得更简单", mode: "explain", prompt: `请把「${topic}」讲得更简单，并用生活类比说明。` },
+    { type: "example", label: "举个例子", mode: "explain", prompt: `请围绕「${topic}」举一个完整例子，并说明每一步对应的知识点。` },
+    { type: "sources", label: "显示来源", mode, prompt: "" }
+  ];
+  const byMode = {
+    qa: [{ type: "hint", label: "只给提示", mode: "guided", prompt: `围绕「${topic}」只给我下一步提示，不要直接给完整答案。` }],
+    explain: [{ type: "quiz", label: "给我一道题", mode: "practice", prompt: `请根据「${topic}」生成 1 道基础题、1 道提高题，并附答案解析。` }],
+    guided: [{ type: "full", label: "完整解析", mode: "explain", prompt: `请把「${topic}」按完整解析模式讲清楚。` }],
+    practice: [{ type: "grade", label: "批改我的答案", mode: "grade", prompt: `请按批改模式检查我对「${topic}」的答案。` }],
+    grade: [{ type: "quiz", label: "生成同类题", mode: "practice", prompt: `请根据本次错因，为「${topic}」生成 2 道同类题并附解析。` }],
+    plan: [{ type: "quiz", label: "生成阶段测验", mode: "practice", prompt: `请根据「${topic}」生成一组阶段测验题并附答案解析。` }]
+  };
+  return common.concat(byMode[mode] || []).concat([
+    { type: "wrong-note", label: "加入错题本", mode, prompt: "" },
+    { type: "mastered", label: "标记已掌握", mode, prompt: "" }
+  ]);
+}
+
+function buildLearningPanel({ citations, topics, graphContext, profile, mode, strategy, answerDepth }) {
+  const mastery = masteryItemsForTopics(profile, topics);
+  const prerequisites = (graphContext?.prerequisiteNodes || []).map((node) => ({
+    label: node.label,
+    relation: node.relation || "前置依赖"
+  }));
+  const related = [
+    ...(graphContext?.focusNode ? [{ label: graphContext.focusNode.label, relation: "当前焦点" }] : []),
+    ...(graphContext?.relatedNodes || []).map((node) => ({ label: node.label, relation: node.relation || "相关知识点" })),
+    ...topics.map((topic) => ({ label: topic, relation: "自动识别" }))
+  ].filter((item, index, array) => item.label && array.findIndex((other) => other.label === item.label) === index).slice(0, 10);
+  const misconceptions = (graphContext?.misconceptionNodes || []).map((node) => ({
+    label: node.label,
+    relation: node.relation || "易混淆"
+  }));
+  const weak = mastery.filter((item) => item.score === null || item.score < 0.58).slice(0, 4);
+  const suggestions = [
+    citations.length ? "本轮回答已优先依据课程资料，可在引用来源中追溯。" : "当前缺少明确资料引用，建议先上传教材、课件或讲义。",
+    prerequisites.length ? `先复习前置知识：${prerequisites.slice(0, 3).map((item) => item.label).join("、")}。` : "如果理解困难，先补充定义、条件和典型例题。",
+    weak.length ? `需要重点观察：${weak.map((item) => item.topic).join("、")}。` : "当前知识点暂无明显低掌握记录。"
+  ];
+  return {
+    mode,
+    strategy,
+    answerDepth: answerDepthLabel(answerDepth),
+    citations: citations.slice(0, 5),
+    relatedKnowledgePoints: related,
+    prerequisites,
+    misconceptions,
+    recommendedExercises: buildRecommendedExercises(mode, topics, graphContext),
+    mastery,
+    suggestions,
+    graphFocus: graphContext?.focusNode ? {
+      graphId: graphContext.graphId,
+      graphTitle: graphContext.graphTitle,
+      nodeId: graphContext.focusNode.id,
+      label: graphContext.focusNode.label,
+      path: graphContext.path || []
+    } : null
+  };
+}
+
+function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint }) {
   const hasEvidence = hits.length > 0 && hits[0].score > 0;
-  const topics = inferQuestionTopics([prompt, ...hits.map((hit) => hit.text)].join("\n"), hits[0]?.subject || user.subject || "");
+  const topics = Array.from(new Set([
+    knowledgePoint,
+    ...inferQuestionTopics([prompt, chapter, knowledgePoint, ...hits.map((hit) => hit.text)].join("\n"), hits[0]?.subject || user.subject || "")
+  ].filter(Boolean))).slice(0, 8);
   const mastery = profileMasterySummary(profile);
   const levelHint = profile.level === "基础" || mastery.average < 0.58
     ? "我会先用通俗语言解释，再补充正式定义。"
     : "你已有一定基础，我会同时给出原理、边界条件和迁移应用。";
+  const effectiveMode = mode || teaching?.mode || "qa";
+  const depthHint = `回答深度：${answerDepthLabel(answerDepth)}。`;
   if (!hasEvidence) {
-    if (mode === "socratic") {
+    if (effectiveMode === "guided") {
       return {
         content: [
           "课程资料中没有检索到足够明确的依据，下面内容仅作为引导性学习建议。",
@@ -2880,7 +3198,7 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
         topics
       };
     }
-    if (mode === "questions" || mode === "practice") {
+    if (effectiveMode === "practice") {
       const topic = topics[0] || prompt;
       return {
         content: [
@@ -2902,7 +3220,26 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
         topics
       };
     }
-    if (mode === "teacher-plan") {
+    if (effectiveMode === "grade") {
+      const topic = topics[0] || prompt;
+      return {
+        content: [
+          "课程资料中没有检索到足够明确的参考答案，因此以下批改只能作为学习反馈，不能直接作为最终评分。",
+          "",
+          `【批改反馈：${topic}】`,
+          "1. 总体评价：请先确认你的答案是否写出了定义、条件、步骤和结论。",
+          "2. 可能正确点：如果你已经写出核心概念和应用场景，这部分可以保留。",
+          "3. 需要检查点：是否缺少关键条件、前置知识、推导依据或例题对应关系。",
+          "4. 修改建议：把答案改成“结论 + 依据 + 步骤 + 易错点”的结构。",
+          "5. 建议复习：上传标准答案或对应章节后，我可以按课程资料逐项评分。",
+          "",
+          "【可靠性说明】当前没有课程资料引用，建议补充标准答案或课程资料。"
+        ].join("\n"),
+        confidence: "low",
+        topics
+      };
+    }
+    if (effectiveMode === "plan" && teaching?.intent === "teacher-design") {
       const topic = topics[0] || prompt;
       return {
         content: [
@@ -2927,7 +3264,7 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
         topics
       };
     }
-    if (mode === "plan") {
+    if (effectiveMode === "plan") {
       const weak = mastery.weak.map((item) => item.topic).concat(profile.weakPoints || []).filter(Boolean);
       return {
         content: [
@@ -2947,6 +3284,25 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
         topics
       };
     }
+    if (effectiveMode === "explain") {
+      const topic = topics[0] || prompt;
+      return {
+        content: [
+          "课程资料中没有检索到足够明确的依据，下面讲解只作为模型推理，不能当作教材结论。",
+          "",
+          `【概念讲解：${topic}】`,
+          "1. 简明定义：请先补充教材或课件后，我可以给出基于资料的准确定义。",
+          "2. 通俗解释：先把概念放到具体场景中理解，再回到正式定义。",
+          "3. 例子：用一个小例子验证这个概念的适用条件。",
+          "4. 常见误区：不要只记结论，要说明边界条件和前置知识。",
+          "5. 推荐练习：写出一个例子，再说明它为什么符合这个概念。",
+          "",
+          "【可靠性说明】当前没有课程资料引用，建议上传对应章节。"
+        ].join("\n"),
+        confidence: "low",
+        topics
+      };
+    }
     return {
       content: [
         "课程资料中没有检索到足够明确的依据，因此我不能把下面内容当作资料结论。",
@@ -2959,11 +3315,12 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
     };
   }
 
-  const evidenceLines = hits.slice(0, 3).map((hit, index) => `依据 [S${index + 1}]：${String(hit.text || hit.quote).slice(0, 160)}`);
-  if (mode === "socratic") {
+  const evidenceLines = citationEvidenceLines(hits);
+  if (effectiveMode === "guided") {
     return {
       content: [
         `${levelHint}`,
+        depthHint,
         "【苏格拉底式引导】我先不直接给最终答案，先按三步帮你判断：",
         `1. 先看资料依据：${evidenceLines[0] || "当前片段不足"}`,
         `2. 你先回答：这里最关键的概念或条件是什么？`,
@@ -2977,7 +3334,7 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
       topics
     };
   }
-  if (mode === "questions" || mode === "practice") {
+  if (effectiveMode === "practice") {
     const topic = topics[0] || prompt;
     return {
       content: [
@@ -2999,7 +3356,42 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
       topics
     };
   }
-  if (mode === "plan") {
+  if (effectiveMode === "grade") {
+    const topic = topics[0] || prompt;
+    return {
+      content: [
+        `【批改反馈：${topic}】`,
+        "1. 总体评价：你的答案需要和课程资料中的定义、条件、步骤逐项对应。",
+        `2. 资料依据：${evidenceLines[0] || "当前片段不足"}。`,
+        "3. 正确的地方：如果答案已经覆盖核心定义和适用场景，可以作为保留部分。",
+        "4. 需要补充的地方：检查是否遗漏前置条件、推导过程、关键术语或结论边界。",
+        "5. 修改建议：按“概念定位 -> 关键条件 -> 分步依据 -> 最终结论 -> 易错提醒”重写。",
+        "6. 建议复习知识点：先复盘相关定义，再做 1 道同类题检验。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "high",
+      topics
+    };
+  }
+  if (effectiveMode === "plan" && teaching?.intent === "teacher-design") {
+    const topic = topics[0] || prompt;
+    return {
+      content: [
+        `【45 分钟教学设计：${topic}】`,
+        `教学目标：学生能依据课程资料解释「${topic}」的概念、条件和应用。`,
+        "重难点：概念边界、典型题型、易混淆点和迁移应用。",
+        "教学流程：5 分钟前测；12 分钟概念讲解；12 分钟例题拆解；10 分钟分层练习；4 分钟错因归纳；2 分钟布置复习任务。",
+        "课堂提问：这个概念的前置知识是什么？如果条件变化，结论是否仍成立？",
+        "课后作业：1 道基础题、1 道迁移题、1 个错因反思。",
+        "",
+        `【引用来源】\n${formatCitations(citations)}`
+      ].join("\n"),
+      confidence: "high",
+      topics
+    };
+  }
+  if (effectiveMode === "plan") {
     const weak = mastery.weak.map((item) => item.topic).concat(profile.weakPoints || []).filter(Boolean);
     return {
       content: [
@@ -3017,16 +3409,19 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
       topics
     };
   }
-  if (mode === "teacher-plan") {
+  if (effectiveMode === "explain") {
     const topic = topics[0] || prompt;
     return {
       content: [
-        `【45 分钟教学设计：${topic}】`,
-        `教学目标：学生能依据课程资料解释「${topic}」的概念、条件和应用。`,
-        "重难点：概念边界、典型题型、易混淆点和迁移应用。",
-        "教学流程：5 分钟前测；12 分钟概念讲解；12 分钟例题拆解；10 分钟分层练习；4 分钟错因归纳；2 分钟布置复习任务。",
-        "课堂提问：这个概念的前置知识是什么？如果条件变化，结论是否仍成立？",
-        "课后作业：1 道基础题、1 道迁移题、1 个错因反思。",
+        `${levelHint}`,
+        depthHint,
+        `【概念讲解：${topic}】`,
+        `1. 简明定义：${String(hits[0].text || hits[0].quote).replace(/\s+/g, " ").slice(0, 180)}。`,
+        hits[1] ? `2. 通俗解释：可以结合资料 [S2] 把它理解为：${String(hits[1].text || hits[1].quote).replace(/\s+/g, " ").slice(0, 140)}。` : "2. 通俗解释：先把概念放进具体例题或实验场景中理解。",
+        `3. 课程资料依据：${evidenceLines[0] || "当前片段不足"}。`,
+        `4. 例子：围绕「${topic}」写一个小例子，并说明条件如何对应到定义。`,
+        "5. 常见误区：只记结论而不说明适用条件，或者把相邻概念混为一谈。",
+        `6. 推荐练习：用自己的话复述「${topic}」，再做 1 道基础题。`,
         "",
         `【引用来源】\n${formatCitations(citations)}`
       ].join("\n"),
@@ -3037,6 +3432,7 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
   return {
     content: [
       `${levelHint}`,
+      depthHint,
       "【课程资料依据】",
       ...evidenceLines,
       "",
@@ -3056,45 +3452,101 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile }) {
 
 function buildEducationalAgentAnswer(db, user, body) {
   const prompt = String(body.prompt || "").trim();
-  const mode = String(body.mode || "rag");
+  const teaching = detectTeachingIntent(prompt, body.mode || "auto", user.role);
+  const mode = teaching.mode;
   const subject = normalizeSubject(body.subject || user.subject || "");
+  const chapter = String(body.chapter || "").trim();
+  const knowledgePoint = String(body.knowledgePoint || "").trim();
+  const answerDepth = String(body.answerDepth || "layered");
   const profile = ensureLearningProfile(db, user.id);
   if (isAcademicMisuse(prompt)) {
+    const topics = inferQuestionTopics(prompt, subject);
+    const graphContext = findGraphContext(db, user.id, subject, prompt, topics, []);
+    const learningPanel = buildLearningPanel({
+      citations: [],
+      topics,
+      graphContext,
+      profile,
+      mode: "guided",
+      strategy: "学习诚信保护",
+      answerDepth
+    });
     return {
       content: "我不能直接代写作业、论文、实验报告或考试答案。可以改为帮你梳理结构、解释知识点、检查你的草稿、给出修改建议，或按提示模式一步步引导你完成。",
       citations: [],
       confidence: "safety",
-      topics: inferQuestionTopics(prompt, subject),
-      intent: "academic-integrity"
+      topics,
+      mode: "guided",
+      label: AI_MODE_META.guided.label,
+      intent: "academic-integrity",
+      strategy: "学习诚信保护",
+      knowledgePoints: topics,
+      graphContext,
+      actions: buildAgentActions("guided", topics),
+      learningPanel,
+      retrieved: []
     };
   }
-  const hits = searchCourseKnowledge(db, user.id, prompt, { subject, limit: RAG_MAX_CONTEXT_CHUNKS });
+  const retrievalQuery = [prompt, chapter, knowledgePoint].filter(Boolean).join("\n");
+  const hits = searchCourseKnowledge(db, user.id, retrievalQuery, { subject, limit: RAG_MAX_CONTEXT_CHUNKS });
   const citations = citationsFromHits(hits);
-  const agent = answerFromEvidence({ user, mode, prompt, hits, citations, profile });
+  const agent = answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint });
+  const graphContext = findGraphContext(db, user.id, subject, retrievalQuery, agent.topics, hits);
+  const topics = Array.from(new Set([
+    knowledgePoint,
+    graphContext.focusNode?.label,
+    ...(agent.topics || [])
+  ].filter(Boolean))).slice(0, 8);
   const evidenceDelta = agent.confidence === "high" ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
-  updateTopicMastery(db, user.id, agent.topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  const updatedProfile = updateTopicMastery(db, user.id, topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
   recordLearningActivity(db, user.id, {
-    kind: mode === "questions" || mode === "practice" ? "practice" : "question",
+    kind: mode === "practice" ? "practice" : "question",
     mode,
     prompt: prompt.slice(0, 120),
-    topics: agent.topics,
+    topics,
     confidence: agent.confidence,
     minutes: mode === "plan" ? 6 : 3
   });
-  if (agent.confidence === "low" && agent.topics[0]) {
+  if ((agent.confidence === "low" || mode === "grade") && topics[0]) {
     addWrongNote(db, user.id, {
-      source: "不确定问答",
-      topic: agent.topics[0],
+      source: mode === "grade" ? "批改反馈" : "不确定问答",
+      topic: topics[0],
       question: prompt,
-      analysis: "课程资料中缺少明确依据，建议补充资料或回看前置概念。",
-      recommendation: "上传对应章节资料后重新提问。"
+      analysis: mode === "grade" ? "本轮触发批改/错因诊断，建议记录错误类型并生成同类题。" : "课程资料中缺少明确依据，建议补充资料或回看前置概念。",
+      recommendation: mode === "grade" ? "按修改建议重写答案，再完成 1 道同类题。" : "上传对应章节资料后重新提问。"
     });
   }
+  const learningPanel = buildLearningPanel({
+    citations,
+    topics,
+    graphContext,
+    profile: updatedProfile,
+    mode,
+    strategy: teaching.strategy,
+    answerDepth
+  });
   return {
     ...agent,
     citations,
-    intent: mode,
-    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score }))
+    mode,
+    label: teaching.label,
+    intent: teaching.intent,
+    strategy: teaching.strategy,
+    answerDepth,
+    knowledgePoints: topics,
+    graphContext,
+    actions: buildAgentActions(mode, topics),
+    learningPanel,
+    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter })),
+    tools: [
+      "intent_router",
+      "retrieve_course_material",
+      "query_knowledge_graph",
+      mode === "practice" ? "generate_quiz" : "",
+      mode === "grade" ? "grade_answer" : "",
+      mode === "plan" ? "create_study_plan" : "",
+      "update_mastery"
+    ].filter(Boolean)
   };
 }
 
@@ -3565,6 +4017,33 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 201, { ok: true, conversation: conv });
   }
 
+  if (method === "POST" && pathname === "/api/wrong-notes") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId"]);
+    ensureUser(db, body.userId);
+    const note = addWrongNote(db, body.userId, {
+      source: body.source || "对话操作",
+      topic: String(body.topic || "待归类").slice(0, 60),
+      question: String(body.question || "").slice(0, 500),
+      answer: String(body.answer || "").slice(0, 1000),
+      analysis: String(body.analysis || "用户从智能体回答中加入错题本。").slice(0, 500),
+      recommendation: String(body.recommendation || "建议生成同类题，并复盘前置知识。").slice(0, 500)
+    });
+    writeDb(db);
+    return send(res, 201, { ok: true, wrongNote: note, learningAnalytics: learningAnalytics(db, body.userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/mastery/update") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId"]);
+    ensureUser(db, body.userId);
+    const topics = Array.isArray(body.topics) ? body.topics.map(String) : [String(body.topic || "")];
+    const delta = Number.isFinite(Number(body.delta)) ? Number(body.delta) : 0.08;
+    const profile = updateTopicMastery(db, body.userId, topics, delta, String(body.evidence || "用户在对话中标记掌握"));
+    writeDb(db);
+    return send(res, 200, { ok: true, profile, learningAnalytics: learningAnalytics(db, body.userId) });
+  }
+
   if (method === "POST" && pathname === "/api/ai/chat") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "prompt"]);
@@ -3591,11 +4070,17 @@ async function handleApi(req, res, pathname, searchParams) {
       content: agentAnswer.content,
       citations: agentAnswer.citations,
       confidence: agentAnswer.confidence,
+      mode: agentAnswer.mode,
       intent: agentAnswer.intent,
+      strategy: agentAnswer.strategy,
+      knowledgePoints: agentAnswer.knowledgePoints,
+      graphContext: agentAnswer.graphContext,
+      learningPanel: agentAnswer.learningPanel,
+      actions: agentAnswer.actions,
       retrieved: agentAnswer.retrieved,
       createdAt: now()
     };
-    conv.mode = body.mode || conv.mode;
+    conv.mode = agentAnswer.mode || body.mode || conv.mode;
     conv.messages.push(userMessage, assistantMessage);
     conv.updatedAt = now();
     if (conv.title === "新的对话") conv.title = String(body.prompt).slice(0, 24);
@@ -3609,14 +4094,19 @@ async function handleApi(req, res, pathname, searchParams) {
       confidence: agentAnswer.confidence,
       citations: agentAnswer.citations,
       retrieved: agentAnswer.retrieved,
+      intent: agentAnswer.intent,
+      strategy: agentAnswer.strategy,
+      knowledgePoints: agentAnswer.knowledgePoints,
+      graphFocus: agentAnswer.learningPanel?.graphFocus || null,
+      tools: agentAnswer.tools || [],
       steps: [
-        "意图识别",
-        "学习画像读取",
+        `意图识别：${agentAnswer.label || agentAnswer.intent || conv.mode}`,
+        "上下文补全：课程/章节/知识点/学生画像",
         "课程资料 RAG 检索",
-        "知识图谱关联",
-        "生成回答",
+        "知识图谱关联与前置知识查询",
+        `教学策略：${agentAnswer.strategy || "课程 RAG 问答"}`,
         "可靠性与引用标注",
-        "学习记录更新"
+        "学习记录与掌握度更新"
       ],
       createdAt: now()
     });
@@ -3888,6 +4378,37 @@ async function handleApi(req, res, pathname, searchParams) {
     db.homework.unshift(homework);
     writeDb(db);
     return send(res, 201, { ok: true, homework });
+  }
+
+  params = routePattern(pathname, "/api/homework/:id");
+  if (method === "PUT" && params) {
+    const body = await readBody(req);
+    const homework = db.homework.find((item) => item.id === params.id);
+    if (!homework) return notFound(res);
+    if (homework.teacherId !== body.teacherId) return sendError(res, 403, "无权修改该作业");
+    if (body.classId) {
+      const klass = db.classes.find((item) => item.id === body.classId && item.teacherId === body.teacherId);
+      if (!klass) return sendError(res, 404, "班级不存在或无权限");
+      homework.classId = body.classId;
+    }
+    if (body.title !== undefined) homework.title = String(body.title || homework.title);
+    if (body.description !== undefined) homework.description = String(body.description || "");
+    if (body.answer !== undefined) homework.answer = String(body.answer || "");
+    if (Array.isArray(body.attachments) && body.attachments.length) homework.attachments = body.attachments;
+    homework.updatedAt = now();
+    writeDb(db);
+    return send(res, 200, { ok: true, homework });
+  }
+
+  if (method === "DELETE" && params) {
+    const body = await readBody(req);
+    const homework = db.homework.find((item) => item.id === params.id);
+    if (!homework) return notFound(res);
+    if (homework.teacherId !== body.teacherId) return sendError(res, 403, "无权删除该作业");
+    db.homework = db.homework.filter((item) => item.id !== homework.id);
+    db.submissions = db.submissions.filter((item) => item.homeworkId !== homework.id);
+    writeDb(db);
+    return send(res, 200, { ok: true });
   }
 
   params = routePattern(pathname, "/api/homework/:id/submit");
