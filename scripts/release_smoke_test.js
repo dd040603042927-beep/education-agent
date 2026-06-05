@@ -78,14 +78,15 @@ async function main() {
     const homepage = await requestText("/");
     assert(homepage.response.ok, "homepage should load");
     assert(homepage.response.headers.get("cache-control")?.includes("no-store"), "homepage should disable stale static cache");
-    assert(homepage.text.includes("/app.js?v=chat-standard-20260605"), "homepage should reference the standard chat app bundle");
-    assert(homepage.text.includes("/styles.css?v=chat-standard-20260605"), "homepage should reference the standard chat styles");
-    const appBundle = await requestText("/app.js?v=chat-standard-20260605");
+    assert(homepage.text.includes("/app.js?v=ml-lab-fix-20260605"), "homepage should reference the current app bundle");
+    assert(homepage.text.includes("/styles.css?v=ml-lab-fix-20260605"), "homepage should reference the current styles");
+    const appBundle = await requestText("/app.js?v=ml-lab-fix-20260605");
     assert(appBundle.response.ok, "app bundle should load with version query");
     assert(appBundle.response.headers.get("cache-control")?.includes("no-store"), "app bundle should disable stale static cache");
     assert(appBundle.text.includes("renderChatActionCards"), "app bundle should contain the unified chat action cards");
     assert(appBundle.text.includes("创建并发送邀请"), "app bundle should contain approval-based group creation UI");
     assert(!appBundle.text.includes("chat-action-head"), "app bundle should not contain the old chat action header");
+    assert(!appBundle.text.includes("面向备课、授课、班级与作业闭环"), "top bar should not contain the old teacher subtitle");
 
     const anonymousState = await request("/api/state");
     assert(anonymousState.response.status === 401, "anonymous /api/state should be rejected");
@@ -147,6 +148,19 @@ async function main() {
     });
     assert(modelCodeRun.response.ok && modelCodeRun.payload.success === true, "model code runner should execute Python code successfully");
     assert(modelCodeRun.payload.output.includes("sum: 10") && modelCodeRun.payload.output.includes("mean: 2.5"), "model code runner should return real stdout");
+
+    const plainTextRun = await request("/api/model-code/run", {
+      method: "POST",
+      cookie: duplicateTeacherCookie,
+      body: {
+        userId: duplicateUserId,
+        subject: "机器学习",
+        title: "plain text execution",
+        code: "hello machine learning lab"
+      }
+    });
+    assert(plainTextRun.response.ok && plainTextRun.payload.success === true, "model code runner should accept a plain one-line statement");
+    assert(plainTextRun.payload.output.includes("hello machine learning lab"), "plain one-line statement should be printed");
 
     const studentRegister = await request("/api/auth/register", {
       method: "POST",

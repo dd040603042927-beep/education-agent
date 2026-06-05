@@ -489,6 +489,7 @@ p {
   min-height: 68px;
   display: flex;
   align-items: center;
+  justify-content: center;
   padding: 0 34px;
   border-radius: 16px;
   background: linear-gradient(135deg, #176da2, #288f91);
@@ -497,16 +498,17 @@ p {
 }
 
 .topbar div {
-  display: grid;
-  gap: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  text-align: center;
 }
 
 .topbar strong {
-  font-size: 22px;
-}
-
-.topbar span {
-  color: rgba(255, 255, 255, 0.82);
+  font-size: clamp(30px, 3vw, 42px);
+  line-height: 1;
+  letter-spacing: 0;
 }
 
 .content {
@@ -2485,12 +2487,20 @@ p {
 .ml-model-content .model-canvas-panel,
 .ml-model-content .saved-models {
   min-height: 0;
-  overflow: hidden;
   padding: 14px;
 }
 
+.ml-model-content .model-canvas-panel,
+.ml-model-content .saved-models {
+  overflow: hidden;
+}
+
 .ml-model-content .palette-panel {
-  gap: 10px;
+  overflow: auto;
+}
+
+.ml-model-content .palette-panel {
+  gap: 8px;
 }
 
 .lab-head {
@@ -2534,24 +2544,37 @@ p {
 }
 
 .ml-model-content .palette {
-  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
 }
 
 .ml-model-content .palette-item {
-  min-height: 54px;
-  padding: 6px;
+  min-height: 44px;
+  padding: 5px 4px;
+  gap: 1px;
+  font-size: 12px;
 }
 
 .ml-model-content .palette-item span {
-  font-size: 20px;
+  font-size: 17px;
 }
 
 .ml-model-content .stack {
-  gap: 8px;
+  gap: 7px;
 }
 
 .ml-model-content .stack textarea {
-  min-height: 62px;
+  min-height: 48px;
+}
+
+.ml-model-content #saveModelForm button {
+  min-height: 38px;
+}
+
+.ml-model-content #saveModelForm .model-action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .model-canvas {
@@ -2635,6 +2658,12 @@ p {
   font-weight: 800;
   color: var(--text);
   line-height: 1.15;
+}
+
+.model-action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .model-code-panel {

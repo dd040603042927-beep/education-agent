@@ -1566,6 +1566,46 @@ function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOu
   return sections.join("\n").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS);
 }
 
+function modelCodeExecutableSource(source) {
+  return `import ast
+import traceback
+
+_source = ${JSON.stringify(String(source || ""))}
+_globals = {"__name__": "__main__", "__file__": "main.py"}
+
+try:
+    _tree = ast.parse(_source, filename="main.py", mode="exec")
+except SyntaxError:
+    if "\\n" not in _source and _source.strip():
+        print(_source.strip())
+    else:
+        raise
+else:
+    try:
+        if _tree.body and isinstance(_tree.body[-1], ast.Expr):
+            _last_expr = ast.Expression(_tree.body.pop().value)
+            ast.fix_missing_locations(_tree)
+            ast.fix_missing_locations(_last_expr)
+            exec(compile(_tree, "main.py", "exec"), _globals)
+            try:
+                _value = eval(compile(_last_expr, "main.py", "eval"), _globals)
+            except NameError:
+                if len(_tree.body) == 0 and "\\n" not in _source and _source.strip().isidentifier():
+                    print(_source.strip())
+                else:
+                    raise
+            else:
+                if _value is not None:
+                    print(_value)
+        else:
+            ast.fix_missing_locations(_tree)
+            exec(compile(_tree, "main.py", "exec"), _globals)
+    except Exception:
+        traceback.print_exc()
+        raise
+`;
+}
+
 function removeRuntimeTempDir(tempDir) {
   const resolvedRuntime = path.resolve(RUNTIME_DIR);
   const resolvedTarget = path.resolve(tempDir);
@@ -1602,7 +1642,7 @@ function runModelCodeSnippet(code) {
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
     const tempDir = fs.mkdtempSync(path.join(RUNTIME_DIR, "model-code-"));
     const scriptPath = path.join(tempDir, "main.py");
-    fs.writeFileSync(scriptPath, source, "utf8");
+    fs.writeFileSync(scriptPath, modelCodeExecutableSource(source), "utf8");
     const python = resolveModelCodePythonCommand();
     const child = spawn(python, ["-u", scriptPath], {
       windowsHide: true,

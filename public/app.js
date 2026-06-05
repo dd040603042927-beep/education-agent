@@ -844,7 +844,6 @@ function renderShell() {
         <header class="topbar">
           <div>
             <strong>🧠 智慧教育智能体平台</strong>
-            <span>${teacherSide ? "面向备课、授课、班级与作业闭环" : "面向学习、练习、模型与作业提交"}</span>
           </div>
         </header>
         <section id="content" class="content"></section>
@@ -4090,8 +4089,10 @@ function renderModelPage() {
         <form id="saveModelForm" class="stack">
           <label>模型名称<input name="name" value="${escapeHtml(models.find((model) => model.id === state.loadedModelId)?.name || "")}" placeholder="${isMachineLearning ? "例如：KNN分类实验" : "例如：斜面小车运动模型"}" /></label>
           <label>说明<textarea name="notes" rows="3" placeholder="记录参数、题目来源或使用场景"></textarea></label>
-          <button class="primary" type="submit" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "保存算法代码" : "保存模型"}</button>
-          <button class="ghost" type="button" id="downloadDraftModel" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "下载算法代码" : "下载当前模型"}</button>
+          <div class="model-action-row">
+            <button class="primary" type="submit" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "保存算法代码" : "保存模型"}</button>
+            <button class="ghost" type="button" id="downloadDraftModel" ${canSaveOrDownload ? "" : "disabled"}>${isMachineLearning ? "下载算法代码" : "下载当前模型"}</button>
+          </div>
           <button class="ghost" type="button" id="clearModelCanvas">清空画布</button>
           ${canSaveOrDownload ? "" : `<p class="hint">请先把模型或算法节点拖入画布，再保存或下载。</p>`}
         </form>
@@ -4305,7 +4306,13 @@ function bindModelPage() {
     resetModelCodeState();
     renderContent();
   });
-  document.getElementById("runModelCodeBtn")?.addEventListener("click", async () => {
+  document.getElementById("runModelCodeBtn")?.addEventListener("click", async (event) => {
+    const runButton = event.currentTarget;
+    const resultOutput = document.querySelector(".run-result-panel pre");
+    const setRunResult = (text) => {
+      state.modelRunResult = text;
+      if (resultOutput) resultOutput.textContent = text;
+    };
     const editor = document.getElementById("modelCodeEditor");
     const draft = editor ? editor.value : state.modelCodeDraft;
     state.modelCodeDraft = draft;
@@ -4316,14 +4323,14 @@ function bindModelPage() {
       component.props.code = draft;
     }
     if (!String(draft || "").trim()) {
-      state.modelRunResult = "执行状态：运行失败（退出码 1）\n\n[stderr]\n代码为空，请先在画布代码编辑器中输入 Python 代码。";
+      setRunResult("执行状态：运行失败（退出码 1）\n\n[stderr]\n代码为空，请先在画布代码编辑器中输入 Python 代码。");
       state.modelCodeRan = true;
-      renderContent();
       return;
     }
     state.modelCodeRunning = true;
-    state.modelRunResult = "正在执行代码，请稍候...";
-    renderContent();
+    runButton.disabled = true;
+    runButton.textContent = "运行中...";
+    setRunResult("正在执行代码，请稍候...");
     try {
       const payload = await api("/api/model-code/run", {
         method: "POST",
@@ -4335,7 +4342,7 @@ function bindModelPage() {
         }
       });
       state.modelCodeRan = true;
-      state.modelRunResult = payload.output || "程序执行完成，但没有返回输出。请在代码中使用 print(...) 输出测试结果。";
+      setRunResult(payload.output || "程序执行完成，但没有返回输出。请在代码中使用 print(...) 输出测试结果。");
       const current = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
       if (current) {
         current.props = current.props && typeof current.props === "object" ? current.props : {};
@@ -4347,10 +4354,11 @@ function bindModelPage() {
       }
     } catch (error) {
       state.modelCodeRan = true;
-      state.modelRunResult = `执行状态：运行接口错误\n\n[stderr]\n${error.message}`;
+      setRunResult(`执行状态：运行接口错误\n\n[stderr]\n${error.message}`);
     } finally {
       state.modelCodeRunning = false;
-      renderContent();
+      runButton.disabled = false;
+      runButton.textContent = "运行测试";
     }
   });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
