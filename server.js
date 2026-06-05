@@ -559,7 +559,7 @@ function ensureDbShape(db) {
       changed = true;
     }
   };
-  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions", "auditLogs"].forEach(ensureArray);
+  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions", "auditLogs", "friendships", "chatThreads", "friendRequests", "chatInvites"].forEach(ensureArray);
   db.users = Array.isArray(db.users) ? db.users : [];
   if (!db.users.some((user) => user.role === "admin")) {
     db.users.unshift({
@@ -615,6 +615,33 @@ function ensureDbShape(db) {
       homework.rubric = parseRubricInput(homework.rubricText || "", homework);
       homework.rubricText = rubricToText(homework.rubric);
       changed = true;
+    }
+  });
+  (db.chatThreads || []).forEach((thread) => {
+    const memberIds = Array.isArray(thread.memberIds) ? Array.from(new Set(thread.memberIds.map(String))) : [];
+    if (!Array.isArray(thread.memberIds) || memberIds.length !== thread.memberIds.length) {
+      thread.memberIds = memberIds;
+      changed = true;
+    }
+    if (!Array.isArray(thread.messages)) {
+      thread.messages = [];
+      changed = true;
+    }
+    if (thread.type === "group") {
+      if (!thread.ownerId) {
+        thread.ownerId = thread.memberIds[0] || "";
+        changed = true;
+      }
+      const adminIds = Array.isArray(thread.adminIds) && thread.adminIds.length ? Array.from(new Set(thread.adminIds.map(String))) : [thread.ownerId].filter(Boolean);
+      if (!Array.isArray(thread.adminIds) || adminIds.length !== thread.adminIds.length) {
+        thread.adminIds = adminIds;
+        changed = true;
+      }
+      const pendingInviteIds = Array.isArray(thread.pendingInviteIds) ? Array.from(new Set(thread.pendingInviteIds.map(String))) : [];
+      if (!Array.isArray(thread.pendingInviteIds) || pendingInviteIds.length !== thread.pendingInviteIds.length) {
+        thread.pendingInviteIds = pendingInviteIds;
+        changed = true;
+      }
     }
   });
   return changed;
@@ -4276,11 +4303,150 @@ function areFriends(db, userId, friendId) {
   return db.friendships.some((item) => item.userId === userId && item.friendId === friendId);
 }
 
+function publicChatThreadForUser(thread, userId) {
+  return {
+    ...thread,
+    memberIds: Array.isArray(thread.memberIds) ? thread.memberIds : [],
+    adminIds: Array.isArray(thread.adminIds) ? thread.adminIds : [],
+    pendingInviteIds: Array.isArray(thread.pendingInviteIds) ? thread.pendingInviteIds : [],
+    messages: (thread.messages || []).filter((message) => !(message.deletedFor || []).includes(userId))
+  };
+}
+
+function visibleFriendRequests(db, userId) {
+  return (db.friendRequests || [])
+    .filter((item) => item.fromUserId === userId || item.toUserId === userId)
+    .slice(-120);
+}
+
+function visibleChatInvites(db, userId) {
+  const ownedGroupIds = new Set((db.chatThreads || [])
+    .filter((thread) => thread.type === "group" && thread.ownerId === userId)
+    .map((thread) => thread.id));
+  return (db.chatInvites || [])
+    .filter((item) => item.fromUserId === userId || item.toUserId === userId || ownedGroupIds.has(item.threadId))
+    .slice(-160);
+}
+
+function addSystemChatMessage(thread, content) {
+  thread.messages = Array.isArray(thread.messages) ? thread.messages : [];
+  thread.messages.push({
+    id: uid("chat"),
+    fromUserId: "system",
+    system: true,
+    content: String(content || ""),
+    createdAt: now(),
+    deletedFor: []
+  });
+  thread.updatedAt = now();
+}
+
 function addFriendship(db, userId, friendId) {
   if (userId === friendId) throw Object.assign(new Error("不能添加自己为好友"), { status: 400 });
   if (!areFriends(db, userId, friendId)) db.friendships.push({ userId, friendId, createdAt: now() });
   if (!areFriends(db, friendId, userId)) db.friendships.push({ userId: friendId, friendId: userId, createdAt: now() });
   return findOrCreateDirectThread(db, userId, friendId);
+}
+
+function resolveUserByTarget(db, targetText) {
+  const target = normalizeAccountInput(targetText);
+  if (!target) return { error: Object.assign(new Error("请输入用户 ID 或姓名"), { status: 400 }) };
+  const loginId = extractLoginId(target);
+  let user = loginId ? db.users.find((item) => item.id === loginId) : null;
+  if (!user) {
+    const nameMatches = db.users.filter((item) => item.name === target);
+    if (nameMatches.length > 1) return { error: Object.assign(new Error("该姓名对应多个用户，请使用 8 位 ID"), { status: 409 }) };
+    user = nameMatches[0] || null;
+  }
+  if (!user) return { error: Object.assign(new Error("未找到用户，请检查 ID 或姓名"), { status: 404 }) };
+  return { user };
+}
+
+function createFriendRequest(db, fromUserId, toUserId, message = "") {
+  if (fromUserId === toUserId) throw Object.assign(new Error("不能添加自己为好友"), { status: 400 });
+  const toUser = ensureUser(db, toUserId);
+  if (areFriends(db, fromUserId, toUserId)) {
+    return { status: "already_friends", thread: findOrCreateDirectThread(db, fromUserId, toUserId), friend: toUser };
+  }
+  const reverse = (db.friendRequests || []).find((item) => item.status === "pending" && item.fromUserId === toUserId && item.toUserId === fromUserId);
+  if (reverse) {
+    return { status: "accepted_reverse", request: respondFriendRequest(db, reverse.id, fromUserId, "accept"), thread: findOrCreateDirectThread(db, fromUserId, toUserId), friend: toUser };
+  }
+  let request = (db.friendRequests || []).find((item) => item.status === "pending" && item.fromUserId === fromUserId && item.toUserId === toUserId);
+  if (!request) {
+    request = {
+      id: uid("friendReq"),
+      fromUserId,
+      toUserId,
+      message: String(message || "").slice(0, 160),
+      status: "pending",
+      createdAt: now(),
+      updatedAt: now()
+    };
+    db.friendRequests.unshift(request);
+  }
+  return { status: "pending", request, friend: toUser };
+}
+
+function respondFriendRequest(db, requestId, userId, action) {
+  const request = (db.friendRequests || []).find((item) => item.id === requestId);
+  if (!request) throw Object.assign(new Error("好友申请不存在"), { status: 404 });
+  if (request.toUserId !== userId) throw Object.assign(new Error("只能处理发给自己的好友申请"), { status: 403 });
+  if (request.status !== "pending") throw Object.assign(new Error("该好友申请已处理"), { status: 409 });
+  request.status = action === "accept" ? "accepted" : "rejected";
+  request.respondedAt = now();
+  request.updatedAt = now();
+  if (request.status === "accepted") request.threadId = addFriendship(db, request.fromUserId, request.toUserId).id;
+  return request;
+}
+
+function ensureGroupOwner(thread, userId) {
+  if (!thread || thread.type !== "group") throw Object.assign(new Error("群聊不存在"), { status: 404 });
+  if (thread.ownerId !== userId) throw Object.assign(new Error("只有群主可以执行该操作"), { status: 403 });
+}
+
+function createChatInvite(db, thread, fromUserId, toUserId) {
+  if (!thread || thread.type !== "group") throw Object.assign(new Error("群聊不存在"), { status: 404 });
+  if (!thread.memberIds.includes(fromUserId)) throw Object.assign(new Error("只有群成员可以邀请好友入群"), { status: 403 });
+  if (thread.memberIds.includes(toUserId)) return null;
+  if (!areFriends(db, fromUserId, toUserId)) throw Object.assign(new Error("只能邀请自己的好友入群"), { status: 403 });
+  let invite = (db.chatInvites || []).find((item) => item.threadId === thread.id && item.toUserId === toUserId && item.status === "pending");
+  if (!invite) {
+    invite = {
+      id: uid("chatInvite"),
+      threadId: thread.id,
+      groupName: thread.name,
+      fromUserId,
+      toUserId,
+      status: "pending",
+      createdAt: now(),
+      updatedAt: now()
+    };
+    db.chatInvites.unshift(invite);
+  }
+  thread.pendingInviteIds = Array.from(new Set([...(thread.pendingInviteIds || []), toUserId]));
+  thread.updatedAt = now();
+  return invite;
+}
+
+function respondChatInvite(db, inviteId, userId, action) {
+  const invite = (db.chatInvites || []).find((item) => item.id === inviteId);
+  if (!invite) throw Object.assign(new Error("群聊邀请不存在"), { status: 404 });
+  if (invite.toUserId !== userId) throw Object.assign(new Error("只能处理发给自己的群聊邀请"), { status: 403 });
+  if (invite.status !== "pending") throw Object.assign(new Error("该群聊邀请已处理"), { status: 409 });
+  const thread = db.chatThreads.find((item) => item.id === invite.threadId && item.type === "group");
+  if (!thread) throw Object.assign(new Error("群聊不存在"), { status: 404 });
+  invite.status = action === "accept" ? "accepted" : "rejected";
+  invite.respondedAt = now();
+  invite.updatedAt = now();
+  thread.pendingInviteIds = (thread.pendingInviteIds || []).filter((id) => id !== userId);
+  if (invite.status === "accepted" && !thread.memberIds.includes(userId)) {
+    thread.memberIds.push(userId);
+    const user = getUser(db, userId);
+    addSystemChatMessage(thread, `${user?.name || userId} 已加入群聊`);
+  }
+  thread.updatedAt = now();
+  return { invite, thread };
 }
 
 function classTeacherIdsForUser(db, user) {
@@ -4321,6 +4487,14 @@ function getRelevantState(db, userId) {
     : (user.classIds || []);
   const visibleUserIds = new Set([userId]);
   db.friendships.filter((item) => item.userId === userId).forEach((item) => visibleUserIds.add(item.friendId));
+  visibleFriendRequests(db, userId).forEach((item) => {
+    visibleUserIds.add(item.fromUserId);
+    visibleUserIds.add(item.toUserId);
+  });
+  visibleChatInvites(db, userId).forEach((item) => {
+    visibleUserIds.add(item.fromUserId);
+    visibleUserIds.add(item.toUserId);
+  });
   db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).forEach((thread) => thread.memberIds.forEach((id) => visibleUserIds.add(id)));
   db.classes
     .filter((item) => item.teacherId === userId || item.studentIds.includes(userId))
@@ -4338,10 +4512,9 @@ function getRelevantState(db, userId) {
     conversations: db.conversations.filter((conv) => conv.userId === userId),
     models: db.models.filter((model) => model.ownerId === userId),
     friends: db.friendships.filter((item) => item.userId === userId).map((item) => publicUser(getUser(db, item.friendId))).filter(Boolean),
-    chatThreads: db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).map((thread) => ({
-      ...thread,
-      messages: thread.messages.filter((message) => !(message.deletedFor || []).includes(userId))
-    })),
+    friendRequests: visibleFriendRequests(db, userId),
+    chatInvites: visibleChatInvites(db, userId),
+    chatThreads: db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).map((thread) => publicChatThreadForUser(thread, userId)),
     classes: db.classes.filter((item) => item.teacherId === userId || item.studentIds.includes(userId)),
     homework: db.homework.filter((item) => item.teacherId === userId || classIds.includes(item.classId)),
     submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
@@ -4995,34 +5168,41 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 200, {
       ok: true,
       friends: db.friendships.filter((item) => item.userId === userId).map((item) => publicUser(getUser(db, item.friendId))).filter(Boolean),
-      threads: db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).map((thread) => ({
-        ...thread,
-        messages: thread.messages.filter((message) => !(message.deletedFor || []).includes(userId))
-      }))
+      friendRequests: visibleFriendRequests(db, userId),
+      chatInvites: visibleChatInvites(db, userId),
+      threads: db.chatThreads.filter((thread) => thread.memberIds.includes(userId)).map((thread) => publicChatThreadForUser(thread, userId))
     });
   }
 
   if (method === "POST" && pathname === "/api/friends") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "target"]);
-    const targetText = String(body.target).trim();
-    let friend = db.users.find((user) => user.id === targetText || `${user.id}-${user.name}` === targetText);
-    if (!friend) {
-      const nameMatches = db.users.filter((user) => user.name === targetText);
-      if (nameMatches.length > 1) return sendError(res, 409, "该姓名对应多个用户，请使用 8 位 ID 添加好友");
-      friend = nameMatches[0] || null;
-    }
-    if (!friend) return sendError(res, 404, "未找到用户，请检查 ID 或姓名");
-    const thread = addFriendship(db, body.userId, friend.id);
-    recordAudit(db, actor, "friend.add", { resourceType: "user", resourceId: friend.id }, req);
+    const resolved = resolveUserByTarget(db, body.target);
+    if (resolved.error) throw resolved.error;
+    const result = createFriendRequest(db, body.userId, resolved.user.id, body.message);
+    recordAudit(db, actor, result.status === "pending" ? "friend.request" : "friend.add", { resourceType: "user", resourceId: resolved.user.id, meta: { status: result.status } }, req);
     writeDb(db);
-    return send(res, 201, { ok: true, friend: publicUser(friend), thread });
+    return send(res, result.status === "pending" ? 201 : 200, { ok: true, ...result, friend: publicUser(resolved.user) });
+  }
+
+  params = routePattern(pathname, "/api/friend-requests/:id/respond");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "action"]);
+    const request = respondFriendRequest(db, params.id, body.userId, body.action === "accept" ? "accept" : "reject");
+    recordAudit(db, actor, "friend.request_respond", { resourceType: "friendRequest", resourceId: request.id, meta: { status: request.status } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, request, state: getRelevantState(db, body.userId) });
   }
 
   params = routePattern(pathname, "/api/friends/:friendId");
   if (method === "DELETE" && params) {
     const userId = queryUserId(searchParams, actor);
     db.friendships = db.friendships.filter((item) => !(item.userId === userId && item.friendId === params.friendId) && !(item.userId === params.friendId && item.friendId === userId));
+    db.friendRequests = (db.friendRequests || []).filter((item) => !(
+      item.status === "pending"
+      && ((item.fromUserId === userId && item.toUserId === params.friendId) || (item.fromUserId === params.friendId && item.toUserId === userId))
+    ));
     recordAudit(db, actor, "friend.delete", { resourceType: "user", resourceId: params.friendId }, req);
     writeDb(db);
     return send(res, 200, { ok: true });
@@ -5031,21 +5211,92 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/chat/groups") {
     const body = await readBody(req);
     assertRequired(body, ["ownerId", "name"]);
-    const memberIds = Array.from(new Set([body.ownerId].concat(Array.isArray(body.memberIds) ? body.memberIds : []))).filter((id) => getUser(db, id));
-    if (memberIds.length < 2) return sendError(res, 400, "群聊至少需要 2 名成员");
+    const owner = ensureUser(db, body.ownerId);
+    const selectedIds = Array.from(new Set(Array.isArray(body.memberIds) ? body.memberIds.map(String) : []))
+      .filter((id) => id !== owner.id && getUser(db, id));
     const thread = {
       id: uid("thread"),
       type: "group",
-      name: String(body.name),
-      memberIds,
+      name: String(body.name || "新的群聊").trim().slice(0, 40) || "新的群聊",
+      ownerId: owner.id,
+      adminIds: [owner.id],
+      memberIds: [owner.id],
+      pendingInviteIds: [],
       messages: [],
       createdAt: now(),
       updatedAt: now()
     };
+    addSystemChatMessage(thread, `${owner.name || owner.id} 创建了群聊`);
     db.chatThreads.unshift(thread);
+    const invites = [];
+    selectedIds.forEach((friendId) => {
+      const invite = createChatInvite(db, thread, owner.id, friendId);
+      if (invite) invites.push(invite);
+    });
     recordAudit(db, actor, "chat.group_create", { resourceType: "chatThread", resourceId: thread.id }, req);
     writeDb(db);
-    return send(res, 201, { ok: true, thread });
+    return send(res, 201, { ok: true, thread, invites });
+  }
+
+  params = routePattern(pathname, "/api/chat/groups/:id/invites");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["fromUserId", "memberIds"]);
+    const thread = db.chatThreads.find((item) => item.id === params.id && item.type === "group");
+    if (!thread) return notFound(res);
+    if (!thread.memberIds.includes(body.fromUserId)) return sendError(res, 403, "只有群成员可以邀请好友入群");
+    const memberIds = Array.from(new Set(Array.isArray(body.memberIds) ? body.memberIds.map(String) : []));
+    const invites = [];
+    memberIds.forEach((memberId) => {
+      const invite = createChatInvite(db, thread, body.fromUserId, memberId);
+      if (invite) invites.push(invite);
+    });
+    recordAudit(db, actor, "chat.group_invite", { resourceType: "chatThread", resourceId: thread.id, meta: { count: invites.length } }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, thread, invites });
+  }
+
+  params = routePattern(pathname, "/api/chat/invites/:id/respond");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "action"]);
+    const result = respondChatInvite(db, params.id, body.userId, body.action === "accept" ? "accept" : "reject");
+    recordAudit(db, actor, "chat.invite_respond", { resourceType: "chatInvite", resourceId: result.invite.id, meta: { status: result.invite.status } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, ...result, state: getRelevantState(db, body.userId) });
+  }
+
+  params = routePattern(pathname, "/api/chat/groups/:id");
+  if (method === "DELETE" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["userId"]);
+    const index = db.chatThreads.findIndex((item) => item.id === params.id && item.type === "group");
+    if (index < 0) return notFound(res);
+    ensureGroupOwner(db.chatThreads[index], body.userId);
+    db.chatInvites = (db.chatInvites || []).filter((invite) => invite.threadId !== params.id);
+    recordAudit(db, actor, "chat.group_dissolve", { resourceType: "chatThread", resourceId: params.id }, req);
+    db.chatThreads.splice(index, 1);
+    writeDb(db);
+    return send(res, 200, { ok: true });
+  }
+
+  params = routePattern(pathname, "/api/chat/groups/:id/members/:memberId");
+  if (method === "DELETE" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["userId"]);
+    const thread = db.chatThreads.find((item) => item.id === params.id && item.type === "group");
+    if (!thread) return notFound(res);
+    const removingSelf = body.userId === params.memberId;
+    if (!removingSelf) ensureGroupOwner(thread, body.userId);
+    if (params.memberId === thread.ownerId) return sendError(res, 400, "群主不能退出，请先解散群聊");
+    thread.memberIds = thread.memberIds.filter((id) => id !== params.memberId);
+    thread.adminIds = (thread.adminIds || []).filter((id) => id !== params.memberId);
+    thread.pendingInviteIds = (thread.pendingInviteIds || []).filter((id) => id !== params.memberId);
+    const member = getUser(db, params.memberId);
+    addSystemChatMessage(thread, removingSelf ? `${member?.name || params.memberId} 退出了群聊` : `${member?.name || params.memberId} 已被移出群聊`);
+    recordAudit(db, actor, removingSelf ? "chat.group_leave" : "chat.group_remove_member", { resourceType: "chatThread", resourceId: thread.id, meta: { memberId: params.memberId } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, thread });
   }
 
   if (method === "POST" && pathname === "/api/chat/messages") {
@@ -5053,7 +5304,14 @@ async function handleApi(req, res, pathname, searchParams) {
     assertRequired(body, ["threadId", "fromUserId", "content"]);
     const thread = db.chatThreads.find((item) => item.id === body.threadId && item.memberIds.includes(body.fromUserId));
     if (!thread) return notFound(res);
-    const message = { id: uid("chat"), fromUserId: body.fromUserId, content: String(body.content), createdAt: now(), deletedFor: [] };
+    if (thread.type === "direct") {
+      const otherId = thread.memberIds.find((id) => id !== body.fromUserId);
+      if (!otherId || !areFriends(db, body.fromUserId, otherId)) return sendError(res, 403, "双方成为好友后才能继续私聊");
+    }
+    const content = String(body.content || "").trim();
+    if (!content) return sendError(res, 400, "消息内容不能为空");
+    if (content.length > 2000) return sendError(res, 400, "单条消息不能超过 2000 字");
+    const message = { id: uid("chat"), fromUserId: body.fromUserId, content, createdAt: now(), deletedFor: [] };
     thread.messages.push(message);
     thread.updatedAt = now();
     recordAudit(db, actor, "chat.message_send", { resourceType: "chatThread", resourceId: thread.id }, req);

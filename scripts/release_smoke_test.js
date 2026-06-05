@@ -122,6 +122,8 @@ async function main() {
       body: { account: studentRegister.payload.user.id, password: "123456" }
     });
     assert(newStudentLogin.response.ok && newStudentLogin.payload.ok, "new student should login by ID");
+    const newStudentId = studentRegister.payload.user.id;
+    const newStudentCookie = String(newStudentLogin.response.headers.get("set-cookie") || "").split(";")[0];
     const newStudentState = newStudentLogin.payload.state;
     assert(newStudentState.knowledgeGraphs.length === 0, "new registered student should not inherit global graphs");
     assert(newStudentState.courseMaterials.length === 0, "new registered student should not inherit global course materials");
@@ -143,6 +145,60 @@ async function main() {
     assert(state.response.ok && state.payload.state?.user?.id === "20260001", "session state should resolve current user");
     const refreshedCookie = String(state.response.headers.get("set-cookie") || "");
     assert(refreshedCookie.includes("edu_session=") && refreshedCookie.includes("Max-Age=172800"), "authenticated state should refresh 2-day session cookie");
+
+    const friendRequest = await request("/api/friends", {
+      method: "POST",
+      cookie,
+      body: { userId: "20260001", target: newStudentId, message: "chat smoke test" }
+    });
+    assert(friendRequest.response.status === 201 && friendRequest.payload.request?.status === "pending", "friend add should create pending request");
+    const newStudentPendingState = await request("/api/state", { cookie: newStudentCookie });
+    assert(newStudentPendingState.payload.state.friendRequests.some((item) => item.id === friendRequest.payload.request.id && item.toUserId === newStudentId), "friend request should be visible to recipient");
+
+    const acceptedFriend = await request(`/api/friend-requests/${friendRequest.payload.request.id}/respond`, {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: { userId: newStudentId, action: "accept" }
+    });
+    assert(acceptedFriend.response.ok && acceptedFriend.payload.request.status === "accepted", "recipient should accept friend request");
+    const acceptedStudentState = acceptedFriend.payload.state;
+    assert(acceptedStudentState.friends.some((item) => item.id === "20260001"), "accepted friend request should create friendship");
+    assert(acceptedStudentState.chatThreads.some((item) => item.type === "direct" && item.memberIds.includes("20260001")), "accepted friend request should create direct chat");
+
+    const groupCreate = await request("/api/chat/groups", {
+      method: "POST",
+      cookie,
+      body: { ownerId: "20260001", name: "Smoke Group", memberIds: [newStudentId] }
+    });
+    assert(groupCreate.response.status === 201 && groupCreate.payload.thread?.id, "group creation should succeed");
+    assert(groupCreate.payload.thread.memberIds.length === 1 && groupCreate.payload.thread.memberIds[0] === "20260001", "invited members should not join group before approval");
+    assert(groupCreate.payload.invites.length === 1 && groupCreate.payload.invites[0].status === "pending", "group creation should create pending invite");
+
+    const groupInviteId = groupCreate.payload.invites[0].id;
+    const studentInviteState = await request("/api/state", { cookie: newStudentCookie });
+    assert(studentInviteState.payload.state.chatInvites.some((item) => item.id === groupInviteId && item.toUserId === newStudentId), "group invite should be visible to recipient");
+
+    const acceptedInvite = await request(`/api/chat/invites/${groupInviteId}/respond`, {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: { userId: newStudentId, action: "accept" }
+    });
+    assert(acceptedInvite.response.ok && acceptedInvite.payload.invite.status === "accepted", "recipient should accept group invite");
+    assert(acceptedInvite.payload.thread.memberIds.includes(newStudentId), "accepted group invite should add member");
+
+    const groupMessage = await request("/api/chat/messages", {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: { threadId: groupCreate.payload.thread.id, fromUserId: newStudentId, content: "hello group" }
+    });
+    assert(groupMessage.response.status === 201 && groupMessage.payload.message?.id, "accepted group member should send group message");
+
+    const dissolvedGroup = await request(`/api/chat/groups/${groupCreate.payload.thread.id}`, {
+      method: "DELETE",
+      cookie,
+      body: { userId: "20260001" }
+    });
+    assert(dissolvedGroup.response.ok, "group owner should dissolve group");
 
     const tampered = await request("/api/ai/chat", {
       method: "POST",

@@ -615,6 +615,7 @@ async function loadState() {
   localStorage.setItem("edu-user", JSON.stringify(state.user));
   if (!state.selectedClassId && state.data.classes.length) state.selectedClassId = state.data.classes[0].id;
   if (!state.selectedGraphId && state.data.knowledgeGraphs.length) state.selectedGraphId = state.data.knowledgeGraphs[0].id;
+  if (state.activeThreadId && !state.data.chatThreads.some((thread) => thread.id === state.activeThreadId)) state.activeThreadId = null;
   if (!state.activeThreadId && state.data.chatThreads.length) state.activeThreadId = state.data.chatThreads[0].id;
 }
 
@@ -4412,85 +4413,294 @@ function bindModelPage() {
   });
 }
 
+function chatUser(id) {
+  if (id === "system") return { id: "system", name: "系统", role: "system" };
+  return (state.data?.users || []).find((user) => user.id === id) || null;
+}
+
+function chatUserLabel(id) {
+  const user = chatUser(id);
+  return user ? `${user.name} · ${user.id}` : id;
+}
+
+function directFriendId(thread) {
+  return (thread?.memberIds || []).find((id) => id !== state.user.id) || "";
+}
+
+function canSendToThread(thread) {
+  if (!thread) return false;
+  if (thread.type !== "direct") return thread.memberIds.includes(state.user.id);
+  const friendId = directFriendId(thread);
+  return (state.data.friends || []).some((friend) => friend.id === friendId);
+}
+
+function threadSubtitle(thread) {
+  if (!thread) return "";
+  const last = (thread.messages || []).slice(-1)[0];
+  const messageText = last ? compactText(last.content || "", 26) : "暂无消息";
+  return `${thread.type === "group" ? `${thread.memberIds.length} 人群聊` : "私聊"} · ${messageText}`;
+}
+
+function pendingFriendRequests(direction = "incoming") {
+  return (state.data.friendRequests || []).filter((item) => (
+    item.status === "pending"
+    && (direction === "incoming" ? item.toUserId === state.user.id : item.fromUserId === state.user.id)
+  ));
+}
+
+function pendingChatInvites(direction = "incoming") {
+  return (state.data.chatInvites || []).filter((item) => (
+    item.status === "pending"
+    && (direction === "incoming" ? item.toUserId === state.user.id : item.fromUserId === state.user.id)
+  ));
+}
+
+function groupPendingInvites(thread) {
+  if (!thread) return [];
+  return (state.data.chatInvites || []).filter((item) => item.threadId === thread.id && item.status === "pending");
+}
+
+function renderChatActionCards(friends) {
+  return `
+    <div class="chat-action-grid">
+      <section class="panel chat-action-card">
+        <div class="split-head">
+          <h3>添加好友</h3>
+          <span>对方同意后才会成为好友</span>
+        </div>
+        <form id="addFriendForm" class="stack compact-auth-form">
+          <div class="inline-form">
+            <input name="target" placeholder="输入 8 位 ID、ID-姓名或姓名" />
+            <button class="primary" type="submit">发送申请</button>
+          </div>
+          <input name="message" placeholder="申请说明（选填）" maxlength="160" />
+        </form>
+        <form id="searchUserForm" class="inline-form">
+          <input name="query" placeholder="搜索用户" />
+          <button class="ghost" type="submit">搜索</button>
+        </form>
+        <div class="search-results compact-results">
+          ${state.searchResults.map((user) => `
+            <button type="button" data-add-result="${user.id}">
+              ${escapeHtml(user.name)}<span>${user.id} · ${roleName(user.role)}</span>
+            </button>
+          `).join("")}
+        </div>
+      </section>
+      <section class="panel chat-action-card">
+        <div class="split-head">
+          <h3>创建群聊</h3>
+          <span>好友接受邀请后才会进群</span>
+        </div>
+        <form id="groupForm" class="stack">
+          <input name="name" placeholder="群聊名称" />
+          <div class="check-list compact-check-list">
+            ${friends.map((friend) => `<label><input type="checkbox" name="member" value="${friend.id}" />${escapeHtml(friend.name)}<span>${friend.id}</span></label>`).join("") || `<span class="hint">先添加好友，再邀请入群。</span>`}
+          </div>
+          <button class="primary" type="submit">创建并发送邀请</button>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+function renderFriendRequestPanel() {
+  const incoming = pendingFriendRequests("incoming");
+  const outgoing = pendingFriendRequests("outgoing");
+  const incomingInvites = pendingChatInvites("incoming");
+  return `
+    <section class="chat-request-panel">
+      <h3>待处理</h3>
+      <div class="request-list">
+        ${incoming.map((request) => {
+          const from = chatUser(request.fromUserId);
+          return `
+            <article class="request-card">
+              <strong>${escapeHtml(from?.name || request.fromUserId)}</strong>
+              <span>申请添加你为好友 · ${fmtTime(request.createdAt)}</span>
+              ${request.message ? `<p>${escapeHtml(request.message)}</p>` : ""}
+              <div class="actions">
+                <button class="mini primary" data-friend-request-action="accept" data-request-id="${request.id}">同意</button>
+                <button class="mini danger" data-friend-request-action="reject" data-request-id="${request.id}">拒绝</button>
+              </div>
+            </article>
+          `;
+        }).join("")}
+        ${incomingInvites.map((invite) => {
+          const from = chatUser(invite.fromUserId);
+          const thread = (state.data.chatThreads || []).find((item) => item.id === invite.threadId) || { name: invite.groupName || "群聊邀请" };
+          return `
+            <article class="request-card">
+              <strong>${escapeHtml(thread.name)}</strong>
+              <span>${escapeHtml(from?.name || invite.fromUserId)} 邀请你入群 · ${fmtTime(invite.createdAt)}</span>
+              <div class="actions">
+                <button class="mini primary" data-chat-invite-action="accept" data-invite-id="${invite.id}">同意</button>
+                <button class="mini danger" data-chat-invite-action="reject" data-invite-id="${invite.id}">拒绝</button>
+              </div>
+            </article>
+          `;
+        }).join("")}
+        ${!incoming.length && !incomingInvites.length ? emptyBlock("暂无待处理申请") : ""}
+      </div>
+      ${outgoing.length ? `
+        <h3>已发送</h3>
+        <div class="request-list compact">
+          ${outgoing.map((request) => `<div class="request-line">${escapeHtml(chatUserLabel(request.toUserId))}<span>等待通过</span></div>`).join("")}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderChatSidebar(friends, threads, active) {
+  return `
+    <aside class="panel chat-directory-panel">
+      ${renderFriendRequestPanel()}
+      <section>
+        <h3>好友</h3>
+        <div class="contact-list">
+          ${friends.map((friend) => `
+            <div class="contact-row">
+              <button type="button" data-open-friend="${friend.id}">${escapeHtml(friend.name)}<span>${friend.id} · ${roleName(friend.role)}</span></button>
+              <button class="icon-danger" data-delete-friend="${friend.id}" title="删除好友">×</button>
+            </div>
+          `).join("") || emptyBlock("暂无好友")}
+        </div>
+      </section>
+      <section>
+        <h3>会话</h3>
+        <div class="conversation-list in-panel">
+          ${threads.map((thread) => `
+            <button class="${active?.id === thread.id ? "active" : ""}" data-thread="${thread.id}">
+              <strong>${escapeHtml(thread.name)}</strong>
+              <span>${escapeHtml(threadSubtitle(thread))}</span>
+            </button>
+          `).join("") || emptyBlock("暂无聊天")}
+        </div>
+      </section>
+    </aside>
+  `;
+}
+
+function renderChatMain(active) {
+  if (!active) return `<section class="panel chat-panel standard-chat-panel">${emptyBlock("添加好友、通过申请或创建群聊后即可开始聊天。")}</section>`;
+  const canSend = canSendToThread(active);
+  return `
+    <section class="panel chat-panel standard-chat-panel">
+      <div class="chat-thread-head">
+        <div>
+          <h3>${escapeHtml(active.name)}</h3>
+          <span>${escapeHtml(threadSubtitle(active))}</span>
+        </div>
+        <button class="danger" id="deleteSelectedMessages">删除选中记录</button>
+      </div>
+      <div class="message-stream standard-message-stream">
+        ${(active.messages || []).map((message) => {
+          const from = chatUser(message.fromUserId);
+          const mine = message.fromUserId === state.user.id;
+          const system = message.system || message.fromUserId === "system";
+          if (system) {
+            return `<div class="chat-system-message">${escapeHtml(message.content)}<span>${fmtTime(message.createdAt)}</span></div>`;
+          }
+          return `
+            <label class="chat-message ${mine ? "mine" : ""}">
+              <input type="checkbox" data-message-check="${message.id}" ${state.selectedMessages.has(message.id) ? "checked" : ""} />
+              <span>${escapeHtml(from?.name || message.fromUserId)} · ${fmtTime(message.createdAt)}</span>
+              <p>${escapeHtml(message.content)}</p>
+            </label>
+          `;
+        }).join("") || `<div class="bubble assistant"><span>系统</span><p>还没有消息。</p></div>`}
+      </div>
+      <form id="chatForm" class="composer">
+        <input name="content" placeholder="${canSend ? "输入聊天内容" : "当前不能发送消息"}" ${canSend ? "" : "disabled"} maxlength="2000" />
+        <button class="primary" type="submit" ${canSend ? "" : "disabled"}>发送</button>
+      </form>
+      ${canSend ? "" : `<p class="hint">私聊需双方保持好友关系；群聊需你是当前群成员。</p>`}
+    </section>
+  `;
+}
+
+function renderChatInfoPanel(active, friends) {
+  if (!active) return `<aside class="panel chat-info-panel">${emptyBlock("选择会话后显示详情。")}</aside>`;
+  if (active.type === "direct") {
+    const friendId = directFriendId(active);
+    const friend = chatUser(friendId);
+    return `
+      <aside class="panel chat-info-panel">
+        <h3>好友信息</h3>
+        <div class="profile-mini chat-profile-card">
+          <strong>${escapeHtml(friend?.name || friendId)}</strong>
+          <span>ID：${escapeHtml(friendId)}</span>
+          <span>身份：${friend ? roleName(friend.role) : "-"}</span>
+        </div>
+        <button class="danger wide" data-delete-friend="${friendId}">删除好友</button>
+      </aside>
+    `;
+  }
+  const owner = chatUser(active.ownerId);
+  const isOwner = active.ownerId === state.user.id;
+  const pendingIds = new Set(groupPendingInvites(active).map((invite) => invite.toUserId));
+  const availableFriends = friends.filter((friend) => !active.memberIds.includes(friend.id) && !pendingIds.has(friend.id));
+  const pending = groupPendingInvites(active);
+  return `
+    <aside class="panel chat-info-panel">
+      <h3>群聊信息</h3>
+      <div class="profile-mini chat-profile-card">
+        <strong>${escapeHtml(active.name)}</strong>
+        <span>群主：${escapeHtml(owner?.name || active.ownerId || "-")}</span>
+        <span>成员：${active.memberIds.length} 人</span>
+      </div>
+      <h3>成员</h3>
+      <div class="member-list">
+        ${active.memberIds.map((id) => {
+          const user = chatUser(id);
+          return `
+            <div class="member-row">
+              <span>${escapeHtml(user?.name || id)}${id === active.ownerId ? "（群主）" : ""}<small>${escapeHtml(id)}</small></span>
+              ${isOwner && id !== state.user.id ? `<button class="mini danger" data-remove-group-member="${id}" data-group-id="${active.id}">移出</button>` : ""}
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <h3>邀请好友入群</h3>
+      <form id="groupInviteForm" class="stack">
+        <div class="check-list compact-check-list">
+          ${availableFriends.map((friend) => `<label><input type="checkbox" name="member" value="${friend.id}" />${escapeHtml(friend.name)}<span>${friend.id}</span></label>`).join("") || `<span class="hint">没有可邀请的好友。</span>`}
+        </div>
+        <button class="primary" type="submit" ${availableFriends.length ? "" : "disabled"}>发送入群邀请</button>
+      </form>
+      ${pending.length ? `
+        <h3>待通过邀请</h3>
+        <div class="request-list compact">
+          ${pending.map((invite) => `<div class="request-line">${escapeHtml(chatUserLabel(invite.toUserId))}<span>等待通过</span></div>`).join("")}
+        </div>
+      ` : ""}
+      <div class="chat-danger-zone">
+        ${isOwner ? `<button class="danger wide" id="dissolveGroupBtn">解散群聊</button>` : `<button class="ghost wide" id="leaveGroupBtn">退出群聊</button>`}
+      </div>
+    </aside>
+  `;
+}
+
 function renderChatPage() {
   const threads = state.data.chatThreads || [];
   const active = threads.find((thread) => thread.id === state.activeThreadId) || threads[0];
   const friends = state.data.friends || [];
   if (active && !state.activeThreadId) state.activeThreadId = active.id;
   return `
-    <div class="chat-action-head">
-      <button type="button" data-chat-jump="addFriendForm">添加好友</button>
-      <button type="button" data-chat-jump="groupForm">创建群聊</button>
-    </div>
-    <div class="chat-layout wide">
-      <aside class="panel contact-panel">
-        <h3>添加好友</h3>
-        <form id="addFriendForm" class="inline-form">
-          <input name="target" placeholder="输入 ID 或姓名" />
-          <button class="primary" type="submit">添加</button>
-        </form>
-        <form id="searchUserForm" class="inline-form">
-          <input name="query" placeholder="搜索用户" />
-          <button class="ghost" type="submit">搜索</button>
-        </form>
-        <div class="search-results">
-          ${state.searchResults.map((user) => `
-            <button data-add-result="${user.id}">${escapeHtml(user.name)} · ${user.id} · ${roleName(user.role)}</button>
-          `).join("")}
-        </div>
-        <h3>好友</h3>
-        <div class="contact-list">
-          ${friends.map((friend) => `
-            <div class="contact-row">
-              <button data-open-friend="${friend.id}">${escapeHtml(friend.name)}<span>${friend.id}</span></button>
-              <button class="icon-danger" data-delete-friend="${friend.id}" title="删除好友">×</button>
-            </div>
-          `).join("") || emptyBlock("暂无好友")}
-        </div>
-        <h3>创建群聊</h3>
-        <form id="groupForm" class="stack">
-          <input name="name" placeholder="群聊名称" />
-          <div class="check-list">
-            ${friends.map((friend) => `<label><input type="checkbox" name="member" value="${friend.id}" />${escapeHtml(friend.name)}</label>`).join("") || `<span class="hint">添加好友后可创建群聊</span>`}
-          </div>
-          <button class="primary" type="submit">创建群聊</button>
-        </form>
-      </aside>
-      <aside class="conversation-list">
-        ${threads.map((thread) => `
-          <button class="${active?.id === thread.id ? "active" : ""}" data-thread="${thread.id}">
-            <strong>${escapeHtml(thread.name)}</strong>
-            <span>${thread.type === "group" ? "群聊" : "私聊"} · ${thread.messages.length} 条</span>
-          </button>
-        `).join("") || emptyBlock("暂无聊天")}
-      </aside>
-      <section class="panel chat-panel">
-        ${active ? `
-          <div class="split-head">
-            <h3>${escapeHtml(active.name)}</h3>
-            <button class="danger" id="deleteSelectedMessages">删除选中记录</button>
-          </div>
-          <div class="message-stream">
-            ${active.messages.map((message) => {
-              const from = state.data.users.find((user) => user.id === message.fromUserId);
-              const mine = message.fromUserId === state.user.id;
-              return `
-                <label class="chat-message ${mine ? "mine" : ""}">
-                  <input type="checkbox" data-message-check="${message.id}" ${state.selectedMessages.has(message.id) ? "checked" : ""} />
-                  <span>${escapeHtml(from?.name || message.fromUserId)}</span>
-                  <p>${escapeHtml(message.content)}</p>
-                </label>
-              `;
-            }).join("") || `<div class="bubble assistant"><span>系统</span><p>还没有消息。</p></div>`}
-          </div>
-          <form id="chatForm" class="composer">
-            <input name="content" placeholder="输入聊天内容" />
-            <button class="primary" type="submit">发送</button>
-          </form>
-        ` : emptyBlock("添加好友或创建群聊后即可开始聊天。")}
-      </section>
+    ${renderChatActionCards(friends)}
+    <div class="chat-layout standard">
+      ${renderChatSidebar(friends, threads, active)}
+      ${renderChatMain(active)}
+      ${renderChatInfoPanel(active, friends)}
     </div>
   `;
+}
+
+function friendRequestToast(payload) {
+  if (payload.status === "already_friends") return "你们已经是好友";
+  if (payload.status === "accepted_reverse") return "已通过对方的好友申请";
+  return "好友申请已发送，等待对方通过";
 }
 
 function bindChatPage() {
@@ -4498,20 +4708,13 @@ function bindChatPage() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: form.get("target") } });
+      const payload = await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: form.get("target"), message: form.get("message") } });
       await loadState();
       renderShell();
-      showToast("好友已添加");
+      showToast(friendRequestToast(payload));
     } catch (error) {
       showToast(error.message, "error");
     }
-  });
-  document.querySelectorAll("[data-chat-jump]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const target = document.getElementById(button.dataset.chatJump);
-      target?.scrollIntoView({ behavior: "smooth", block: "center" });
-      target?.querySelector("input")?.focus();
-    });
   });
   document.getElementById("searchUserForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -4527,32 +4730,62 @@ function bindChatPage() {
   document.querySelectorAll("[data-add-result]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
-        await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: button.dataset.addResult } });
+        const payload = await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: button.dataset.addResult } });
         state.searchResults = [];
         await loadState();
         renderShell();
-        showToast("好友已添加");
+        showToast(friendRequestToast(payload));
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-friend-request-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/api/friend-requests/${button.dataset.requestId}/respond`, {
+          method: "POST",
+          body: { userId: state.user.id, action: button.dataset.friendRequestAction }
+        });
+        await loadState();
+        renderShell();
+        showToast(button.dataset.friendRequestAction === "accept" ? "已同意好友申请" : "已拒绝好友申请");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-chat-invite-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        const payload = await api(`/api/chat/invites/${button.dataset.inviteId}/respond`, {
+          method: "POST",
+          body: { userId: state.user.id, action: button.dataset.chatInviteAction }
+        });
+        if (payload.thread?.id && button.dataset.chatInviteAction === "accept") state.activeThreadId = payload.thread.id;
+        await loadState();
+        renderShell();
+        showToast(button.dataset.chatInviteAction === "accept" ? "已加入群聊" : "已拒绝群聊邀请");
       } catch (error) {
         showToast(error.message, "error");
       }
     });
   });
   document.querySelectorAll("[data-open-friend]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      try {
-        await api("/api/friends", { method: "POST", body: { userId: state.user.id, target: button.dataset.openFriend } });
-        await loadState();
-        const thread = state.data.chatThreads.find((item) => item.type === "direct" && item.memberIds.includes(button.dataset.openFriend));
-        if (thread) state.activeThreadId = thread.id;
-        renderShell();
-      } catch (error) {
-        showToast(error.message, "error");
+    button.addEventListener("click", () => {
+      const thread = (state.data.chatThreads || []).find((item) => item.type === "direct" && item.memberIds.includes(button.dataset.openFriend));
+      if (thread) {
+        state.activeThreadId = thread.id;
+        state.selectedMessages.clear();
+        renderContent();
+      } else {
+        showToast("对方通过好友申请后即可私聊", "error");
       }
     });
   });
   document.querySelectorAll("[data-delete-friend]").forEach((button) => {
     button.addEventListener("click", async () => {
-      if (!confirm("确认删除该好友？聊天线程会保留，但好友关系会解除。")) return;
+      if (!confirm("确认删除该好友？聊天记录会保留，但双方不能继续私聊。")) return;
       try {
         await api(`/api/friends/${button.dataset.deleteFriend}?userId=${state.user.id}`, { method: "DELETE" });
         await loadState();
@@ -4619,7 +4852,64 @@ function bindChatPage() {
       state.activeThreadId = payload.thread.id;
       await loadState();
       renderShell();
-      showToast("群聊已创建");
+      showToast(memberIds.length ? "群聊已创建，入群邀请已发送" : "群聊已创建");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("groupInviteForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const memberIds = form.getAll("member");
+    if (!memberIds.length) return showToast("请选择要邀请的好友", "error");
+    try {
+      await api(`/api/chat/groups/${state.activeThreadId}/invites`, {
+        method: "POST",
+        body: { fromUserId: state.user.id, memberIds }
+      });
+      await loadState();
+      renderShell();
+      showToast("入群邀请已发送");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-remove-group-member]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确认将该成员移出群聊？")) return;
+      try {
+        await api(`/api/chat/groups/${button.dataset.groupId}/members/${button.dataset.removeGroupMember}`, {
+          method: "DELETE",
+          body: { userId: state.user.id }
+        });
+        await loadState();
+        renderShell();
+        showToast("成员已移出群聊");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.getElementById("dissolveGroupBtn")?.addEventListener("click", async () => {
+    if (!confirm("确认解散该群聊？所有成员都将看不到这个群聊。")) return;
+    try {
+      await api(`/api/chat/groups/${state.activeThreadId}`, { method: "DELETE", body: { userId: state.user.id } });
+      state.activeThreadId = null;
+      await loadState();
+      renderShell();
+      showToast("群聊已解散");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("leaveGroupBtn")?.addEventListener("click", async () => {
+    if (!confirm("确认退出该群聊？")) return;
+    try {
+      await api(`/api/chat/groups/${state.activeThreadId}/members/${state.user.id}`, { method: "DELETE", body: { userId: state.user.id } });
+      state.activeThreadId = null;
+      await loadState();
+      renderShell();
+      showToast("已退出群聊");
     } catch (error) {
       showToast(error.message, "error");
     }

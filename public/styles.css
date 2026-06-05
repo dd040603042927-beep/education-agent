@@ -1606,6 +1606,246 @@ p {
   background: #eef7fb;
 }
 
+.chat-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.chat-action-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  align-content: start;
+}
+
+.chat-action-card .split-head h3,
+.chat-directory-panel h3,
+.chat-info-panel h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.chat-action-card .split-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-layout.standard {
+  grid-template-columns: 320px minmax(0, 1fr) 310px;
+  min-height: 610px;
+  height: calc(100vh - 330px);
+  min-height: 620px;
+}
+
+.chat-directory-panel,
+.chat-info-panel,
+.standard-chat-panel {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.chat-directory-panel,
+.chat-info-panel {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  padding: 16px;
+  overflow: auto;
+}
+
+.chat-request-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.request-list {
+  display: grid;
+  gap: 8px;
+}
+
+.request-list.compact {
+  gap: 6px;
+}
+
+.request-card,
+.request-line {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+}
+
+.request-card {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+}
+
+.request-card strong {
+  color: var(--text);
+}
+
+.request-card span,
+.request-card p,
+.request-line span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.request-card .actions {
+  display: flex;
+  gap: 8px;
+}
+
+.request-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.compact-results {
+  max-height: 140px;
+  overflow: auto;
+}
+
+.compact-results button span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.compact-check-list {
+  max-height: 132px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+}
+
+.compact-check-list label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  font-size: 13px;
+}
+
+.compact-check-list label span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.conversation-list.in-panel {
+  min-height: 0;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.chat-thread-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-thread-head h3 {
+  margin: 0 0 3px;
+}
+
+.chat-thread-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.standard-chat-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  padding: 16px;
+}
+
+.standard-message-stream {
+  min-height: 0;
+  max-height: none;
+  height: 100%;
+}
+
+.chat-system-message {
+  justify-self: center;
+  max-width: 72%;
+  padding: 7px 10px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: #edf3f8;
+  font-size: 12px;
+  text-align: center;
+}
+
+.chat-system-message span {
+  margin-left: 8px;
+  color: #94a3b8;
+}
+
+.chat-profile-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+}
+
+.chat-profile-card strong {
+  color: var(--text);
+}
+
+.chat-profile-card span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.member-list {
+  display: grid;
+  gap: 8px;
+}
+
+.member-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fbfd;
+}
+
+.member-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-row small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat-danger-zone {
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
 .chat-layout.ai-workbench {
   grid-template-columns: 250px minmax(0, 1fr) 340px;
   align-items: start;
@@ -2956,6 +3196,7 @@ p {
   .graph-workspace,
   .model-layout,
   .chat-layout.wide,
+  .chat-layout.standard,
   .chat-layout.ai-workbench {
     grid-template-columns: 1fr;
   }
@@ -2974,6 +3215,10 @@ p {
   }
 
   .chat-layout.ai-workbench {
+    height: auto;
+  }
+
+  .chat-layout.standard {
     height: auto;
   }
 
@@ -3024,6 +3269,7 @@ p {
 
   .grid.two,
   .form-grid,
+  .chat-action-grid,
   .chat-layout,
   .review-layout,
   .submission-grid,
