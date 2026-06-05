@@ -23,6 +23,7 @@ const state = {
   modelCodeComponentId: null,
   modelCodeDraft: "",
   modelCodeRan: false,
+  modelCodeRunning: false,
   modelRunResult: "",
   activeThreadId: null,
   selectedMessages: new Set(),
@@ -593,6 +594,7 @@ function resetSessionSelectionState() {
   state.modelCodeComponentId = null;
   state.modelCodeDraft = "";
   state.modelCodeRan = false;
+  state.modelCodeRunning = false;
   state.modelRunResult = "";
   state.graphViews = {};
   state.graphNodeModal = null;
@@ -3940,6 +3942,7 @@ function resetModelCodeState() {
   state.modelCodeComponentId = null;
   state.modelCodeDraft = "";
   state.modelCodeRan = false;
+  state.modelCodeRunning = false;
 }
 
 function modelCodeDefinition() {
@@ -4011,7 +4014,9 @@ function modelDraftComponents() {
     props: {
       ...meta.defaults,
       code: state.modelCodeDraft || definition.code || "",
-      expectedResult: definition.result || ""
+      expectedResult: definition.result || "",
+      runResult: state.modelRunResult || "",
+      lastRunAt: state.modelRunResult ? new Date().toISOString() : ""
     }
   }];
 }
@@ -4052,7 +4057,7 @@ function renderRunResultPanel() {
   return `
     <div class="run-result-panel">
       <strong>运行结果</strong>
-      <p>${result ? escapeHtml(result) : "暂无运行结果。双击机器学习算法节点，修改代码后点击运行测试。"}</p>
+      <pre>${result ? escapeHtml(result) : "暂无运行结果。双击机器学习算法节点，修改代码后点击运行测试。"}</pre>
     </div>
   `;
 }
@@ -4170,12 +4175,12 @@ function renderModelCodePanel() {
           <span>${escapeHtml(algorithm.chapter)}</span>
         </div>
         <div class="model-code-tools">
-          <button class="primary" type="button" id="runModelCodeBtn">运行测试</button>
+          <button class="primary" type="button" id="runModelCodeBtn" ${state.modelCodeRunning ? "disabled" : ""}>${state.modelCodeRunning ? "运行中..." : "运行测试"}</button>
           <button class="mini" type="button" id="closeModelCodeBtn">关闭</button>
         </div>
       </div>
       <textarea id="modelCodeEditor" spellcheck="false">${escapeHtml(code)}</textarea>
-      <p class="hint">代码可直接修改；点击右上角“运行测试”后，结果会显示在画布下方“运行结果”区域。</p>
+      <p class="hint">代码可直接修改；点击右上角“运行测试”后，后端会调用 Python 执行当前代码，stdout/stderr 会显示在画布下方“运行结果”区域。</p>
     </div>
   `;
 }
@@ -4300,21 +4305,53 @@ function bindModelPage() {
     resetModelCodeState();
     renderContent();
   });
-  document.getElementById("runModelCodeBtn")?.addEventListener("click", () => {
+  document.getElementById("runModelCodeBtn")?.addEventListener("click", async () => {
     const editor = document.getElementById("modelCodeEditor");
     const draft = editor ? editor.value : state.modelCodeDraft;
     state.modelCodeDraft = draft;
     const definition = modelCodeDefinition();
-    const result = definition?.result || "模拟运行完成：代码已载入，可继续接入 Python 执行环境返回真实指标。";
-    state.modelCodeRan = true;
-    state.modelRunResult = result;
     const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
     if (component) {
       component.props = component.props && typeof component.props === "object" ? component.props : {};
       component.props.code = draft;
-      component.props.runResult = result;
     }
+    if (!String(draft || "").trim()) {
+      state.modelRunResult = "执行状态：运行失败（退出码 1）\n\n[stderr]\n代码为空，请先在画布代码编辑器中输入 Python 代码。";
+      state.modelCodeRan = true;
+      renderContent();
+      return;
+    }
+    state.modelCodeRunning = true;
+    state.modelRunResult = "正在执行代码，请稍候...";
     renderContent();
+    try {
+      const payload = await api("/api/model-code/run", {
+        method: "POST",
+        body: {
+          userId: state.user.id,
+          subject: state.modelSubject,
+          title: definition?.title || component?.label || "自定义算法代码",
+          code: draft
+        }
+      });
+      state.modelCodeRan = true;
+      state.modelRunResult = payload.output || "程序执行完成，但没有返回输出。请在代码中使用 print(...) 输出测试结果。";
+      const current = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
+      if (current) {
+        current.props = current.props && typeof current.props === "object" ? current.props : {};
+        current.props.code = draft;
+        current.props.runResult = state.modelRunResult;
+        current.props.lastExitCode = payload.exitCode;
+        current.props.lastDurationMs = payload.durationMs;
+        current.props.lastRunAt = new Date().toISOString();
+      }
+    } catch (error) {
+      state.modelCodeRan = true;
+      state.modelRunResult = `执行状态：运行接口错误\n\n[stderr]\n${error.message}`;
+    } finally {
+      state.modelCodeRunning = false;
+      renderContent();
+    }
   });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
     state.modelComponents = [];

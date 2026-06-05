@@ -65,6 +65,9 @@ const SESSION_IDLE_TIMEOUT_MS = Math.max(30 * 60 * 1000, Math.min(SESSION_MAX_ID
 const SESSION_TTL_MS = SESSION_IDLE_TIMEOUT_MS;
 const LOGIN_MAX_FAILURES = Math.max(3, Number(process.env.LOGIN_MAX_FAILURES || 5));
 const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_MS || 10 * 60 * 1000));
+const MODEL_CODE_TIMEOUT_MS = Math.max(1000, Math.min(30 * 1000, Number(process.env.MODEL_CODE_TIMEOUT_MS || 10 * 1000)));
+const MODEL_CODE_MAX_CHARS = Math.max(1000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_CHARS || 80000)));
+const MODEL_CODE_MAX_OUTPUT_CHARS = Math.max(2000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_OUTPUT_CHARS || 30000)));
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const TEXT_UPLOAD_EXTENSIONS = new Set([".txt", ".md", ".csv", ".json"]);
 const ZIP_OFFICE_EXTENSIONS = new Set([".docx", ".pptx", ".xlsx"]);
@@ -1543,6 +1546,121 @@ function extractBinaryOfficeText(buffer) {
 function resolvePythonCommand() {
   if (process.env.PDF_AGENT_PYTHON) return process.env.PDF_AGENT_PYTHON;
   return "python";
+}
+
+function resolveModelCodePythonCommand() {
+  if (process.env.MODEL_CODE_PYTHON) return process.env.MODEL_CODE_PYTHON;
+  if (process.env.PDF_AGENT_PYTHON) return process.env.PDF_AGENT_PYTHON;
+  return "python";
+}
+
+function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOut = false, durationMs = 0 }) {
+  const sections = [];
+  sections.push(`执行状态：${timedOut ? "超时终止" : exitCode === 0 ? "运行成功" : `运行失败（退出码 ${exitCode}）`}`);
+  sections.push(`耗时：${durationMs} ms`);
+  const cleanStdout = String(stdout || "").trimEnd();
+  const cleanStderr = String(stderr || "").trimEnd();
+  if (cleanStdout) sections.push(`\n[stdout]\n${cleanStdout}`);
+  if (cleanStderr) sections.push(`\n[stderr]\n${cleanStderr}`);
+  if (!cleanStdout && !cleanStderr) sections.push("\n程序没有输出。请在代码中使用 print(...) 输出测试结果。");
+  return sections.join("\n").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS);
+}
+
+function removeRuntimeTempDir(tempDir) {
+  const resolvedRuntime = path.resolve(RUNTIME_DIR);
+  const resolvedTarget = path.resolve(tempDir);
+  if (!resolvedTarget.startsWith(resolvedRuntime)) return;
+  try {
+    fs.rmSync(resolvedTarget, { recursive: true, force: true });
+  } catch {}
+}
+
+function runModelCodeSnippet(code) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const source = String(code || "");
+    if (!source.trim()) {
+      resolve({
+        success: false,
+        exitCode: 1,
+        timedOut: false,
+        durationMs: 0,
+        output: "执行状态：运行失败（退出码 1）\n\n[stderr]\n代码为空，请先在画布代码编辑器中输入 Python 代码。"
+      });
+      return;
+    }
+    if (source.length > MODEL_CODE_MAX_CHARS) {
+      resolve({
+        success: false,
+        exitCode: 1,
+        timedOut: false,
+        durationMs: 0,
+        output: `执行状态：运行失败（退出码 1）\n\n[stderr]\n代码长度不能超过 ${MODEL_CODE_MAX_CHARS} 个字符。`
+      });
+      return;
+    }
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    const tempDir = fs.mkdtempSync(path.join(RUNTIME_DIR, "model-code-"));
+    const scriptPath = path.join(tempDir, "main.py");
+    fs.writeFileSync(scriptPath, source, "utf8");
+    const python = resolveModelCodePythonCommand();
+    const child = spawn(python, ["-u", scriptPath], {
+      windowsHide: true,
+      cwd: tempDir,
+      env: {
+        ...process.env,
+        PYTHONUTF8: "1",
+        PYTHONIOENCODING: "utf-8",
+        MPLBACKEND: "Agg"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    const appendLimited = (current, chunk) => {
+      const next = current + chunk.toString("utf8");
+      if (next.length <= MODEL_CODE_MAX_OUTPUT_CHARS * 2) return next;
+      return next.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS * 2);
+    };
+    const finish = (exitCode = 1) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const durationMs = Date.now() - startedAt;
+      const payload = {
+        success: !timedOut && exitCode === 0,
+        exitCode,
+        timedOut,
+        durationMs,
+        stdout: stdout.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS),
+        stderr: stderr.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS)
+      };
+      payload.output = formatModelCodeOutput(payload);
+      removeRuntimeTempDir(tempDir);
+      resolve(payload);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill();
+      } catch {}
+      stderr = appendLimited(stderr, `\n代码执行超过 ${MODEL_CODE_TIMEOUT_MS} ms，已自动终止。`);
+      finish(124);
+    }, MODEL_CODE_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      stdout = appendLimited(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = appendLimited(stderr, chunk);
+    });
+    child.on("error", (error) => {
+      stderr = appendLimited(stderr, `无法启动 Python：${error.message}`);
+      finish(1);
+    });
+    child.on("close", (code) => finish(Number.isFinite(Number(code)) ? Number(code) : 1));
+  });
 }
 
 function runAdvancedPdfAgent({ filePath, maxChars, jobId, envOverrides = {}, timeoutMs = PDF_AGENT_TIMEOUT_MS }, onProgress = () => {}) {
@@ -5151,6 +5269,26 @@ async function handleApi(req, res, pathname, searchParams) {
     recordAudit(db, actor, "model.create", { resourceType: "model", resourceId: model.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, model });
+  }
+
+  if (method === "POST" && pathname === "/api/model-code/run") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "code"]);
+    const result = await runModelCodeSnippet(body.code);
+    recordAudit(db, actor, "model.code_run", {
+      resourceType: "modelCode",
+      resourceId: "",
+      meta: {
+        subject: String(body.subject || "机器学习").slice(0, 40),
+        title: String(body.title || "自定义代码").slice(0, 80),
+        success: result.success,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        durationMs: result.durationMs
+      }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, ...result });
   }
 
   params = routePattern(pathname, "/api/models/:id");

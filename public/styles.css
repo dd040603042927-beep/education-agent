@@ -2765,7 +2765,7 @@ p {
   font-size: 19px;
 }
 
-.run-result-panel p {
+.run-result-panel pre {
   margin: 0;
   color: var(--text);
   font-size: 19px;
@@ -2773,6 +2773,7 @@ p {
   line-height: 1.75;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  font-family: Consolas, "SFMono-Regular", monospace;
 }
 
 .property-grid {

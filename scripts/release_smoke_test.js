@@ -103,6 +103,7 @@ async function main() {
     assert(duplicateRegister.response.status === 201 && duplicateRegister.payload.user?.id, "duplicate display name registration should succeed");
     const duplicateUserId = duplicateRegister.payload.user.id;
     const registerSetCookie = String(duplicateRegister.response.headers.get("set-cookie") || "");
+    const duplicateTeacherCookie = registerSetCookie.split(";")[0];
     assert(registerSetCookie.includes("edu_session=") && registerSetCookie.includes("Max-Age=172800"), "registration should auto-login with 2-day session cookie");
     assert(duplicateRegister.payload.state?.user?.id === duplicateUserId, "registration should return the new user's initial state");
     assert(duplicateRegister.payload.state.knowledgeGraphs.length === 0, "registered teacher initial state should not inherit graphs");
@@ -133,6 +134,19 @@ async function main() {
     assert(newTeacherState.conversations.length === 0, "new registered teacher should start without conversations");
     assert(newTeacherState.models.length === 0, "new registered teacher should start without saved models");
     assert(newTeacherState.friends.length === 0 && newTeacherState.chatThreads.length === 0, "new registered teacher should start without friends or chats");
+
+    const modelCodeRun = await request("/api/model-code/run", {
+      method: "POST",
+      cookie: duplicateTeacherCookie,
+      body: {
+        userId: duplicateUserId,
+        subject: "机器学习",
+        title: "smoke real code execution",
+        code: "values = [1, 2, 3, 4]\nprint('sum:', sum(values))\nprint('mean:', round(sum(values) / len(values), 2))"
+      }
+    });
+    assert(modelCodeRun.response.ok && modelCodeRun.payload.success === true, "model code runner should execute Python code successfully");
+    assert(modelCodeRun.payload.output.includes("sum: 10") && modelCodeRun.payload.output.includes("mean: 2.5"), "model code runner should return real stdout");
 
     const studentRegister = await request("/api/auth/register", {
       method: "POST",
