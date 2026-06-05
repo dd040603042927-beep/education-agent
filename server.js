@@ -79,6 +79,7 @@ const SECURITY_HEADERS = {
   "permissions-policy": "camera=(), microphone=(), geolocation=()",
   "content-security-policy": "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
 };
+const NO_CACHE_STATIC_EXTENSIONS = new Set([".html", ".js", ".css"]);
 const graphJobs = new Map();
 const uploadSessions = new Map();
 
@@ -5653,6 +5654,17 @@ function contentType(filePath) {
   }[ext] || "application/octet-stream";
 }
 
+function staticHeaders(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const headers = { ...SECURITY_HEADERS, "content-type": contentType(filePath) };
+  if (NO_CACHE_STATIC_EXTENSIONS.has(ext)) {
+    headers["cache-control"] = "no-store, no-cache, must-revalidate, proxy-revalidate";
+    headers["pragma"] = "no-cache";
+    headers["expires"] = "0";
+  }
+  return headers;
+}
+
 function serveStatic(req, res, pathname) {
   const safePath = pathname === "/" ? "/index.html" : pathname;
   const filePath = path.normalize(path.join(PUBLIC_DIR, safePath));
@@ -5668,13 +5680,13 @@ function serveStatic(req, res, pathname) {
           res.writeHead(404, SECURITY_HEADERS);
           res.end("Not found");
         } else {
-          res.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8" });
+          res.writeHead(200, staticHeaders(path.join(PUBLIC_DIR, "index.html")));
           res.end(fallback);
         }
       });
       return;
     }
-    res.writeHead(200, { ...SECURITY_HEADERS, "content-type": contentType(filePath) });
+    res.writeHead(200, staticHeaders(filePath));
     res.end(data);
   });
 }

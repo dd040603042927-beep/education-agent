@@ -23,6 +23,16 @@ async function request(path, options = {}) {
   return { response, payload };
 }
 
+async function requestText(path, options = {}) {
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      ...(options.cookie ? { cookie: options.cookie } : {})
+    }
+  });
+  return { response, text: await response.text() };
+}
+
 async function waitForReady() {
   const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
@@ -64,6 +74,18 @@ async function main() {
 
   try {
     await waitForReady();
+
+    const homepage = await requestText("/");
+    assert(homepage.response.ok, "homepage should load");
+    assert(homepage.response.headers.get("cache-control")?.includes("no-store"), "homepage should disable stale static cache");
+    assert(homepage.text.includes("/app.js?v=chat-standard-20260605"), "homepage should reference the standard chat app bundle");
+    assert(homepage.text.includes("/styles.css?v=chat-standard-20260605"), "homepage should reference the standard chat styles");
+    const appBundle = await requestText("/app.js?v=chat-standard-20260605");
+    assert(appBundle.response.ok, "app bundle should load with version query");
+    assert(appBundle.response.headers.get("cache-control")?.includes("no-store"), "app bundle should disable stale static cache");
+    assert(appBundle.text.includes("renderChatActionCards"), "app bundle should contain the unified chat action cards");
+    assert(appBundle.text.includes("创建并发送邀请"), "app bundle should contain approval-based group creation UI");
+    assert(!appBundle.text.includes("chat-action-head"), "app bundle should not contain the old chat action header");
 
     const anonymousState = await request("/api/state");
     assert(anonymousState.response.status === 401, "anonymous /api/state should be rejected");
