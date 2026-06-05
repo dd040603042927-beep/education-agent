@@ -547,6 +547,41 @@ function getCurrentUser() {
   }
 }
 
+function resetSessionSelectionState() {
+  stopGraphJobPolling();
+  if (state.graphUploadAbort) {
+    try {
+      state.graphUploadAbort.abort();
+    } catch {}
+  }
+  state.selectedGraphId = null;
+  state.selectedClassId = null;
+  state.activeConversationId = null;
+  state.activeThreadId = null;
+  state.homeworkModal = null;
+  state.homeworkDetailId = null;
+  state.teacherHomeworkDetailId = null;
+  state.materialDetailId = null;
+  state.selectedComponentId = null;
+  state.loadedModelId = null;
+  state.modelCodeType = null;
+  state.modelCodeComponentId = null;
+  state.modelCodeDraft = "";
+  state.modelCodeRan = false;
+  state.modelRunResult = "";
+  state.graphViews = {};
+  state.graphNodeModal = null;
+  state.graphFocusNodeId = null;
+  state.graphSelectedNodeId = null;
+  state.graphSearch = "";
+  state.graphJob = null;
+  state.conversationContextMenu = null;
+  state.graphUploadAbort = null;
+  state.graphGenerationCanceled = false;
+  state.selectedMessages.clear();
+  state.searchResults = [];
+}
+
 async function loadState() {
   if (!state.user) return;
   const payload = await api("/api/state");
@@ -565,6 +600,7 @@ async function boot() {
       const payload = await api("/api/session");
       state.user = payload.user;
       state.data = payload.state;
+      resetSessionSelectionState();
       localStorage.setItem("edu-user", JSON.stringify(state.user));
       renderShell();
     } catch {
@@ -635,13 +671,13 @@ function renderAuth() {
           <button class="tab" data-auth-tab="register">注册</button>
         </div>
         <form id="loginForm" class="auth-form">
-          <label>账号 ID 或姓名<input name="account" placeholder="示例：20260001 或 黄豆" required /></label>
+          <label>账号 ID 或姓名<input name="account" placeholder="建议使用 8 位 ID，重名用户必须用 ID" required /></label>
           <label>密码<input name="password" type="password" placeholder="示例账号密码：123456" required /></label>
           <button class="primary wide" type="submit">进入平台</button>
-          <p class="hint">内置教师：20260001 / 黄豆；内置学生：20260002 / 绿豆。</p>
+          <p class="hint">用户名允许重复，系统分配的 8 位 ID 永远唯一。内置教师：20260001；内置学生：20260002。</p>
         </form>
         <form id="registerForm" class="auth-form hidden">
-          <label>姓名<input name="name" placeholder="请输入姓名" required /></label>
+          <label>姓名<input name="name" placeholder="姓名可重复，登录以 8 位 ID 为准" required /></label>
           <label>密码<input name="password" type="password" placeholder="设置登录密码" required /></label>
           <label>身份
             <select name="role">
@@ -676,6 +712,7 @@ function renderAuth() {
       });
       state.user = payload.user;
       state.data = payload.state;
+      resetSessionSelectionState();
       localStorage.setItem("edu-user", JSON.stringify(state.user));
       state.page = "graph";
       renderShell();
@@ -813,6 +850,7 @@ function renderShell() {
         activeConversationId: null,
         activeThreadId: null
       });
+      resetSessionSelectionState();
       renderAuth();
     });
   });

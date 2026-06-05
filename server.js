@@ -3276,13 +3276,11 @@ function evaluateCriterion(criterion, submissionText) {
 
 function visibleCourseMaterials(db, userId) {
   const user = ensureUser(db, userId);
-  const teacherIds = user.role === "student"
-    ? db.classes.filter((klass) => (user.classIds || []).includes(klass.id)).map((klass) => klass.teacherId)
-    : [];
+  if (user.role === "admin") return db.courseMaterials || [];
+  const teacherIds = classTeacherIdsForUser(db, user);
   return (db.courseMaterials || []).filter((material) => (
     material.ownerId === userId
-    || material.global
-    || teacherIds.includes(material.ownerId)
+    || (user.role === "student" && material.global && teacherIds.includes(material.ownerId))
     || (material.classId && (user.classIds || []).includes(material.classId))
   ));
 }
@@ -3349,8 +3347,8 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
   });
 
   const graphHits = [];
-  (db.knowledgeGraphs || [])
-    .filter((graph) => graph.ownerId === userId || graph.global || !subject || graph.subject === subject)
+  visibleKnowledgeGraphs(db, userId)
+    .filter((graph) => !subject || subject === "通用" || graph.subject === subject || String(query).includes(graph.subject))
     .forEach((graph) => {
       (graph.nodes || []).forEach((node) => {
         const nodeText = [node.label, node.details, ...(node.knowledgePoints || [])].join(" ");
@@ -3535,9 +3533,9 @@ function findGraphContext(db, userId, subject, prompt, topics = [], hits = []) {
   const queryText = [prompt, subject, ...topics].filter(Boolean).join(" ");
   const queryTokens = new Set(tokenizeForSearch(queryText));
   const graphHitNodeIds = new Set(hits.filter((hit) => hit.type === "graph").map((hit) => `${hit.graphId}:${hit.nodeId}`));
-  const graphs = (db.knowledgeGraphs || []).filter((graph) => {
-    return graph.ownerId === userId || graph.global || !subject || subject === "通用" || graph.subject === subject || String(prompt).includes(graph.subject);
-  });
+  const graphs = visibleKnowledgeGraphs(db, userId).filter((graph) => (
+    !subject || subject === "通用" || graph.subject === subject || String(prompt).includes(graph.subject)
+  ));
   const candidates = [];
   graphs.forEach((graph) => {
     (graph.nodes || []).forEach((node) => {
@@ -4257,6 +4255,25 @@ function addFriendship(db, userId, friendId) {
   return findOrCreateDirectThread(db, userId, friendId);
 }
 
+function classTeacherIdsForUser(db, user) {
+  if (!user || user.role !== "student") return [];
+  const classIds = user.classIds || [];
+  return Array.from(new Set((db.classes || [])
+    .filter((klass) => classIds.includes(klass.id) || (klass.studentIds || []).includes(user.id))
+    .map((klass) => klass.teacherId)
+    .filter(Boolean)));
+}
+
+function visibleKnowledgeGraphs(db, userId) {
+  const user = ensureUser(db, userId);
+  if (user.role === "admin") return db.knowledgeGraphs || [];
+  const teacherIds = classTeacherIdsForUser(db, user);
+  return (db.knowledgeGraphs || []).filter((graph) => (
+    graph.ownerId === userId
+    || (user.role === "student" && graph.global && teacherIds.includes(graph.ownerId))
+  ));
+}
+
 function routePattern(pathname, pattern) {
   const a = pathname.split("/").filter(Boolean);
   const b = pattern.split("/").filter(Boolean);
@@ -4289,9 +4306,7 @@ function getRelevantState(db, userId) {
   return {
     user: publicUser(user),
     users: (user.role === "admin" ? db.users : db.users.filter((item) => visibleUserIds.has(item.id))).map(publicUser),
-    knowledgeGraphs: db.knowledgeGraphs
-      .filter((graph) => graph.ownerId === userId || graph.global)
-      .map((graph) => enhanceGraphForEducation(graph)),
+    knowledgeGraphs: visibleKnowledgeGraphs(db, userId).map((graph) => enhanceGraphForEducation(graph)),
     conversations: db.conversations.filter((conv) => conv.userId === userId),
     models: db.models.filter((model) => model.ownerId === userId),
     friends: db.friendships.filter((item) => item.userId === userId).map((item) => publicUser(getUser(db, item.friendId))).filter(Boolean),
@@ -4352,16 +4367,18 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["name", "password", "role"]);
     if (!["teacher", "student"].includes(body.role)) throw Object.assign(new Error("身份必须是 teacher 或 student"), { status: 400 });
+    const name = String(body.name || "").trim();
+    if (!name) return sendError(res, 400, "用户名不能为空");
     if (String(body.password).length < 6) return sendError(res, 400, "密码至少 6 位");
     const user = {
       id: generateUserId(db),
-      name: String(body.name).trim(),
+      name,
       role: body.role,
       passwordHash: hashPassword(body.password),
       subject: body.role === "teacher" ? String(body.subject || "") : "",
       className: String(body.className || ""),
       classIds: [],
-      avatar: String(body.name).trim().slice(0, 1) || "用",
+      avatar: name.slice(0, 1) || "用",
       createdAt: now()
     };
     db.users.push(user);
@@ -4374,7 +4391,16 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["account", "password"]);
     const account = String(body.account).trim();
-    const user = db.users.find((item) => item.id === account || item.name === account);
+    let user = db.users.find((item) => item.id === account);
+    if (!user) {
+      const nameMatches = db.users.filter((item) => item.name === account);
+      if (nameMatches.length > 1) {
+        recordAudit(db, null, "auth.login_failed", { meta: { account, reason: "duplicate_name" } }, req);
+        writeDb(db);
+        return sendError(res, 409, "该用户名存在多个账号，请使用系统分配的 8 位 ID 登录");
+      }
+      user = nameMatches[0] || null;
+    }
     if (!user) {
       recordAudit(db, null, "auth.login_failed", { meta: { account, reason: "not_found" } }, req);
       writeDb(db);
@@ -4456,7 +4482,7 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "GET" && pathname === "/api/graphs") {
     const userId = queryUserId(searchParams, actor);
     const subject = searchParams.get("subject");
-    let graphs = db.knowledgeGraphs.filter((graph) => graph.ownerId === userId || graph.global);
+    let graphs = visibleKnowledgeGraphs(db, userId);
     if (subject) graphs = graphs.filter((graph) => graph.subject === subject);
     return send(res, 200, { ok: true, graphs: graphs.map((graph) => enhanceGraphForEducation(graph)) });
   }
@@ -4645,7 +4671,7 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "GET" && params) {
     const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
     if (!graph) return notFound(res);
-    if (!graph.global && graph.ownerId !== actor.id && actor.role !== "admin") return sendError(res, 403, "无权查看该图谱");
+    if (!visibleKnowledgeGraphs(db, actor.id).some((item) => item.id === graph.id)) return sendError(res, 403, "无权查看该图谱");
     return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
   if (method === "DELETE" && params) {
@@ -4940,7 +4966,12 @@ async function handleApi(req, res, pathname, searchParams) {
     const body = await readBody(req);
     assertRequired(body, ["userId", "target"]);
     const targetText = String(body.target).trim();
-    const friend = db.users.find((user) => user.id === targetText || user.name === targetText || `${user.id}-${user.name}` === targetText);
+    let friend = db.users.find((user) => user.id === targetText || `${user.id}-${user.name}` === targetText);
+    if (!friend) {
+      const nameMatches = db.users.filter((user) => user.name === targetText);
+      if (nameMatches.length > 1) return sendError(res, 409, "该姓名对应多个用户，请使用 8 位 ID 添加好友");
+      friend = nameMatches[0] || null;
+    }
     if (!friend) return sendError(res, 404, "未找到用户，请检查 ID 或姓名");
     const thread = addFriendship(db, body.userId, friend.id);
     recordAudit(db, actor, "friend.add", { resourceType: "user", resourceId: friend.id }, req);
@@ -5050,7 +5081,7 @@ async function handleApi(req, res, pathname, searchParams) {
       const name = String(row.name || "").trim();
       const studentNo = String(row.id || "").trim();
       if (!name && !studentNo) return;
-      let user = db.users.find((item) => item.role === "student" && (item.id === studentNo || (name && item.name === name)));
+      let user = studentNo ? db.users.find((item) => item.role === "student" && item.id === studentNo) : null;
       if (!user) {
         user = {
           id: studentNo && /^\d{8}$/.test(studentNo) && !db.users.some((item) => item.id === studentNo) ? studentNo : generateUserId(db),

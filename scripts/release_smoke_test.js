@@ -68,6 +68,50 @@ async function main() {
     const anonymousState = await request("/api/state");
     assert(anonymousState.response.status === 401, "anonymous /api/state should be rejected");
 
+    const duplicateRegister = await request("/api/auth/register", {
+      method: "POST",
+      body: { name: "黄豆", password: "123456", role: "teacher", subject: "机器学习" }
+    });
+    assert(duplicateRegister.response.status === 201 && duplicateRegister.payload.user?.id, "duplicate display name registration should succeed");
+    const duplicateUserId = duplicateRegister.payload.user.id;
+
+    const duplicateNameLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: "黄豆", password: "123456" }
+    });
+    assert(duplicateNameLogin.response.status === 409, "duplicate display name login should require unique ID");
+
+    const newTeacherLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: duplicateUserId, password: "123456" }
+    });
+    assert(newTeacherLogin.response.ok && newTeacherLogin.payload.ok, "new duplicate-name teacher should login by ID");
+    const newTeacherState = newTeacherLogin.payload.state;
+    assert(newTeacherState.knowledgeGraphs.length === 0, "new registered teacher should not inherit global graphs");
+    assert(newTeacherState.courseMaterials.length === 0, "new registered teacher should not inherit global course materials");
+    assert(newTeacherState.classes.length === 0, "new registered teacher should start without classes");
+    assert(newTeacherState.homework.length === 0, "new registered teacher should start without homework");
+    assert(newTeacherState.conversations.length === 0, "new registered teacher should start without conversations");
+    assert(newTeacherState.models.length === 0, "new registered teacher should start without saved models");
+    assert(newTeacherState.friends.length === 0 && newTeacherState.chatThreads.length === 0, "new registered teacher should start without friends or chats");
+
+    const studentRegister = await request("/api/auth/register", {
+      method: "POST",
+      body: { name: "同名测试学生", password: "123456", role: "student", className: "未加入" }
+    });
+    assert(studentRegister.response.status === 201 && studentRegister.payload.user?.id, "new student registration should succeed");
+    const newStudentLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: studentRegister.payload.user.id, password: "123456" }
+    });
+    assert(newStudentLogin.response.ok && newStudentLogin.payload.ok, "new student should login by ID");
+    const newStudentState = newStudentLogin.payload.state;
+    assert(newStudentState.knowledgeGraphs.length === 0, "new registered student should not inherit global graphs");
+    assert(newStudentState.courseMaterials.length === 0, "new registered student should not inherit global course materials");
+    assert(newStudentState.classes.length === 0, "new registered student should start without classes");
+    assert(newStudentState.homework.length === 0, "new registered student should start without homework");
+    assert(newStudentState.friends.length === 0 && newStudentState.chatThreads.length === 0, "new registered student should start without friends or chats");
+
     const login = await request("/api/auth/login", {
       method: "POST",
       body: { account: "20260001", password: "123456" }
