@@ -312,7 +312,14 @@ function createInitialDb() {
     agentRuns: [],
     auditLogs: [],
     friendRequests: [],
-    chatInvites: []
+    chatInvites: [],
+    lessons: [],
+    classroomSessions: [],
+    classroomEvents: [],
+    lessonExports: [],
+    quizAttempts: [],
+    agentProfiles: [],
+    simulationAssets: []
   };
 }
 
@@ -510,7 +517,14 @@ function ensureDbShape(db) {
     "friendships",
     "chatThreads",
     "friendRequests",
-    "chatInvites"
+    "chatInvites",
+    "lessons",
+    "classroomSessions",
+    "classroomEvents",
+    "lessonExports",
+    "quizAttempts",
+    "agentProfiles",
+    "simulationAssets"
   ].forEach(ensureArray);
   db.users = Array.isArray(db.users) ? db.users : [];
   (db.users || []).forEach((user) => {
@@ -4351,6 +4365,503 @@ function learningAnalytics(db, userId) {
   };
 }
 
+function defaultLessonAgents() {
+  return [
+    { id: uid("agent"), role: "director", name: "课堂导演", style: "控制节奏、切换环节、安排测验" },
+    { id: uid("agent"), role: "teacher", name: "AI教师", style: "主讲概念、公式、步骤和例题" },
+    { id: uid("agent"), role: "assistant", name: "AI助教", style: "补充解释、引用资料、提示前置知识" },
+    { id: uid("agent"), role: "student-basic", name: "基础同学", style: "提出基础问题和易忽略条件" },
+    { id: uid("agent"), role: "student-misconception", name: "易错同学", style: "暴露常见误区并等待纠正" },
+    { id: uid("agent"), role: "grader", name: "评分Agent", style: "批改课堂小测并回流学习画像" }
+  ];
+}
+
+function compactServerText(text, limit = 120) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  return value.length > limit ? `${value.slice(0, limit)}...` : value;
+}
+
+function lessonSourceLabel(source = {}) {
+  const typeLabels = {
+    material: "课程资料",
+    graph_node: "知识图谱节点",
+    graph: "知识图谱",
+    homework: "作业错因",
+    weakness: "班级薄弱点",
+    topic: "教师输入主题"
+  };
+  return typeLabels[source.type] || "教师输入主题";
+}
+
+function lessonDefaultObjectives(topic, subject, topics = []) {
+  const focus = topics.filter(Boolean).slice(0, 3);
+  return [
+    `理解「${topic}」的核心概念和适用场景`,
+    focus[0] ? `能解释 ${focus[0]} 与前置知识的关系` : `能说出 ${subject} 中该知识点的关键条件`,
+    focus[1] ? `能完成围绕 ${focus[1]} 的课堂小测` : "能完成课堂即时测验并复盘错因"
+  ];
+}
+
+function lessonWhiteboardObjects(topic, subject, topics = []) {
+  const first = topics[0] || topic;
+  const second = topics[1] || "前置知识";
+  const third = topics[2] || "典型应用";
+  return [
+    { id: uid("wb"), type: "text", x: 80, y: 72, text: `${subject}：${topic}` },
+    { id: uid("wb"), type: "rect", x: 80, y: 118, width: 190, height: 58, text: first },
+    { id: uid("wb"), type: "arrow", from: [270, 147], to: [360, 147], text: "依赖" },
+    { id: uid("wb"), type: "rect", x: 360, y: 118, width: 190, height: 58, text: second },
+    { id: uid("wb"), type: "arrow", from: [550, 147], to: [640, 147], text: "迁移" },
+    { id: uid("wb"), type: "rect", x: 640, y: 118, width: 190, height: 58, text: third },
+    { id: uid("wb"), type: "note", x: 110, y: 230, text: "课堂目标：先讲概念，再用问题暴露误区，最后用小测回流画像。" }
+  ];
+}
+
+function buildLessonQuiz(topic, subject, topics = []) {
+  const focus = topics.filter(Boolean).slice(0, 4);
+  const first = focus[0] || topic;
+  const second = focus[1] || "前置知识";
+  const third = focus[2] || "应用场景";
+  return [
+    {
+      id: uid("quiz"),
+      type: "single",
+      topic: first,
+      stem: `学习「${topic}」时，第一步最应该确认什么？`,
+      options: [
+        `核心概念、适用条件和前置知识`,
+        "直接记住所有题目答案",
+        "跳过定义只看结论",
+        "只看无关例子"
+      ],
+      answer: "核心概念、适用条件和前置知识",
+      explanation: `课堂重点是把「${first}」放回 ${subject} 的知识结构中理解。`
+    },
+    {
+      id: uid("quiz"),
+      type: "single",
+      topic: second,
+      stem: `如果学生在「${topic}」上卡住，优先回看哪类内容？`,
+      options: [
+        `${second} 等前置知识`,
+        "完全无关的新章节",
+        "只背答案不看过程",
+        "跳过课堂小测"
+      ],
+      answer: `${second} 等前置知识`,
+      explanation: "前置依赖是学习路径规划和薄弱点归因的关键。"
+    },
+    {
+      id: uid("quiz"),
+      type: "short",
+      topic: third,
+      stem: `请用一句话说明「${topic}」最容易混淆的地方或使用边界。`,
+      answer: topic,
+      explanation: "简答题由教师复核，系统先根据关键词给出课堂反馈。"
+    }
+  ];
+}
+
+function buildLessonScenes({ subject, topic, objectives, topics, citations, duration }) {
+  const minutes = Math.max(10, Math.min(90, Number(duration || 20)));
+  const citationText = citations.length ? citations.slice(0, 2).map((item) => `${item.sourceName || item.title || "课程资料"} ${item.chapter || ""}`).join("；") : "暂无资料引用，按教师输入主题生成";
+  return [
+    {
+      id: uid("scene"),
+      type: "slide",
+      title: "概念导入",
+      duration: Math.round(minutes * 0.18 * 60),
+      objective: objectives[0],
+      content: {
+        headline: topic,
+        bullets: [
+          `本节课聚焦 ${subject} 中的「${topic}」。`,
+          `先明确概念边界，再进入例子、白板推导和课堂小测。`,
+          `引用来源：${citationText}`
+        ]
+      }
+    },
+    {
+      id: uid("scene"),
+      type: "whiteboard",
+      title: "白板讲解",
+      duration: Math.round(minutes * 0.22 * 60),
+      objective: objectives[1] || objectives[0],
+      whiteboard: { objects: lessonWhiteboardObjects(topic, subject, topics) },
+      content: {
+        headline: "结构化推导",
+        bullets: [
+          "左侧放核心概念，中间放前置依赖，右侧放迁移应用。",
+          "教师可继续添加公式、箭头、流程节点或高亮说明。"
+        ]
+      }
+    },
+    {
+      id: uid("scene"),
+      type: "discussion",
+      title: "多智能体讨论",
+      duration: Math.round(minutes * 0.22 * 60),
+      objective: "通过 AI 同学追问暴露误区",
+      script: [
+        { agentRole: "teacher", agentName: "AI教师", text: `我们先用一个具体问题检查你是否真正理解「${topic}」。` },
+        { agentRole: "assistant", agentName: "AI助教", text: `我会把回答限定在课程资料和图谱关联知识内，并标出不确定部分。` },
+        { agentRole: "student-basic", agentName: "基础同学", text: `${topic} 和 ${topics[1] || "前置知识"} 的关系是什么？` },
+        { agentRole: "student-misconception", agentName: "易错同学", text: `如果只记结论不看条件，会不会也能做题？` }
+      ]
+    },
+    {
+      id: uid("scene"),
+      type: "quiz",
+      title: "课堂小测",
+      duration: Math.round(minutes * 0.18 * 60),
+      objective: objectives[2] || "即时检测掌握情况",
+      quiz: { questions: buildLessonQuiz(topic, subject, topics) }
+    },
+    {
+      id: uid("scene"),
+      type: "summary",
+      title: "总结与补救路径",
+      duration: Math.round(minutes * 0.18 * 60),
+      objective: "把课堂结果回流到学习画像",
+      content: {
+        headline: "课堂闭环",
+        bullets: [
+          "完成测验后会记录掌握度证据。",
+          "答错的知识点会进入错题线索，教师可继续生成补救作业。",
+          "课堂脚本可导出为 Markdown 或 HTML。"
+        ]
+      }
+    }
+  ];
+}
+
+function lessonCitationsFromHits(hits) {
+  return hits.slice(0, 5).map((hit) => ({
+    id: hit.id || hit.chunkId || hit.nodeId || uid("cite"),
+    title: hit.title || hit.graphTitle || "课程资料",
+    sourceName: hit.sourceName || hit.title || hit.graphTitle || "课程资料",
+    subject: hit.subject || "",
+    chapter: hit.chapter || "",
+    page: hit.page || "",
+    snippet: compactServerText(hit.text || hit.summary || hit.label || "", 160)
+  }));
+}
+
+function collectLessonGenerationContext(db, userId, body) {
+  const subject = normalizeSubject(body.subject || "");
+  let topic = String(body.topic || body.knowledgePoint || body.title || "").trim();
+  const source = { type: String(body.sourceType || "topic") };
+  const contextParts = [];
+
+  if (body.materialId) {
+    const material = visibleCourseMaterials(db, userId).find((item) => item.id === body.materialId);
+    if (material) {
+      source.type = "material";
+      source.materialId = material.id;
+      topic = topic || material.title || material.subject;
+      contextParts.push(material.text || "", material.title || "", material.subject || "");
+    }
+  }
+
+  if (body.graphId) {
+    const graph = visibleKnowledgeGraphs(db, userId).find((item) => item.id === body.graphId);
+    if (graph) {
+      source.type = body.nodeId ? "graph_node" : "graph";
+      source.graphId = graph.id;
+      source.graphTitle = graph.title;
+      const node = body.nodeId ? (graph.nodes || []).find((item) => item.id === body.nodeId) : null;
+      if (node) {
+        source.nodeId = node.id;
+        source.nodeLabel = node.label;
+        topic = topic || node.label;
+        contextParts.push(node.label, node.summary || "", node.details || "", (node.knowledgePoints || []).join("\n"));
+      } else {
+        topic = topic || graph.title || graph.subject;
+        contextParts.push(graph.title || "", (graph.nodes || []).slice(0, 12).map((nodeItem) => nodeItem.label).join("\n"));
+      }
+    }
+  }
+
+  topic = topic || subject || "互动课堂";
+  source.topic = topic;
+  const query = [topic, subject, contextParts.join("\n")].filter(Boolean).join("\n");
+  const hits = searchCourseKnowledge(db, userId, query, { subject, limit: 5 });
+  const citations = lessonCitationsFromHits(hits);
+  const topics = Array.from(new Set([
+    topic,
+    ...inferQuestionTopics(query, subject),
+    ...hits.flatMap((hit) => inferQuestionTopics(hit.text || hit.title || "", subject))
+  ].filter(Boolean))).slice(0, 8);
+  return {
+    subject: subject || hits[0]?.subject || "通用",
+    topic,
+    source,
+    contextText: query,
+    hits,
+    citations,
+    topics
+  };
+}
+
+function createLessonFromRequest(db, teacher, body) {
+  const context = collectLessonGenerationContext(db, teacher.id, body);
+  const objectives = Array.isArray(body.objectives) && body.objectives.length
+    ? body.objectives.map(String).filter(Boolean).slice(0, 8)
+    : lessonDefaultObjectives(context.topic, context.subject, context.topics);
+  const lesson = {
+    id: uid("lesson"),
+    teacherId: teacher.id,
+    title: String(body.title || `${context.topic}互动课堂`).trim().slice(0, 80),
+    subject: context.subject,
+    source: context.source,
+    status: body.status === "published" ? "published" : "draft",
+    classIds: Array.isArray(body.classIds) ? body.classIds.map(String).filter(Boolean) : [],
+    duration: Math.max(10, Math.min(90, Number(body.duration || 20))),
+    objectives,
+    agents: Array.isArray(body.agents) && body.agents.length ? body.agents : defaultLessonAgents(),
+    scenes: buildLessonScenes({
+      subject: context.subject,
+      topic: context.topic,
+      objectives,
+      topics: context.topics,
+      citations: context.citations,
+      duration: body.duration
+    }),
+    citations: context.citations,
+    tags: context.topics,
+    analytics: { sessions: 0, attempts: 0, averageScore: null },
+    createdAt: now(),
+    updatedAt: now()
+  };
+  return lesson;
+}
+
+function lessonCanView(db, lesson, user) {
+  if (!lesson || !user) return false;
+  if (user.role === "admin" || lesson.teacherId === user.id) return true;
+  if (user.role !== "student") return false;
+  const userClassIds = new Set(user.classIds || []);
+  const sharedToClass = (lesson.classIds || []).some((classId) => userClassIds.has(classId));
+  const joinedSession = (db.classroomSessions || []).some((session) => session.lessonId === lesson.id && (session.participantIds || []).includes(user.id));
+  return lesson.status === "published" && (sharedToClass || joinedSession);
+}
+
+function visibleLessons(db, userId) {
+  const user = ensureUser(db, userId);
+  return (db.lessons || [])
+    .filter((lesson) => lessonCanView(db, lesson, user))
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+}
+
+function publicLesson(db, lesson, userId) {
+  const attempts = (db.quizAttempts || []).filter((item) => item.lessonId === lesson.id);
+  const scores = attempts.map((item) => Number(item.score)).filter(Number.isFinite);
+  return {
+    ...lesson,
+    analytics: {
+      ...(lesson.analytics || {}),
+      sessions: (db.classroomSessions || []).filter((item) => item.lessonId === lesson.id).length,
+      attempts: attempts.length,
+      myAttempts: attempts.filter((item) => item.studentId === userId).length,
+      averageScore: scores.length ? Math.round(scores.reduce((sum, item) => sum + item, 0) / scores.length) : null
+    }
+  };
+}
+
+function publicClassroomSession(session, userId) {
+  return {
+    ...session,
+    events: (session.events || []).slice(-80),
+    isParticipant: (session.participantIds || []).includes(userId)
+  };
+}
+
+function assertLessonEditable(lesson, actor) {
+  if (!lesson) throw Object.assign(new Error("课堂不存在"), { status: 404 });
+  if (actor.role !== "admin" && lesson.teacherId !== actor.id) {
+    throw Object.assign(new Error("只能修改自己创建的课堂"), { status: 403 });
+  }
+}
+
+function assertSessionVisible(db, session, actor) {
+  if (!session) throw Object.assign(new Error("课堂会话不存在"), { status: 404 });
+  const lesson = (db.lessons || []).find((item) => item.id === session.lessonId);
+  if (!lesson) throw Object.assign(new Error("课堂不存在"), { status: 404 });
+  if (actor.role === "admin" || lesson.teacherId === actor.id || (session.participantIds || []).includes(actor.id)) {
+    return lesson;
+  }
+  throw Object.assign(new Error("无权访问该课堂会话"), { status: 403 });
+}
+
+function lessonSceneAgentEvents(scene, lesson) {
+  if (!scene) return [];
+  const teacher = (lesson.agents || []).find((item) => item.role === "teacher") || { name: "AI教师", role: "teacher" };
+  const assistant = (lesson.agents || []).find((item) => item.role === "assistant") || { name: "AI助教", role: "assistant" };
+  if (scene.type === "discussion" && Array.isArray(scene.script)) {
+    return scene.script.map((line) => ({
+      id: uid("event"),
+      type: "agent_speech",
+      agentRole: line.agentRole,
+      agentName: line.agentName,
+      text: line.text,
+      createdAt: now()
+    }));
+  }
+  if (scene.type === "quiz") {
+    return [{
+      id: uid("event"),
+      type: "agent_speech",
+      agentRole: "grader",
+      agentName: "评分Agent",
+      text: "课堂小测已准备好，提交后会把结果回流到学习画像。",
+      createdAt: now()
+    }];
+  }
+  return [
+    {
+      id: uid("event"),
+      type: "agent_speech",
+      agentRole: teacher.role,
+      agentName: teacher.name,
+      text: scene.content?.headline ? `${scene.title}：${scene.content.headline}` : `进入环节：${scene.title}`,
+      createdAt: now()
+    },
+    {
+      id: uid("event"),
+      type: "agent_speech",
+      agentRole: assistant.role,
+      agentName: assistant.name,
+      text: (scene.content?.bullets || []).slice(0, 2).join("；") || `本环节目标：${scene.objective || "理解并应用当前知识点"}`,
+      createdAt: now()
+    }
+  ];
+}
+
+function addClassroomEvents(db, session, events) {
+  const normalized = events.map((event) => ({
+    id: event.id || uid("event"),
+    sessionId: session.id,
+    lessonId: session.lessonId,
+    ...event,
+    createdAt: event.createdAt || now()
+  }));
+  session.events = Array.isArray(session.events) ? session.events : [];
+  session.events.push(...normalized);
+  session.events = session.events.slice(-160);
+  db.classroomEvents.push(...normalized);
+  db.classroomEvents = db.classroomEvents.slice(-2000);
+  session.updatedAt = now();
+  return normalized;
+}
+
+function startClassroomSession(db, lesson, actor, body) {
+  const classId = String(body.classId || "").trim();
+  const participantIds = new Set();
+  if (actor.role === "student") participantIds.add(actor.id);
+  if (classId) {
+    const klass = (db.classes || []).find((item) => item.id === classId);
+    if (!klass) throw Object.assign(new Error("班级不存在"), { status: 404 });
+    if (lesson.teacherId !== actor.id && !lessonCanView(db, lesson, actor)) {
+      throw Object.assign(new Error("无权启动该课堂"), { status: 403 });
+    }
+    (klass.studentIds || []).forEach((id) => participantIds.add(id));
+  }
+  const session = {
+    id: uid("classroom"),
+    lessonId: lesson.id,
+    teacherId: lesson.teacherId,
+    classId,
+    participantIds: Array.from(participantIds),
+    currentSceneIndex: 0,
+    status: "running",
+    events: [],
+    notes: [],
+    startedBy: actor.id,
+    startedAt: now(),
+    updatedAt: now()
+  };
+  addClassroomEvents(db, session, [{
+    type: "system",
+    text: `课堂「${lesson.title}」已启动。`,
+    createdAt: now()
+  }, ...lessonSceneAgentEvents((lesson.scenes || [])[0], lesson)]);
+  db.classroomSessions.unshift(session);
+  lesson.analytics = lesson.analytics || {};
+  lesson.analytics.sessions = Number(lesson.analytics.sessions || 0) + 1;
+  lesson.updatedAt = now();
+  return session;
+}
+
+function scoreLessonQuiz(scene, answers = {}) {
+  const questions = scene?.quiz?.questions || [];
+  if (!questions.length) return { score: 0, results: [] };
+  const results = questions.map((question) => {
+    const raw = answers[question.id] ?? answers[question.stem] ?? "";
+    const given = String(raw || "").trim();
+    const expected = String(question.answer || "").trim();
+    let correct = false;
+    if (question.type === "short") {
+      const tokens = tokenizeForSearch(expected);
+      const givenTokens = new Set(tokenizeForSearch(given));
+      correct = Boolean(given) && (tokens.some((token) => givenTokens.has(token)) || given.includes(expected) || expected.includes(given));
+    } else {
+      correct = given === expected;
+    }
+    return {
+      questionId: question.id,
+      topic: question.topic || scene.title,
+      stem: question.stem,
+      answer: given,
+      expected,
+      correct,
+      explanation: question.explanation || ""
+    };
+  });
+  const correctCount = results.filter((item) => item.correct).length;
+  return {
+    score: Math.round((correctCount / questions.length) * 100),
+    results
+  };
+}
+
+function lessonExportContent(lesson, format = "markdown") {
+  if (format === "json") return JSON.stringify(lesson, null, 2);
+  const sceneMarkdown = (lesson.scenes || []).map((scene, index) => {
+    const lines = [
+      `## ${index + 1}. ${scene.title}`,
+      `类型：${scene.type}`,
+      scene.objective ? `目标：${scene.objective}` : "",
+      ...(scene.content?.bullets || []).map((item) => `- ${item}`),
+      ...(scene.script || []).map((line) => `- ${line.agentName || line.agentRole}：${line.text}`),
+      ...(scene.quiz?.questions || []).map((q, qIndex) => `- 题 ${qIndex + 1}：${q.stem}\n  答案：${q.answer}\n  解析：${q.explanation || ""}`)
+    ];
+    return lines.filter(Boolean).join("\n");
+  }).join("\n\n");
+  const markdown = [
+    `# ${lesson.title}`,
+    "",
+    `学科：${lesson.subject}`,
+    `来源：${lessonSourceLabel(lesson.source)} · ${lesson.source?.topic || ""}`,
+    `时长：${lesson.duration || 20} 分钟`,
+    "",
+    "## 课堂目标",
+    ...(lesson.objectives || []).map((item) => `- ${item}`),
+    "",
+    "## 多智能体角色",
+    ...(lesson.agents || []).map((agent) => `- ${agent.name}：${agent.style || agent.role}`),
+    "",
+    sceneMarkdown
+  ].join("\n");
+  if (format === "html") {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${lesson.title}</title><style>body{font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.7;max-width:960px;margin:36px auto;padding:0 24px;color:#172033}h1,h2{color:#1d4ed8}section{border:1px solid #d8e0ef;border-radius:8px;padding:18px;margin:16px 0}</style></head><body>${markdown.split("\n\n").map((block) => {
+      if (block.startsWith("# ")) return `<h1>${block.slice(2)}</h1>`;
+      if (block.startsWith("## ")) return `<h2>${block.slice(3)}</h2>`;
+      return `<section>${block.split("\n").map((line) => `<p>${line.replace(/^-\s*/, "")}</p>`).join("")}</section>`;
+    }).join("")}</body></html>`;
+  }
+  return markdown;
+}
+
 function gradeSubmissionWithFeedback(db, homework, submission) {
   const rubric = parseRubricInput(homework.rubric?.length ? homework.rubric : homework.rubricText, homework);
   const rubricResults = rubric.map((criterion) => evaluateCriterion(criterion, submission.answerText));
@@ -4611,6 +5122,15 @@ function getRelevantState(db, userId) {
     homework: db.homework.filter((item) => item.teacherId === userId || classIds.includes(item.classId)),
     submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
     courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
+    lessons: visibleLessons(db, userId).map((lesson) => publicLesson(db, lesson, userId)),
+    classroomSessions: (db.classroomSessions || [])
+      .filter((session) => {
+        const lesson = (db.lessons || []).find((item) => item.id === session.lessonId);
+        return lesson && lessonCanView(db, lesson, user) && (lesson.teacherId === userId || (session.participantIds || []).includes(userId) || user.role === "admin");
+      })
+      .map((session) => publicClassroomSession(session, userId)),
+    quizAttempts: (db.quizAttempts || []).filter((item) => item.studentId === userId || db.lessons.some((lesson) => lesson.id === item.lessonId && lesson.teacherId === userId)).slice(0, 120),
+    lessonExports: (db.lessonExports || []).filter((item) => db.lessons.some((lesson) => lesson.id === item.lessonId && (lesson.teacherId === userId || user.role === "admin"))).slice(0, 80),
     learningProfile: ensureLearningProfile(db, userId),
     wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
     learningAnalytics: learningAnalytics(db, userId),
@@ -4782,6 +5302,246 @@ async function handleApi(req, res, pathname, searchParams) {
     recordAudit(db, actor, "user.update", { resourceType: "user", resourceId: user.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, user: publicUser(user) });
+  }
+
+  if (method === "GET" && pathname === "/api/lessons") {
+    const userId = queryUserId(searchParams, actor);
+    const subject = searchParams.get("subject");
+    let lessons = visibleLessons(db, userId);
+    if (subject) lessons = lessons.filter((lesson) => lesson.subject === normalizeSubject(subject));
+    return send(res, 200, { ok: true, lessons: lessons.map((lesson) => publicLesson(db, lesson, userId)) });
+  }
+
+  if (method === "POST" && pathname === "/api/lessons/generate") {
+    const body = await readBody(req);
+    assertRequired(body, ["teacherId"]);
+    requireRole(actor, ["teacher", "admin"]);
+    const teacher = ensureUser(db, body.teacherId);
+    if (!["teacher", "admin"].includes(teacher.role)) return sendError(res, 403, "只有教师可以生成互动课堂");
+    const ownedClassIds = new Set((db.classes || []).filter((klass) => klass.teacherId === teacher.id).map((klass) => klass.id));
+    const requestedClassIds = Array.isArray(body.classIds) ? body.classIds.map(String).filter(Boolean) : [];
+    body.classIds = requestedClassIds.filter((classId) => ownedClassIds.has(classId));
+    const lesson = createLessonFromRequest(db, teacher, body);
+    db.lessons.unshift(lesson);
+    recordAudit(db, actor, "lesson.generate", { resourceType: "lesson", resourceId: lesson.id, meta: { title: lesson.title, subject: lesson.subject } }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, lesson: publicLesson(db, lesson, actor.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/lessons/:id");
+  if (method === "GET" && params) {
+    const lesson = (db.lessons || []).find((item) => item.id === params.id);
+    if (!lesson) return notFound(res);
+    if (!lessonCanView(db, lesson, actor)) return sendError(res, 403, "无权查看该课堂");
+    return send(res, 200, { ok: true, lesson: publicLesson(db, lesson, actor.id) });
+  }
+
+  if (method === "PUT" && params) {
+    const body = await readBody(req);
+    const lesson = (db.lessons || []).find((item) => item.id === params.id);
+    try {
+      assertLessonEditable(lesson, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    if (body.title !== undefined) lesson.title = String(body.title || lesson.title).trim().slice(0, 80) || lesson.title;
+    if (body.subject !== undefined) lesson.subject = normalizeSubject(body.subject);
+    if (Array.isArray(body.objectives)) lesson.objectives = body.objectives.map(String).filter(Boolean).slice(0, 10);
+    if (Array.isArray(body.agents)) lesson.agents = body.agents.filter(Boolean).slice(0, 12);
+    if (Array.isArray(body.scenes)) lesson.scenes = body.scenes.filter(Boolean).slice(0, 24);
+    if (Array.isArray(body.classIds)) {
+      const ownedClassIds = new Set((db.classes || []).filter((klass) => klass.teacherId === lesson.teacherId).map((klass) => klass.id));
+      lesson.classIds = body.classIds.map(String).filter((classId) => ownedClassIds.has(classId));
+    }
+    if (["draft", "published"].includes(body.status)) lesson.status = body.status;
+    lesson.updatedAt = now();
+    recordAudit(db, actor, "lesson.update", { resourceType: "lesson", resourceId: lesson.id }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, lesson: publicLesson(db, lesson, actor.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/lessons/:id/export");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    const lesson = (db.lessons || []).find((item) => item.id === params.id);
+    try {
+      assertLessonEditable(lesson, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    const format = ["markdown", "html", "json"].includes(body.format) ? body.format : "markdown";
+    const content = lessonExportContent(lesson, format);
+    const exportRecord = {
+      id: uid("lesson_export"),
+      lessonId: lesson.id,
+      teacherId: lesson.teacherId,
+      format,
+      fileName: `${lesson.title}.${format === "markdown" ? "md" : format}`,
+      characters: content.length,
+      content,
+      createdAt: now()
+    };
+    db.lessonExports.unshift(exportRecord);
+    recordAudit(db, actor, "lesson.export", { resourceType: "lesson", resourceId: lesson.id, meta: { format } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, export: exportRecord });
+  }
+
+  params = routePattern(pathname, "/api/classrooms/:lessonId/start");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    const lesson = (db.lessons || []).find((item) => item.id === params.lessonId);
+    if (!lesson) return notFound(res);
+    if (actor.role === "teacher" || actor.role === "admin") {
+      try {
+        assertLessonEditable(lesson, actor);
+      } catch (error) {
+        return sendError(res, error.status || 500, error.message);
+      }
+    } else if (!lessonCanView(db, lesson, actor)) {
+      return sendError(res, 403, "无权启动该课堂");
+    }
+    const session = startClassroomSession(db, lesson, actor, body);
+    recordAudit(db, actor, "classroom.start", { resourceType: "classroomSession", resourceId: session.id, meta: { lessonId: lesson.id } }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/classrooms/:sessionId/next");
+  if (method === "POST" && params) {
+    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
+    let lesson;
+    try {
+      lesson = assertSessionVisible(db, session, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    const scenes = lesson.scenes || [];
+    if (!scenes.length) return sendError(res, 400, "该课堂没有可运行的环节");
+    if (session.currentSceneIndex >= scenes.length - 1) {
+      session.status = "complete";
+      addClassroomEvents(db, session, [{ type: "system", text: "课堂已完成，可以导出课件或查看测验回流。", createdAt: now() }]);
+    } else {
+      session.currentSceneIndex += 1;
+      addClassroomEvents(db, session, lessonSceneAgentEvents(scenes[session.currentSceneIndex], lesson));
+    }
+    recordAudit(db, actor, "classroom.next", { resourceType: "classroomSession", resourceId: session.id, meta: { sceneIndex: session.currentSceneIndex } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/classrooms/:sessionId/ask");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["question"]);
+    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
+    let lesson;
+    try {
+      lesson = assertSessionVisible(db, session, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    const question = String(body.question || "").trim().slice(0, 500);
+    const hits = searchCourseKnowledge(db, actor.id, `${lesson.title}\n${question}`, { subject: lesson.subject, limit: 3 });
+    const citations = lessonCitationsFromHits(hits);
+    const answer = [
+      `针对你的问题「${question}」，我会先回到本节课主题「${lesson.source?.topic || lesson.title}」。`,
+      citations[0] ? `可引用资料：${citations[0].sourceName || citations[0].title}${citations[0].chapter ? ` · ${citations[0].chapter}` : ""}。` : "当前没有命中课程资料，以下为课堂脚本内的引导性解释。",
+      "建议先说明概念边界，再举一个例子，最后用课堂小测验证。"
+    ].join("\n");
+    addClassroomEvents(db, session, [
+      { type: "student_question", userId: actor.id, text: question, createdAt: now() },
+      { type: "agent_speech", agentRole: "assistant", agentName: "AI助教", text: answer, citations, createdAt: now() }
+    ]);
+    if (actor.role === "student") {
+      recordLearningActivity(db, actor.id, { kind: "question", mode: "classroom", prompt: question, topics: lesson.tags || [], confidence: citations.length ? "medium" : "low", minutes: 2 });
+    }
+    recordAudit(db, actor, "classroom.ask", { resourceType: "classroomSession", resourceId: session.id }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/classrooms/:sessionId/quiz/submit");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    assertRequired(body, ["studentId"]);
+    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
+    let lesson;
+    try {
+      lesson = assertSessionVisible(db, session, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    const student = ensureUser(db, body.studentId);
+    if (student.role !== "student") return sendError(res, 400, "课堂测验只能由学生提交");
+    if (!lessonCanView(db, lesson, student) && !(session.participantIds || []).includes(student.id)) return sendError(res, 403, "该学生不在课堂中");
+    const scene = (lesson.scenes || []).find((item) => item.id === body.sceneId) || (lesson.scenes || []).find((item) => item.type === "quiz");
+    if (!scene || scene.type !== "quiz") return sendError(res, 404, "该课堂没有测验环节");
+    const result = scoreLessonQuiz(scene, body.answers || {});
+    const topics = Array.from(new Set(result.results.map((item) => item.topic).filter(Boolean))).slice(0, 8);
+    const attempt = {
+      id: uid("quiz_attempt"),
+      lessonId: lesson.id,
+      sessionId: session.id,
+      sceneId: scene.id,
+      studentId: student.id,
+      answers: body.answers || {},
+      score: result.score,
+      results: result.results,
+      topics,
+      createdAt: now()
+    };
+    db.quizAttempts.unshift(attempt);
+    db.quizAttempts = db.quizAttempts.slice(0, 1000);
+    updateTopicMastery(db, student.id, topics, result.score >= 70 ? 0.08 : -0.08, `互动课堂测验：${lesson.title}，得分 ${result.score}`);
+    recordLearningActivity(db, student.id, { kind: "practice", mode: "classroom_quiz", prompt: lesson.title, topics, confidence: "high", minutes: 5 });
+    result.results.filter((item) => !item.correct).slice(0, 3).forEach((item) => {
+      addWrongNote(db, student.id, {
+        source: "课堂测验",
+        topic: item.topic || lesson.title,
+        question: item.stem,
+        answer: item.answer,
+        analysis: `课堂测验答错，参考答案：${item.expected}`,
+        recommendation: item.explanation || "建议回看课堂白板和对应知识图谱节点。"
+      });
+    });
+    addClassroomEvents(db, session, [{ type: "quiz_attempt", userId: student.id, text: `${student.name} 完成课堂小测，得分 ${result.score}`, attemptId: attempt.id, createdAt: now() }]);
+    lesson.analytics = lesson.analytics || {};
+    lesson.analytics.attempts = Number(lesson.analytics.attempts || 0) + 1;
+    lesson.updatedAt = now();
+    recordAudit(db, actor, "classroom.quiz_submit", { resourceType: "quizAttempt", resourceId: attempt.id, meta: { score: result.score } }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, attempt, session: publicClassroomSession(session, actor.id), learningAnalytics: learningAnalytics(db, student.id), state: getRelevantState(db, actor.id) });
+  }
+
+  params = routePattern(pathname, "/api/classrooms/:sessionId/whiteboard/action");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
+    let lesson;
+    try {
+      lesson = assertSessionVisible(db, session, actor);
+    } catch (error) {
+      return sendError(res, error.status || 500, error.message);
+    }
+    const scene = (lesson.scenes || [])[session.currentSceneIndex] || (lesson.scenes || []).find((item) => item.type === "whiteboard");
+    if (!scene) return sendError(res, 404, "当前课堂没有可写入的白板环节");
+    scene.whiteboard = scene.whiteboard || { objects: [] };
+    const object = {
+      id: uid("wb"),
+      type: String(body.type || "note"),
+      x: Number(body.x || 120),
+      y: Number(body.y || 120),
+      text: String(body.text || "课堂备注").slice(0, 300),
+      createdBy: actor.id,
+      createdAt: now()
+    };
+    scene.whiteboard.objects.push(object);
+    lesson.updatedAt = now();
+    addClassroomEvents(db, session, [{ type: "whiteboard_action", userId: actor.id, text: object.text, object, createdAt: now() }]);
+    recordAudit(db, actor, "classroom.whiteboard_action", { resourceType: "classroomSession", resourceId: session.id }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, object, lesson: publicLesson(db, lesson, actor.id), session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
   }
 
   if (method === "GET" && pathname === "/api/graphs") {

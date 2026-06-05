@@ -50,7 +50,20 @@ const state = {
   conversationContextMenu: null,
   graphUploadAbort: null,
   graphGenerationCanceled: false,
-  searchResults: []
+  searchResults: [],
+  activeLessonId: null,
+  activeClassroomSessionId: null,
+  classroomDraft: {
+    sourceType: "topic",
+    subject: "",
+    topic: "",
+    materialId: "",
+    graphId: "",
+    nodeId: "",
+    classIds: [],
+    duration: 20
+  },
+  lessonExport: null
 };
 
 const subjects = ["数学", "物理", "化学", "生物", "机器学习", "语文", "英语", "历史", "地理", "政治", "通用"];
@@ -103,6 +116,7 @@ const GRAPH_RELATION_FILTERS = [
 const teacherMenus = [
   { key: "home", icon: "⌂", label: "教学工作台", section: "总览" },
   { key: "ai", icon: "◉", label: "教学指导", section: "教学" },
+  { key: "classroom", icon: "▣", label: "互动课堂", section: "教学" },
   { key: "homework", icon: "✓", label: "作业管理", section: "教学" },
   { key: "graph", icon: "▦", label: "知识图谱", section: "资源" },
   { key: "materials", icon: "▤", label: "课程资料", section: "资源" },
@@ -115,6 +129,7 @@ const teacherMenus = [
 const studentMenus = [
   { key: "home", icon: "⌂", label: "学习首页", section: "总览" },
   { key: "ai", icon: "◉", label: "发起对话", section: "学习" },
+  { key: "classroom", icon: "▣", label: "AI课堂", section: "学习" },
   { key: "graph", icon: "▦", label: "知识图谱", section: "学习" },
   { key: "homework", icon: "✓", label: "作业提交", section: "学习" },
   { key: "models", icon: "◇", label: "模型实验室", section: "资源" },
@@ -565,6 +580,16 @@ function downloadJson(filename, data) {
   URL.revokeObjectURL(url);
 }
 
+function downloadText(filename, content, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 function getCurrentUser() {
   const raw = localStorage.getItem("edu-user");
   if (!raw) return null;
@@ -607,6 +632,9 @@ function resetSessionSelectionState() {
   state.conversationContextMenu = null;
   state.graphUploadAbort = null;
   state.graphGenerationCanceled = false;
+  state.activeLessonId = null;
+  state.activeClassroomSessionId = null;
+  state.lessonExport = null;
   state.selectedMessages.clear();
   state.searchResults = [];
 }
@@ -619,6 +647,9 @@ async function loadState() {
   localStorage.setItem("edu-user", JSON.stringify(state.user));
   if (!state.selectedClassId && state.data.classes.length) state.selectedClassId = state.data.classes[0].id;
   if (!state.selectedGraphId && state.data.knowledgeGraphs.length) state.selectedGraphId = state.data.knowledgeGraphs[0].id;
+  if (state.activeLessonId && !state.data.lessons?.some((lesson) => lesson.id === state.activeLessonId)) state.activeLessonId = null;
+  if (!state.activeLessonId && state.data.lessons?.length) state.activeLessonId = state.data.lessons[0].id;
+  if (state.activeClassroomSessionId && !state.data.classroomSessions?.some((session) => session.id === state.activeClassroomSessionId)) state.activeClassroomSessionId = null;
   if (state.activeThreadId && !state.data.chatThreads.some((thread) => thread.id === state.activeThreadId)) state.activeThreadId = null;
   if (!state.activeThreadId && state.data.chatThreads.length) state.activeThreadId = state.data.chatThreads[0].id;
 }
@@ -950,11 +981,13 @@ function renderContent() {
   if (state.user?.role === "student" && state.page === "materials") state.page = "graph";
   const main = document.querySelector(".main");
   main?.classList.toggle("ai-main", state.page === "ai");
+  main?.classList.toggle("classroom-main", state.page === "classroom");
   main?.classList.toggle("model-main", state.page === "models");
   main?.classList.toggle("ml-model-main", state.page === "models" && state.modelSubject === "机器学习");
   const contentClasses = ["content"];
   if (state.page === "home") contentClasses.push("home-content");
   if (state.page === "ai") contentClasses.push("ai-content");
+  if (state.page === "classroom") contentClasses.push("classroom-content");
   if (state.page === "models") contentClasses.push("model-content");
   if (state.page === "models" && state.modelSubject === "机器学习") contentClasses.push("ml-model-content");
   if (state.page === "graph" && state.user?.role === "student") contentClasses.push("student-graph-content");
@@ -965,6 +998,7 @@ function renderContent() {
     home: renderHomePage,
     graph: renderGraphPage,
     ai: renderAiPage,
+    classroom: renderClassroomPage,
     materials: renderMaterialsPage,
     models: renderModelPage,
     chat: renderChatPage,
@@ -982,6 +1016,7 @@ function bindCurrentPage() {
     home: bindHomePage,
     graph: bindGraphPage,
     ai: bindAiPage,
+    classroom: bindClassroomPage,
     materials: bindMaterialsPage,
     models: bindModelPage,
     chat: bindChatPage,
@@ -1081,6 +1116,7 @@ function renderTeacherHomePage() {
         </div>
         <div class="dashboard-actions">
           ${renderDashboardAction("materials", "上传资料", "PDF、Word、PPTX 入库并可问答", true)}
+          ${renderDashboardAction("classroom", "互动课堂", "生成课堂脚本、测验和白板讲解")}
           ${renderDashboardAction("graph", "生成图谱", "从教材目录和知识点构建课程图谱")}
           ${renderDashboardAction("homework", "发布作业", "布置文字、图片或视频作业")}
           ${renderDashboardAction("classes", "班级管理", "创建班级、导入学生、查看申请")}
@@ -1159,6 +1195,7 @@ function renderStudentHomePage() {
         </div>
         <div class="dashboard-actions">
           ${renderDashboardAction("ai", "问 AI", "基于课程资料提问、讲解或练习", true)}
+          ${renderDashboardAction("classroom", "AI 课堂", "进入教师发布的互动课堂")}
           ${renderDashboardAction("homework", "提交作业", "查看老师发布的作业")}
           ${renderDashboardAction("graph", "查看图谱", "按学科查看知识网络")}
           ${renderDashboardAction("models", "模型实验室", "运行机器学习或学科模型")}
@@ -1198,6 +1235,618 @@ function bindHomePage() {
       state.page = button.dataset.dashboardPage;
       renderShell();
     });
+  });
+}
+
+function renderClassroomPage() {
+  return isTeacherLike() ? renderTeacherClassroomPage() : renderStudentClassroomPage();
+}
+
+function selectedLesson() {
+  const lessons = state.data.lessons || [];
+  return lessons.find((lesson) => lesson.id === state.activeLessonId) || lessons[0] || null;
+}
+
+function selectedClassroomSession(lesson) {
+  const sessions = state.data.classroomSessions || [];
+  if (state.activeClassroomSessionId) {
+    const active = sessions.find((session) => session.id === state.activeClassroomSessionId);
+    if (active) return active;
+  }
+  return lesson ? sessions.find((session) => session.lessonId === lesson.id) || null : null;
+}
+
+function lessonStatusLabel(status) {
+  return status === "published" ? "已发布" : "草稿";
+}
+
+function lessonSourceLabelClient(source = {}) {
+  const labels = {
+    material: "课程资料",
+    graph_node: "图谱节点",
+    graph: "知识图谱",
+    homework: "作业错因",
+    weakness: "班级薄弱点",
+    topic: "教师主题"
+  };
+  return labels[source.type] || "教师主题";
+}
+
+function classroomSceneTypeLabel(type) {
+  return {
+    slide: "幻灯片",
+    whiteboard: "白板",
+    discussion: "讨论",
+    quiz: "测验",
+    summary: "总结",
+    simulation: "仿真"
+  }[type] || type || "环节";
+}
+
+function classroomAgentLabel(role) {
+  return {
+    director: "课堂导演",
+    teacher: "AI教师",
+    assistant: "AI助教",
+    "student-basic": "基础同学",
+    "student-misconception": "易错同学",
+    grader: "评分Agent"
+  }[role] || role || "智能体";
+}
+
+function classroomDraftNodeOptions() {
+  const graph = (state.data.knowledgeGraphs || []).find((item) => item.id === state.classroomDraft.graphId)
+    || (state.data.knowledgeGraphs || [])[0];
+  return (graph?.nodes || []).slice(0, 120).map((node) => `<option value="${escapeHtml(node.id)}" ${node.id === state.classroomDraft.nodeId ? "selected" : ""}>${escapeHtml(node.label)}</option>`).join("");
+}
+
+function renderLessonList(lessons) {
+  return `
+    <div class="lesson-list">
+      ${lessons.map((lesson) => `
+        <article class="${lesson.id === state.activeLessonId ? "active" : ""}" data-select-lesson="${lesson.id}">
+          <div>
+            <strong>${escapeHtml(lesson.title)}</strong>
+            <span>${escapeHtml(lesson.subject)} · ${lessonStatusLabel(lesson.status)} · ${lesson.scenes?.length || 0} 个环节</span>
+            <small>${lessonSourceLabelClient(lesson.source)} · ${fmtTime(lesson.updatedAt || lesson.createdAt)}</small>
+          </div>
+          <div class="lesson-metrics">
+            <span>${lesson.analytics?.sessions || 0}<small>课堂</small></span>
+            <span>${lesson.analytics?.attempts || 0}<small>测验</small></span>
+          </div>
+        </article>
+      `).join("") || emptyBlock(isTeacherLike() ? "还没有互动课堂。先从主题、资料或图谱节点生成一节课。" : "还没有可加入的 AI 课堂。教师发布到班级后会显示。")}
+    </div>
+  `;
+}
+
+function renderTeacherClassroomPage() {
+  const lessons = state.data.lessons || [];
+  const lesson = selectedLesson();
+  const session = selectedClassroomSession(lesson);
+  const materials = state.data.courseMaterials || [];
+  const graphs = state.data.knowledgeGraphs || [];
+  const classes = state.data.classes || [];
+  const attempts = state.data.quizAttempts || [];
+  return `
+    <section class="dashboard-hero classroom-hero">
+      <div>
+        <h2>互动课堂工坊</h2>
+        <p>从课程资料、知识图谱节点或教师主题生成课堂脚本，再运行多智能体课堂、测验和导出。</p>
+      </div>
+      <button class="primary" type="button" id="focusLessonGenerate">生成互动课堂</button>
+    </section>
+    <section class="dashboard-stats">
+      ${renderDashboardStat("课堂脚本", lessons.length, `${lessons.filter((item) => item.status === "published").length} 节已发布`)}
+      ${renderDashboardStat("课堂运行", (state.data.classroomSessions || []).length, "真实启动后计入")}
+      ${renderDashboardStat("课堂测验", attempts.length, attempts[0] ? `最近 ${attempts[0].score} 分` : "暂无提交")}
+      ${renderDashboardStat("可用资料", materials.length, `${graphs.length} 个图谱可生成微课`)}
+    </section>
+    <div class="classroom-workbench">
+      <section class="panel classroom-generator-panel" id="lessonGeneratePanel">
+        <div class="split-head">
+          <h3>课堂生成器</h3>
+          <span>资料 / 图谱 / 主题</span>
+        </div>
+        <form id="lessonGenerateForm" class="stack">
+          <div class="form-grid">
+            <label>来源类型
+              <select name="sourceType" id="lessonSourceType">
+                <option value="topic" ${state.classroomDraft.sourceType === "topic" ? "selected" : ""}>教师输入主题</option>
+                <option value="material" ${state.classroomDraft.sourceType === "material" ? "selected" : ""}>课程资料生成</option>
+                <option value="graph_node" ${state.classroomDraft.sourceType === "graph_node" ? "selected" : ""}>知识图谱节点生成</option>
+              </select>
+            </label>
+            <label>学科
+              <select name="subject">${subjectOptions(state.classroomDraft.subject || state.user.subject || "通用")}</select>
+            </label>
+          </div>
+          <label>课堂主题<input name="topic" value="${escapeHtml(state.classroomDraft.topic || "")}" placeholder="例如：Cache 直接映射地址划分、KNN 算法流程" required /></label>
+          <div class="form-grid">
+            <label>课程资料
+              <select name="materialId">
+                <option value="">不指定资料</option>
+                ${materials.map((item) => `<option value="${item.id}" ${item.id === state.classroomDraft.materialId ? "selected" : ""}>${escapeHtml(item.title)}</option>`).join("")}
+              </select>
+            </label>
+            <label>知识图谱
+              <select name="graphId" id="lessonGraphSelect">
+                <option value="">不指定图谱</option>
+                ${graphs.map((item) => `<option value="${item.id}" ${item.id === state.classroomDraft.graphId ? "selected" : ""}>${escapeHtml(item.title)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+          <label>图谱节点
+            <select name="nodeId">
+              <option value="">按图谱整体生成</option>
+              ${classroomDraftNodeOptions()}
+            </select>
+          </label>
+          <div class="form-grid">
+            <label>课堂时长（分钟）<input name="duration" type="number" min="10" max="90" value="${state.classroomDraft.duration || 20}" /></label>
+            <label>发布状态
+              <select name="status">
+                <option value="draft">先保存草稿</option>
+                <option value="published">生成后发布给班级</option>
+              </select>
+            </label>
+          </div>
+          <label>发布班级</label>
+          <div class="check-list lesson-class-list">
+            ${classes.map((klass) => `<label><input type="checkbox" name="classIds" value="${klass.id}" />${escapeHtml(klass.name)} · ${escapeHtml(klass.subject)}</label>`).join("") || `<span class="hint">还没有班级。课堂可先保存为草稿。</span>`}
+          </div>
+          <button class="primary" type="submit">生成课堂脚本</button>
+        </form>
+      </section>
+      <section class="panel classroom-list-panel">
+        <div class="split-head">
+          <h3>课堂列表</h3>
+          <span>${lessons.length} 节</span>
+        </div>
+        ${renderLessonList(lessons)}
+      </section>
+    </div>
+    ${lesson ? renderLessonEditor(lesson) : ""}
+    ${lesson ? renderClassroomStage(lesson, session, "teacher") : ""}
+    ${state.lessonExport ? renderLessonExportModal() : ""}
+  `;
+}
+
+function renderStudentClassroomPage() {
+  const lessons = state.data.lessons || [];
+  const lesson = selectedLesson();
+  const session = selectedClassroomSession(lesson);
+  const attempts = state.data.quizAttempts || [];
+  return `
+    <section class="dashboard-hero classroom-hero">
+      <div>
+        <h2>AI课堂</h2>
+        <p>进入教师发布的互动课堂，跟随 AI 教师、AI 助教和课堂测验完成学习闭环。</p>
+      </div>
+      ${lesson ? `<button class="primary" type="button" data-start-classroom="${lesson.id}">${session ? "继续课堂" : "开始学习"}</button>` : ""}
+    </section>
+    <section class="dashboard-stats">
+      ${renderDashboardStat("可加入课堂", lessons.length, lesson ? `当前：${lesson.title}` : "暂无课堂")}
+      ${renderDashboardStat("课堂回放", (state.data.classroomSessions || []).length, "参与后生成")}
+      ${renderDashboardStat("课堂测验", attempts.length, attempts[0] ? `最近 ${attempts[0].score} 分` : "暂无提交")}
+      ${renderDashboardStat("课堂错题", (state.data.wrongNotes || []).filter((item) => item.source === "课堂测验").length, "测验答错后生成")}
+    </section>
+    <div class="classroom-student-layout">
+      <section class="panel classroom-list-panel">
+        <div class="split-head">
+          <h3>已加入课堂</h3>
+          <span>${lessons.length} 节</span>
+        </div>
+        ${renderLessonList(lessons)}
+      </section>
+      <div>
+        ${lesson ? renderClassroomStage(lesson, session, "student") : `<section class="panel">${emptyBlock("暂无可学习课堂。请先加入教师创建的班级，或等待教师发布课堂。")}</section>`}
+      </div>
+    </div>
+  `;
+}
+
+function renderLessonEditor(lesson) {
+  return `
+    <section class="panel lesson-editor-panel">
+      <div class="split-head">
+        <h3>课堂脚本编辑器</h3>
+        <div class="actions compact-actions">
+          <button class="mini" type="button" data-start-classroom="${lesson.id}">启动课堂</button>
+          <button class="mini" type="button" data-export-lesson="${lesson.id}" data-format="markdown">导出 Markdown</button>
+          <button class="mini" type="button" data-export-lesson="${lesson.id}" data-format="html">导出 HTML</button>
+        </div>
+      </div>
+      <form id="lessonEditorForm" class="lesson-editor-grid">
+        <input type="hidden" name="lessonId" value="${lesson.id}" />
+        <label>课堂标题<input name="title" value="${escapeHtml(lesson.title)}" /></label>
+        <label>学科<select name="subject">${subjectOptions(lesson.subject)}</select></label>
+        <label>状态
+          <select name="status">
+            <option value="draft" ${lesson.status !== "published" ? "selected" : ""}>草稿</option>
+            <option value="published" ${lesson.status === "published" ? "selected" : ""}>发布</option>
+          </select>
+        </label>
+        <label>发布班级
+          <div class="check-list compact-check-list">
+            ${(state.data.classes || []).map((klass) => `<label><input type="checkbox" name="classIds" value="${klass.id}" ${(lesson.classIds || []).includes(klass.id) ? "checked" : ""} />${escapeHtml(klass.name)}</label>`).join("") || `<span class="hint">暂无班级</span>`}
+          </div>
+        </label>
+        <label class="wide-field">课程目标<textarea name="objectives" rows="5">${escapeHtml((lesson.objectives || []).join("\n"))}</textarea></label>
+        <label class="wide-field">AI 角色配置 JSON<textarea name="agents" rows="8">${escapeHtml(JSON.stringify(lesson.agents || [], null, 2))}</textarea></label>
+        <label class="wide-field">课堂环节 Storyboard JSON<textarea name="scenes" rows="12">${escapeHtml(JSON.stringify(lesson.scenes || [], null, 2))}</textarea></label>
+        <button class="primary" type="submit">保存课堂脚本</button>
+      </form>
+    </section>
+  `;
+}
+
+function renderClassroomStage(lesson, session, mode) {
+  const scenes = lesson.scenes || [];
+  const sceneIndex = session ? Number(session.currentSceneIndex || 0) : 0;
+  const scene = scenes[sceneIndex] || scenes[0];
+  return `
+    <section class="panel classroom-runner">
+      <div class="classroom-topline">
+        <div>
+          <span>${escapeHtml(lesson.subject)} · ${lessonStatusLabel(lesson.status)} · ${lessonSourceLabelClient(lesson.source)}</span>
+          <h3>${escapeHtml(lesson.title)}</h3>
+        </div>
+        <div class="actions compact-actions">
+          ${mode === "teacher" ? renderClassroomStartControls(lesson) : ""}
+          ${!session ? `<button class="primary" type="button" data-start-classroom="${lesson.id}">${mode === "teacher" ? "启动课堂" : "开始学习"}</button>` : ""}
+          ${session ? `<button class="mini" type="button" data-next-classroom="${session.id}">${sceneIndex >= scenes.length - 1 ? "完成课堂" : "下一环节"}</button>` : ""}
+        </div>
+      </div>
+      <div class="classroom-layout">
+        <aside class="classroom-outline">
+          <strong>课堂大纲</strong>
+          ${scenes.map((item, index) => `
+            <button type="button" class="${index === sceneIndex ? "active" : ""}" data-classroom-scene-index="${index}">
+              <span>${index + 1}. ${escapeHtml(item.title)}</span>
+              <small>${classroomSceneTypeLabel(item.type)} · ${Math.round(Number(item.duration || 0) / 60) || 3} 分钟</small>
+            </button>
+          `).join("")}
+        </aside>
+        <main class="classroom-stage">
+          ${scene ? renderClassroomScene(scene, lesson, mode, session) : emptyBlock("课堂脚本没有环节。")}
+        </main>
+        <aside class="classroom-agent-panel">
+          <strong>智能体与引用</strong>
+          <div class="agent-list">
+            ${(lesson.agents || []).slice(0, 8).map((agent) => `<article><span>${escapeHtml(agent.name || classroomAgentLabel(agent.role))}</span><small>${escapeHtml(agent.style || classroomAgentLabel(agent.role))}</small></article>`).join("")}
+          </div>
+          <div class="citation-list">
+            ${(lesson.citations || []).slice(0, 4).map((item) => `<article><span>${escapeHtml(item.sourceName || item.title)}</span><small>${escapeHtml(item.chapter || item.snippet || "课程引用")}</small></article>`).join("") || `<p class="hint">没有资料引用时，课堂会标记为基于教师输入主题生成。</p>`}
+          </div>
+        </aside>
+      </div>
+      <div class="classroom-bottom">
+        <section>
+          <strong>课堂事件</strong>
+          <div class="classroom-events">
+            ${(session?.events || []).slice(-8).map(renderClassroomEvent).join("") || `<p class="hint">启动课堂后显示 AI 教师、助教、同学和学生互动事件。</p>`}
+          </div>
+        </section>
+        ${session ? `
+          <form id="classroomAskForm" class="classroom-ask">
+            <input name="question" placeholder="学生提问 / 教师补充课堂指令" autocomplete="off" />
+            <button class="mini" type="submit">发送</button>
+          </form>
+        ` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderClassroomStartControls(lesson) {
+  const classIds = lesson.classIds || [];
+  const classes = (state.data.classes || []).filter((klass) => !classIds.length || classIds.includes(klass.id));
+  if (!classes.length) return "";
+  return `
+    <select id="classroomStartClass">
+      <option value="">不绑定班级</option>
+      ${classes.map((klass) => `<option value="${klass.id}">${escapeHtml(klass.name)}</option>`).join("")}
+    </select>
+  `;
+}
+
+function renderClassroomScene(scene, lesson, mode, session) {
+  if (scene.type === "whiteboard") return renderWhiteboardScene(scene);
+  if (scene.type === "discussion") return renderDiscussionScene(scene);
+  if (scene.type === "quiz") return renderQuizScene(scene, lesson, mode, session);
+  return `
+    <div class="stage-slide">
+      <span>${classroomSceneTypeLabel(scene.type)}</span>
+      <h2>${escapeHtml(scene.content?.headline || scene.title)}</h2>
+      <p>${escapeHtml(scene.objective || "完成本环节学习目标。")}</p>
+      <ul>
+        ${(scene.content?.bullets || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderWhiteboardScene(scene) {
+  const objects = scene.whiteboard?.objects || [];
+  return `
+    <div class="whiteboard-stage">
+      ${objects.map((item) => {
+        const style = `left:${Number(item.x || 80)}px;top:${Number(item.y || 80)}px;`;
+        if (item.type === "arrow") {
+          const from = item.from || [80, 80];
+          const to = item.to || [220, 80];
+          const width = Math.max(60, Number(to[0]) - Number(from[0]));
+          return `<div class="wb-arrow" style="left:${Number(from[0])}px;top:${Number(from[1])}px;width:${width}px"><span>${escapeHtml(item.text || "")}</span></div>`;
+        }
+        return `<div class="wb-object ${escapeHtml(item.type || "note")}" style="${style}">${escapeHtml(item.text || "")}</div>`;
+      }).join("")}
+      <form id="whiteboardActionForm" class="whiteboard-action">
+        <input name="text" placeholder="添加白板备注或公式" />
+        <button class="mini" type="submit">添加</button>
+      </form>
+    </div>
+  `;
+}
+
+function renderDiscussionScene(scene) {
+  return `
+    <div class="discussion-stage">
+      ${(scene.script || []).map((line) => `
+        <article class="${escapeHtml(line.agentRole || "")}">
+          <strong>${escapeHtml(line.agentName || classroomAgentLabel(line.agentRole))}</strong>
+          <p>${escapeHtml(line.text)}</p>
+        </article>
+      `).join("") || emptyBlock("暂无讨论脚本。")}
+    </div>
+  `;
+}
+
+function renderQuizScene(scene, lesson, mode, session) {
+  const questions = scene.quiz?.questions || [];
+  const attempts = (state.data.quizAttempts || []).filter((item) => item.lessonId === lesson.id && item.sceneId === scene.id);
+  if (mode === "student" && session) {
+    return `
+      <form id="classroomQuizForm" class="quiz-stage">
+        <input type="hidden" name="sceneId" value="${scene.id}" />
+        ${questions.map((question, index) => `
+          <fieldset>
+            <legend>${index + 1}. ${escapeHtml(question.stem)}</legend>
+            ${question.type === "short" ? `<textarea name="${question.id}" rows="3" placeholder="输入你的解释"></textarea>` : (question.options || []).map((option) => `<label><input type="radio" name="${question.id}" value="${escapeHtml(option)}" />${escapeHtml(option)}</label>`).join("")}
+            <small>${escapeHtml(question.topic || "")}</small>
+          </fieldset>
+        `).join("")}
+        <button class="primary" type="submit">提交课堂测验</button>
+      </form>
+    `;
+  }
+  return `
+    <div class="quiz-stage">
+      ${questions.map((question, index) => `
+        <article>
+          <strong>${index + 1}. ${escapeHtml(question.stem)}</strong>
+          <p>答案：${escapeHtml(question.answer)}</p>
+          <small>${escapeHtml(question.explanation || "")}</small>
+        </article>
+      `).join("")}
+      <p class="hint">学生提交 ${attempts.length} 次${attempts.length ? `，最近得分 ${attempts[0].score}` : ""}。</p>
+    </div>
+  `;
+}
+
+function renderClassroomEvent(event) {
+  const label = event.agentName || classroomAgentLabel(event.agentRole) || (event.type === "student_question" ? "学生" : "课堂");
+  return `
+    <article class="${escapeHtml(event.type || "")}">
+      <strong>${escapeHtml(label)}</strong>
+      <p>${escapeHtml(event.text || "")}</p>
+      <small>${fmtTime(event.createdAt)}</small>
+    </article>
+  `;
+}
+
+function renderLessonExportModal() {
+  const item = state.lessonExport;
+  return `
+    <div class="modal-backdrop">
+      <section class="modal">
+        <button class="modal-close" id="closeLessonExportModal">×</button>
+        <h2>课堂导出</h2>
+        <p class="hint">${escapeHtml(item.fileName)} · ${item.characters || item.content?.length || 0} 字符</p>
+        <pre class="export-preview">${escapeHtml(item.content || "")}</pre>
+        <div class="actions">
+          <button class="primary" id="downloadLessonExport">下载文件</button>
+          <button class="ghost" id="closeLessonExportBottom">关闭</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindClassroomPage() {
+  document.getElementById("focusLessonGenerate")?.addEventListener("click", () => {
+    document.getElementById("lessonGeneratePanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  document.getElementById("lessonSourceType")?.addEventListener("change", (event) => {
+    state.classroomDraft.sourceType = event.currentTarget.value;
+  });
+  document.getElementById("lessonGraphSelect")?.addEventListener("change", (event) => {
+    state.classroomDraft.graphId = event.currentTarget.value;
+    state.classroomDraft.nodeId = "";
+    renderContent();
+  });
+  document.getElementById("lessonGenerateForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const classIds = form.getAll("classIds").map(String);
+    state.classroomDraft = {
+      sourceType: form.get("sourceType"),
+      subject: form.get("subject"),
+      topic: form.get("topic"),
+      materialId: form.get("materialId"),
+      graphId: form.get("graphId"),
+      nodeId: form.get("nodeId"),
+      classIds,
+      duration: Number(form.get("duration") || 20)
+    };
+    try {
+      const payload = await api("/api/lessons/generate", {
+        method: "POST",
+        body: {
+          teacherId: state.user.id,
+          ...state.classroomDraft,
+          status: form.get("status"),
+          classIds
+        }
+      });
+      state.activeLessonId = payload.lesson.id;
+      await loadState();
+      renderShell();
+      showToast("互动课堂脚本已生成");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-select-lesson]").forEach((card) => {
+    card.addEventListener("click", () => {
+      state.activeLessonId = card.dataset.selectLesson;
+      state.activeClassroomSessionId = null;
+      renderContent();
+    });
+  });
+  document.getElementById("lessonEditorForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const lessonId = form.get("lessonId");
+      const agents = JSON.parse(String(form.get("agents") || "[]"));
+      const scenes = JSON.parse(String(form.get("scenes") || "[]"));
+      const payload = await api(`/api/lessons/${lessonId}`, {
+        method: "PUT",
+        body: {
+          title: form.get("title"),
+          subject: form.get("subject"),
+          status: form.get("status"),
+          classIds: form.getAll("classIds").map(String),
+          objectives: String(form.get("objectives") || "").split(/\n+/).map((item) => item.trim()).filter(Boolean),
+          agents,
+          scenes
+        }
+      });
+      state.activeLessonId = payload.lesson.id;
+      await loadState();
+      renderShell();
+      showToast("课堂脚本已保存");
+    } catch (error) {
+      showToast(`脚本保存失败：${error.message}`, "error");
+    }
+  });
+  document.querySelectorAll("[data-start-classroom]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        const classId = document.getElementById("classroomStartClass")?.value || "";
+        const payload = await api(`/api/classrooms/${button.dataset.startClassroom}/start`, {
+          method: "POST",
+          body: { userId: state.user.id, classId }
+        });
+        state.activeLessonId = payload.session.lessonId;
+        state.activeClassroomSessionId = payload.session.id;
+        await loadState();
+        renderShell();
+        showToast("课堂已启动");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-next-classroom]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        const payload = await api(`/api/classrooms/${button.dataset.nextClassroom}/next`, { method: "POST", body: { userId: state.user.id } });
+        state.activeClassroomSessionId = payload.session.id;
+        await loadState();
+        renderShell();
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.getElementById("classroomAskForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const session = selectedClassroomSession(selectedLesson());
+    const question = String(form.get("question") || "").trim();
+    if (!session || !question) return;
+    try {
+      const payload = await api(`/api/classrooms/${session.id}/ask`, { method: "POST", body: { userId: state.user.id, question } });
+      state.activeClassroomSessionId = payload.session.id;
+      await loadState();
+      renderShell();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("classroomQuizForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const session = selectedClassroomSession(selectedLesson());
+    if (!session) return;
+    const answers = {};
+    for (const [key, value] of form.entries()) {
+      if (key !== "sceneId") answers[key] = value;
+    }
+    try {
+      const payload = await api(`/api/classrooms/${session.id}/quiz/submit`, {
+        method: "POST",
+        body: { studentId: state.user.id, sceneId: form.get("sceneId"), answers }
+      });
+      await loadState();
+      renderShell();
+      showToast(`课堂测验已提交，得分 ${payload.attempt.score}`);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.getElementById("whiteboardActionForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const session = selectedClassroomSession(selectedLesson());
+    if (!session) return showToast("请先启动课堂", "error");
+    try {
+      await api(`/api/classrooms/${session.id}/whiteboard/action`, { method: "POST", body: { userId: state.user.id, type: "note", text: form.get("text") } });
+      await loadState();
+      renderShell();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-export-lesson]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        const payload = await api(`/api/lessons/${button.dataset.exportLesson}/export`, { method: "POST", body: { userId: state.user.id, format: button.dataset.format } });
+        state.lessonExport = payload.export;
+        const type = payload.export.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
+        downloadText(payload.export.fileName, payload.export.content, type);
+        await loadState();
+        renderContent();
+        showToast("课堂已导出");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.getElementById("closeLessonExportModal")?.addEventListener("click", () => {
+    state.lessonExport = null;
+    renderContent();
+  });
+  document.getElementById("closeLessonExportBottom")?.addEventListener("click", () => {
+    state.lessonExport = null;
+    renderContent();
+  });
+  document.getElementById("downloadLessonExport")?.addEventListener("click", () => {
+    if (!state.lessonExport) return;
+    const type = state.lessonExport.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
+    downloadText(state.lessonExport.fileName, state.lessonExport.content, type);
   });
 }
 
@@ -1503,6 +2152,7 @@ function renderGraphDetailPanel(graph, mode = "teacher") {
       <div class="detail-actions">
         <button class="mini" type="button" data-graph-node-action="explain">讲解</button>
         <button class="mini" type="button" data-graph-node-action="exercise">出题</button>
+        ${isTeacherLike() ? `<button class="mini" type="button" data-graph-node-action="classroom">生成互动微课</button>` : ""}
         <button class="mini" type="button" data-graph-node-action="path">学习路径</button>
         <button class="mini" type="button" data-graph-node-action="compare">对比</button>
       </div>
@@ -3207,6 +3857,24 @@ function bindGraphPage() {
 
   document.querySelectorAll("[data-graph-node-action]").forEach((button) => {
     button.addEventListener("click", () => {
+      if (button.dataset.graphNodeAction === "classroom") {
+        const graph = graphListForCurrentRole().find((item) => item.id === state.selectedGraphId) || graphListForCurrentRole()[0];
+        const node = graph ? graphSelectedNode(graph) : null;
+        state.classroomDraft = {
+          ...state.classroomDraft,
+          sourceType: "graph_node",
+          subject: graph?.subject || state.classroomDraft.subject || "",
+          topic: node?.label || graph?.title || "",
+          graphId: graph?.id || "",
+          nodeId: node?.id || "",
+          materialId: "",
+          duration: 15
+        };
+        state.page = "classroom";
+        renderShell();
+        showToast("已带入图谱节点，可生成互动微课");
+        return;
+      }
       const actionText = {
         explain: "已定位知识点，可在教学指导中生成分层讲解。",
         exercise: "已定位知识点，可基于当前子图生成练习题。",
@@ -3675,7 +4343,10 @@ function renderMaterialsPage() {
                 <span>${escapeHtml(item.subject)} · ${item.chunkCount} 个片段 · ${item.characters} 字</span>
                 <small>${escapeHtml(item.sourceName || "课程资料")} · ${fmtTime(item.createdAt)}</small>
               </div>
-              ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
+              <div class="row-actions">
+                ${isTeacherLike() ? `<button class="mini" data-material-classroom="${item.id}">生成课堂</button>` : ""}
+                ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
+              </div>
             </article>
           `).join("") || emptyBlock("还没有课程资料。上传文件或粘贴内容后会在这里显示。")}
         </div>
@@ -3770,6 +4441,26 @@ function bindMaterialsPage() {
       } catch (error) {
         showToast(error.message, "error");
       }
+    });
+  });
+  document.querySelectorAll("[data-material-classroom]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const material = (state.data.courseMaterials || []).find((item) => item.id === button.dataset.materialClassroom);
+      if (!material) return;
+      state.classroomDraft = {
+        ...state.classroomDraft,
+        sourceType: "material",
+        subject: material.subject || "",
+        topic: material.title || "",
+        materialId: material.id,
+        graphId: "",
+        nodeId: "",
+        duration: 20
+      };
+      state.page = "classroom";
+      renderShell();
+      showToast("已带入课程资料，可生成互动课堂");
     });
   });
   document.querySelectorAll("[data-view-material]").forEach((card) => {

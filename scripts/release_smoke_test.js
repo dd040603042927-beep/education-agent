@@ -78,12 +78,13 @@ async function main() {
     const homepage = await requestText("/");
     assert(homepage.response.ok, "homepage should load");
     assert(homepage.response.headers.get("cache-control")?.includes("no-store"), "homepage should disable stale static cache");
-    assert(homepage.text.includes("/app.js?v=release-home-20260605"), "homepage should reference the current app bundle");
-    assert(homepage.text.includes("/styles.css?v=release-home-20260605"), "homepage should reference the current styles");
-    const appBundle = await requestText("/app.js?v=release-home-20260605");
+    assert(homepage.text.includes("/app.js?v=interactive-classroom-20260605"), "homepage should reference the current app bundle");
+    assert(homepage.text.includes("/styles.css?v=interactive-classroom-20260605"), "homepage should reference the current styles");
+    const appBundle = await requestText("/app.js?v=interactive-classroom-20260605");
     assert(appBundle.response.ok, "app bundle should load with version query");
     assert(appBundle.response.headers.get("cache-control")?.includes("no-store"), "app bundle should disable stale static cache");
     assert(appBundle.text.includes("renderTeacherHomePage") && appBundle.text.includes("renderStudentHomePage"), "app bundle should contain role dashboards");
+    assert(appBundle.text.includes("renderTeacherClassroomPage") && appBundle.text.includes("renderStudentClassroomPage"), "app bundle should contain interactive classroom pages");
     assert(appBundle.text.includes("renderChatActionCards"), "app bundle should contain the unified chat action cards");
     assert(appBundle.text.includes("创建并发送邀请"), "app bundle should contain approval-based group creation UI");
     assert(!appBundle.text.includes("chat-action-head"), "app bundle should not contain the old chat action header");
@@ -315,6 +316,67 @@ async function main() {
       body: { studentId: "20260002" }
     });
     assert(classApply.response.ok && classApply.payload.application?.status === "approved", "student should join the class before submitting homework");
+
+    const generatedLesson = await request("/api/lessons/generate", {
+      method: "POST",
+      cookie,
+      body: {
+        teacherId: "20260001",
+        sourceType: "topic",
+        subject: "物理",
+        topic: "牛顿第二定律互动课堂",
+        classIds: [createdClass.payload.class.id],
+        status: "published",
+        duration: 15
+      }
+    });
+    assert(generatedLesson.response.status === 201 && generatedLesson.payload.lesson?.id, "teacher should generate an interactive classroom lesson");
+    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "quiz"), "generated lesson should include a classroom quiz scene");
+
+    const studentLessonState = await request("/api/state", { cookie: studentCookie });
+    assert(studentLessonState.payload.state.lessons.some((lesson) => lesson.id === generatedLesson.payload.lesson.id), "published classroom lesson should be visible to class student");
+
+    const classroomStart = await request(`/api/classrooms/${generatedLesson.payload.lesson.id}/start`, {
+      method: "POST",
+      cookie,
+      body: { userId: "20260001", classId: createdClass.payload.class.id }
+    });
+    assert(classroomStart.response.status === 201 && classroomStart.payload.session?.id, "teacher should start classroom session");
+    assert(classroomStart.payload.session.participantIds.includes("20260002"), "classroom session should include class student");
+    const sessionId = classroomStart.payload.session.id;
+
+    for (let i = 0; i < 3; i += 1) {
+      const nextScene = await request(`/api/classrooms/${sessionId}/next`, {
+        method: "POST",
+        cookie,
+        body: { userId: "20260001" }
+      });
+      assert(nextScene.response.ok, "teacher should advance classroom scenes");
+    }
+
+    const classroomAsk = await request(`/api/classrooms/${sessionId}/ask`, {
+      method: "POST",
+      cookie: studentCookie,
+      body: { userId: "20260002", question: "这节课最容易错在哪里？" }
+    });
+    assert(classroomAsk.response.ok && classroomAsk.payload.session.events.some((event) => event.type === "student_question"), "student should ask during classroom");
+
+    const quizScene = generatedLesson.payload.lesson.scenes.find((scene) => scene.type === "quiz");
+    const quizAnswers = Object.fromEntries((quizScene.quiz.questions || []).map((question) => [question.id, question.answer]));
+    const quizSubmit = await request(`/api/classrooms/${sessionId}/quiz/submit`, {
+      method: "POST",
+      cookie: studentCookie,
+      body: { studentId: "20260002", sceneId: quizScene.id, answers: quizAnswers }
+    });
+    assert(quizSubmit.response.status === 201 && quizSubmit.payload.attempt?.score >= 80, "classroom quiz should score and create an attempt");
+    assert(quizSubmit.payload.learningAnalytics.summary.count > 0, "classroom quiz should update learning mastery evidence");
+
+    const lessonExport = await request(`/api/lessons/${generatedLesson.payload.lesson.id}/export`, {
+      method: "POST",
+      cookie,
+      body: { userId: "20260001", format: "markdown" }
+    });
+    assert(lessonExport.response.ok && lessonExport.payload.export?.content.includes("牛顿第二定律互动课堂"), "teacher should export lesson markdown");
 
     const submitted = await request(`/api/homework/${homeworkId}/submit`, {
       method: "POST",
