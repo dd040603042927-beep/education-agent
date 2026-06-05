@@ -5,7 +5,7 @@ const DEFAULT_GRAPH_EXTRACTOR = "ai-unlimited-pdf-graph-agent";
 const state = {
   user: null,
   data: null,
-  page: "graph",
+  page: "home",
   selectedGraphId: null,
   graphSubject: "物理",
   activeConversationId: null,
@@ -101,23 +101,25 @@ const GRAPH_RELATION_FILTERS = [
 ];
 
 const teacherMenus = [
-  { key: "graph", icon: "📘", label: "导入书本生成图谱" },
-  { key: "ai", icon: "🎓", label: "教学指导（对话）" },
-  { key: "materials", icon: "📚", label: "课程资料" },
-  { key: "models", icon: "🧠", label: "模型显示" },
-  { key: "chat", icon: "☁️", label: "聊天信息" },
-  { key: "classes", icon: "🏫", label: "班级管理" },
-  { key: "homework", icon: "✏️", label: "作业管理" },
-  { key: "profile", icon: "ℹ️", label: "个人信息" }
+  { key: "home", icon: "⌂", label: "教学工作台", section: "总览" },
+  { key: "ai", icon: "◉", label: "教学指导", section: "教学" },
+  { key: "homework", icon: "✓", label: "作业管理", section: "教学" },
+  { key: "graph", icon: "▦", label: "知识图谱", section: "资源" },
+  { key: "materials", icon: "▤", label: "课程资料", section: "资源" },
+  { key: "models", icon: "◇", label: "模型实验室", section: "资源" },
+  { key: "classes", icon: "▥", label: "班级管理", section: "管理" },
+  { key: "chat", icon: "◌", label: "聊天信息", section: "沟通" },
+  { key: "profile", icon: "i", label: "个人信息", section: "账户" }
 ];
 
 const studentMenus = [
-  { key: "graph", icon: "📗", label: "知识图谱" },
-  { key: "ai", icon: "☁️", label: "发起对话" },
-  { key: "models", icon: "🧠", label: "模型显示" },
-  { key: "chat", icon: "☁️", label: "聊天信息" },
-  { key: "homework", icon: "📥", label: "作业提交" },
-  { key: "profile", icon: "ℹ️", label: "个人信息" }
+  { key: "home", icon: "⌂", label: "学习首页", section: "总览" },
+  { key: "ai", icon: "◉", label: "发起对话", section: "学习" },
+  { key: "graph", icon: "▦", label: "知识图谱", section: "学习" },
+  { key: "homework", icon: "✓", label: "作业提交", section: "学习" },
+  { key: "models", icon: "◇", label: "模型实验室", section: "资源" },
+  { key: "chat", icon: "◌", label: "聊天信息", section: "沟通" },
+  { key: "profile", icon: "i", label: "个人信息", section: "账户" }
 ];
 
 const MODEL_LABS = {
@@ -679,6 +681,30 @@ function renderConversationContextMenu() {
   `;
 }
 
+function renderNavSections(menus) {
+  const sections = [];
+  menus.forEach((item) => {
+    const section = item.section || "功能";
+    let group = sections.find((entry) => entry.name === section);
+    if (!group) {
+      group = { name: section, items: [] };
+      sections.push(group);
+    }
+    group.items.push(item);
+  });
+  return sections.map((group) => `
+    <div class="nav-section">
+      <div class="nav-section-title">${escapeHtml(group.name)}</div>
+      ${group.items.map((item) => `
+        <button class="nav-item ${state.page === item.key ? "active" : ""}" data-page="${item.key}">
+          <span>${item.icon}</span>${item.label}
+        </button>
+        ${item.key === "ai" ? renderSidebarConversations() : ""}
+      `).join("")}
+    </div>
+  `).join("");
+}
+
 function renderAuth() {
   app.innerHTML = `
     <main class="auth-shell">
@@ -700,10 +726,10 @@ function renderAuth() {
         </div>
         <form id="loginForm" class="auth-form">
           <label>账号 ID 或姓名<input name="account" autocomplete="username" placeholder="建议使用 8 位 ID，重名用户必须用 ID" required /></label>
-          <label>密码<input name="password" type="password" autocomplete="current-password" placeholder="示例账号密码：123456" required /></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" placeholder="请输入账号密码" required /></label>
           <button class="primary wide" type="submit">进入平台</button>
           <p class="hint">2 天内刷新页面会自动保持登录。用户名允许重复，系统分配的 8 位 ID 永远唯一。</p>
-          <p class="hint">内置教师：20260001 / 123456；内置学生：20260002 / 123456。</p>
+          <p class="hint">忘记密码或需要开通学校账号时，请联系平台管理员重置。</p>
         </form>
         <form id="registerForm" class="auth-form hidden">
           <label>姓名<input name="name" autocomplete="name" maxlength="30" placeholder="姓名可重复，登录以 8 位 ID 为准" required /></label>
@@ -759,7 +785,7 @@ function renderAuth() {
       state.data = payload.state;
       resetSessionSelectionState();
       localStorage.setItem("edu-user", JSON.stringify(state.user));
-      state.page = "graph";
+      state.page = "home";
       renderShell();
       showToast("登录成功");
     } catch (error) {
@@ -797,7 +823,7 @@ function renderAuth() {
       state.data = payload.state;
       resetSessionSelectionState();
       localStorage.setItem("edu-user", JSON.stringify(state.user));
-      state.page = "graph";
+      state.page = "home";
       renderShell();
       showToast(`注册成功，ID：${payload.user.id}`);
     } catch (error) {
@@ -817,21 +843,16 @@ function renderShell() {
     <div class="layout">
       <aside class="sidebar">
         <div class="side-brand">
-          <strong>${teacherSide ? "📖 教学中枢" : "📚 学习索引"}</strong>
+          <strong>${teacherSide ? "教学中枢" : "学习索引"}</strong>
           <span>${escapeHtml(state.user.name)}（${roleName(state.user.role)}）</span>
           <small>ID：${state.user.id}</small>
         </div>
         <div class="section-label">${teacherSide ? "教师端" : "学生端"}</div>
         <nav class="nav">
-          ${menus.map((item) => `
-            <button class="nav-item ${state.page === item.key ? "active" : ""}" data-page="${item.key}">
-              <span>${item.icon}</span>${item.label}
-            </button>
-            ${item.key === "ai" ? renderSidebarConversations() : ""}
-          `).join("")}
+          ${renderNavSections(menus)}
         </nav>
         <div class="profile-mini">
-          <strong>${teacherSide ? "🏫 我的信息" : "👤 我的信息"}</strong>
+          <strong>我的信息</strong>
           <dl>
             <dt>姓名：</dt><dd>${escapeHtml(state.user.name)}</dd>
             <dt>${teacherSide ? "学科：" : "班级："}</dt><dd>${escapeHtml(teacherSide ? (state.user.subject || "未设置") : (state.user.className || "未加入"))}</dd>
@@ -850,7 +871,7 @@ function renderShell() {
       </main>
       <div class="floating-tools">
         <button title="刷新数据" id="refreshBtn">↻</button>
-        <button title="回到知识图谱" data-page="graph">✦</button>
+        <button title="回到工作台" data-page="home">⌂</button>
       </div>
       ${renderConversationContextMenu()}
     </div>
@@ -907,7 +928,7 @@ function renderShell() {
       Object.assign(state, {
         user: null,
         data: null,
-        page: "graph",
+        page: "home",
         activeConversationId: null,
         activeThreadId: null
       });
@@ -932,6 +953,7 @@ function renderContent() {
   main?.classList.toggle("model-main", state.page === "models");
   main?.classList.toggle("ml-model-main", state.page === "models" && state.modelSubject === "机器学习");
   const contentClasses = ["content"];
+  if (state.page === "home") contentClasses.push("home-content");
   if (state.page === "ai") contentClasses.push("ai-content");
   if (state.page === "models") contentClasses.push("model-content");
   if (state.page === "models" && state.modelSubject === "机器学习") contentClasses.push("ml-model-content");
@@ -940,6 +962,7 @@ function renderContent() {
   if (state.page === "homework") contentClasses.push("homework-content");
   content.className = contentClasses.join(" ");
   const pageMap = {
+    home: renderHomePage,
     graph: renderGraphPage,
     ai: renderAiPage,
     materials: renderMaterialsPage,
@@ -956,6 +979,7 @@ function renderContent() {
 
 function bindCurrentPage() {
   const binders = {
+    home: bindHomePage,
     graph: bindGraphPage,
     ai: bindAiPage,
     materials: bindMaterialsPage,
@@ -966,6 +990,215 @@ function bindCurrentPage() {
     profile: bindProfilePage
   };
   (binders[state.page] || bindGraphPage)();
+}
+
+function renderDashboardStat(label, value, hint = "") {
+  return `
+    <article class="dashboard-stat">
+      <strong>${escapeHtml(value)}</strong>
+      <span>${escapeHtml(label)}</span>
+      ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
+    </article>
+  `;
+}
+
+function renderDashboardAction(page, title, description, primary = false) {
+  return `
+    <button class="dashboard-action ${primary ? "primary-action" : ""}" data-dashboard-page="${page}">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(description)}</span>
+    </button>
+  `;
+}
+
+function renderDashboardEmpty(message, page, label) {
+  return `
+    <div class="dashboard-empty">
+      <p>${escapeHtml(message)}</p>
+      <button class="mini primary" data-dashboard-page="${page}">${escapeHtml(label)}</button>
+    </div>
+  `;
+}
+
+function teacherDashboardData() {
+  const classes = state.data.classes || [];
+  const homework = state.data.homework || [];
+  const submissions = state.data.submissions || [];
+  const materials = state.data.courseMaterials || [];
+  const graphs = state.data.knowledgeGraphs || [];
+  const conversations = state.data.conversations || [];
+  const studentIds = new Set(classes.flatMap((klass) => klass.studentIds || []));
+  const pendingReview = submissions.filter((item) => item.status !== "graded").length;
+  const reviewPending = submissions.filter((item) => item.status === "review_pending").length;
+  const submitted = submissions.length;
+  const expected = homework.reduce((sum, item) => {
+    const klass = classes.find((classItem) => classItem.id === item.classId);
+    return sum + (klass?.studentIds?.length || 0);
+  }, 0);
+  const unsubmitted = Math.max(0, expected - submitted);
+  const recentApplications = classes.flatMap((klass) => (klass.applications || []).map((app) => ({ ...app, className: klass.name })))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const recentQuestions = conversations
+    .flatMap((conv) => (conv.messages || []).filter((msg) => msg.role === "user").map((msg) => ({ ...msg, title: conv.title, mode: conv.mode })))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return { classes, homework, submissions, materials, graphs, conversations, studentIds, pendingReview, reviewPending, unsubmitted, recentApplications, recentQuestions };
+}
+
+function renderTeacherHomePage() {
+  const data = teacherDashboardData();
+  const recentMaterials = data.materials.slice(0, 4);
+  const recentHomework = data.homework.slice(0, 4);
+  return `
+    <section class="dashboard-hero">
+      <div>
+        <h2>教学工作台</h2>
+        <p>从资料、图谱、作业和班级数据进入当天最需要处理的教学任务。</p>
+      </div>
+      <button class="primary" data-dashboard-page="materials">上传课程资料</button>
+    </section>
+    <section class="dashboard-stats">
+      ${renderDashboardStat("待确认批改", data.pendingReview, data.reviewPending ? `${data.reviewPending} 份已有 AI 建议` : "等待学生提交或教师确认")}
+      ${renderDashboardStat("未提交作业", data.unsubmitted, "按当前班级作业估算")}
+      ${renderDashboardStat("班级学生", data.studentIds.size, `${data.classes.length} 个班级`)}
+      ${renderDashboardStat("课程资料", data.materials.length, `${data.graphs.length} 个知识图谱`)}
+    </section>
+    <div class="dashboard-grid">
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>今日待办</h3>
+          <button class="mini" data-dashboard-page="homework">查看作业</button>
+        </div>
+        <div class="dashboard-list">
+          ${data.pendingReview ? `<article><strong>${data.pendingReview} 份提交需要处理</strong><span>进入作业管理，可生成 AI 建议或确认最终成绩。</span></article>` : ""}
+          ${data.unsubmitted ? `<article><strong>${data.unsubmitted} 人次尚未提交</strong><span>可在作业详情中查看提交情况并提醒学生。</span></article>` : ""}
+          ${data.recentApplications[0] ? data.recentApplications.slice(0, 3).map((item) => `<article><strong>${escapeHtml(item.studentName)} 加入 ${escapeHtml(item.className)}</strong><span>${escapeHtml(item.reason || item.status)} · ${fmtTime(item.createdAt)}</span></article>`).join("") : ""}
+          ${!data.pendingReview && !data.unsubmitted && !data.recentApplications.length ? renderDashboardEmpty("暂无待办。可以先上传资料、生成图谱或发布第一份作业。", "materials", "上传资料") : ""}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>快捷操作</h3>
+        </div>
+        <div class="dashboard-actions">
+          ${renderDashboardAction("materials", "上传资料", "PDF、Word、PPTX 入库并可问答", true)}
+          ${renderDashboardAction("graph", "生成图谱", "从教材目录和知识点构建课程图谱")}
+          ${renderDashboardAction("homework", "发布作业", "布置文字、图片或视频作业")}
+          ${renderDashboardAction("classes", "班级管理", "创建班级、导入学生、查看申请")}
+          ${renderDashboardAction("ai", "教学设计", "用课程资料生成教案和练习")}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>课程资产</h3>
+          <button class="mini" data-dashboard-page="materials">管理资料</button>
+        </div>
+        <div class="dashboard-list">
+          ${recentMaterials.map((item) => `<article><strong>${escapeHtml(item.title || item.name || "课程资料")}</strong><span>${escapeHtml(item.subject || "通用")} · ${fmtTime(item.createdAt || item.updatedAt)}</span></article>`).join("") || renderDashboardEmpty("还没有课程资料。先上传一份课件或教材，系统才能做资料问答和图谱生成。", "materials", "上传第一份资料")}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>最近作业</h3>
+          <button class="mini" data-dashboard-page="homework">进入作业</button>
+        </div>
+        <div class="dashboard-list">
+          ${recentHomework.map((item) => `<article><strong>${escapeHtml(item.title)}</strong><span>${fmtTime(item.createdAt)} · ${escapeHtml(compactText(item.description || "无文字说明", 42))}</span></article>`).join("") || renderDashboardEmpty("还没有发布作业。发布作业后，学生提交、AI 建议和教师确认会形成闭环。", "homework", "发布第一份作业")}
+        </div>
+      </section>
+      <section class="panel dashboard-card wide-card">
+        <div class="split-head">
+          <h3>最近高频问题</h3>
+          <button class="mini" data-dashboard-page="ai">打开对话</button>
+        </div>
+        <div class="dashboard-list compact">
+          ${data.recentQuestions.slice(0, 5).map((item) => `<article><strong>${escapeHtml(compactText(item.content || "", 70))}</strong><span>${escapeHtml(aiModeLabel(item.mode || "qa"))} · ${fmtTime(item.createdAt)}</span></article>`).join("") || renderDashboardEmpty("还没有教学对话记录。可以从教学指导开始一次课程资料问答或教学设计。", "ai", "发起教学对话")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderStudentHomePage() {
+  const homework = state.data.homework || [];
+  const submissions = state.data.submissions || [];
+  const graphs = state.data.knowledgeGraphs || [];
+  const conversations = state.data.conversations || [];
+  const wrongNotes = state.data.wrongNotes || [];
+  const analytics = state.data.learningAnalytics || {};
+  const submittedIds = new Set(submissions.filter((item) => item.studentId === state.user.id).map((item) => item.homeworkId));
+  const pendingHomework = homework.filter((item) => !submittedIds.has(item.id));
+  const latestConversation = conversations[0];
+  const weak = analytics.summary?.weak || [];
+  return `
+    <section class="dashboard-hero">
+      <div>
+        <h2>学习首页</h2>
+        <p>聚合待完成作业、推荐复习、知识图谱和最近对话，帮助你继续上次学习。</p>
+      </div>
+      <button class="primary" data-dashboard-page="ai">问 AI</button>
+    </section>
+    <section class="dashboard-stats">
+      ${renderDashboardStat("待完成作业", pendingHomework.length, submissions.length ? `${submissions.length} 份已提交` : "尚未提交")}
+      ${renderDashboardStat("推荐复习", weak.length, weak[0] ? `优先：${weak[0].topic}` : "暂无薄弱诊断")}
+      ${renderDashboardStat("错题记录", wrongNotes.length, wrongNotes[0] ? wrongNotes[0].topic : "完成练习后生成")}
+      ${renderDashboardStat("可学习图谱", graphs.length, "由教师开放或自己生成")}
+    </section>
+    <div class="dashboard-grid">
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>今日学习</h3>
+          <button class="mini" data-dashboard-page="homework">作业提交</button>
+        </div>
+        <div class="dashboard-list">
+          ${pendingHomework.slice(0, 4).map((item) => `<article><strong>${escapeHtml(item.title)}</strong><span>${fmtTime(item.createdAt)} · 双击作业卡片查看并提交</span></article>`).join("") || renderDashboardEmpty("当前没有待完成作业。可以进入对话或知识图谱继续复习。", "ai", "开始提问")}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>快捷操作</h3>
+        </div>
+        <div class="dashboard-actions">
+          ${renderDashboardAction("ai", "问 AI", "基于课程资料提问、讲解或练习", true)}
+          ${renderDashboardAction("homework", "提交作业", "查看老师发布的作业")}
+          ${renderDashboardAction("graph", "查看图谱", "按学科查看知识网络")}
+          ${renderDashboardAction("models", "模型实验室", "运行机器学习或学科模型")}
+          ${renderDashboardAction("chat", "联系老师", "私聊、群聊和申请处理")}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>推荐复习</h3>
+          <button class="mini" data-dashboard-page="graph">查看图谱</button>
+        </div>
+        <div class="dashboard-list">
+          ${weak.slice(0, 4).map((item) => `<article><strong>${escapeHtml(item.topic)}</strong><span>掌握度 ${percentText(item.score)} · ${escapeHtml(item.status || "需要复习")}</span></article>`).join("") || renderDashboardEmpty("暂无明确薄弱点。完成一次问答、练习或作业后会生成学习画像。", "ai", "做一次诊断")}
+        </div>
+      </section>
+      <section class="panel dashboard-card">
+        <div class="split-head">
+          <h3>继续学习</h3>
+          <button class="mini" data-dashboard-page="ai">打开对话</button>
+        </div>
+        <div class="dashboard-list">
+          ${latestConversation ? `<article><strong>${escapeHtml(latestConversation.title || "最近对话")}</strong><span>${escapeHtml(aiModeLabel(latestConversation.mode || "qa"))} · ${fmtTime(latestConversation.updatedAt)}</span></article>` : renderDashboardEmpty("还没有学习对话。可以先问一个概念、一道题或一个复习计划。", "ai", "发起第一次对话")}
+          ${wrongNotes.slice(0, 3).map((note) => `<article><strong>${escapeHtml(note.topic || "错题")}</strong><span>${escapeHtml(compactText(note.analysis || note.question || "", 56))}</span></article>`).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderHomePage() {
+  return isTeacherLike() ? renderTeacherHomePage() : renderStudentHomePage();
+}
+
+function bindHomePage() {
+  document.querySelectorAll("[data-dashboard-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.page = button.dataset.dashboardPage;
+      renderShell();
+    });
+  });
 }
 
 function graphListForCurrentRole() {
@@ -3731,13 +3964,6 @@ function renderAiPage() {
           <button type="button" data-ai-draft="plan">复习计划</button>
         </div>
         <form id="aiForm" class="composer rich-composer ai-composer">
-          <div class="ai-input-tools">
-            <button type="button" data-ai-tool="image">上传图片题目</button>
-            <button type="button" data-ai-tool="pdf">上传 PDF</button>
-            <button type="button" data-ai-tool="knowledge">选择知识点</button>
-            <button type="button" data-ai-tool="wrong">选择错题</button>
-            <button type="button" data-ai-tool="voice">语音输入</button>
-          </div>
           <input name="prompt" placeholder="${escapeHtml(aiPromptPlaceholder(isTeacher))}" />
           <button class="primary" type="submit">发送</button>
         </form>
@@ -3848,21 +4074,6 @@ function bindAiPage() {
       const nextInput = document.querySelector("#aiForm input[name='prompt']");
       if (nextInput) nextInput.value = shouldFill ? draft.prompt : preservedPrompt;
       nextInput?.focus();
-    });
-  });
-  document.querySelectorAll("[data-ai-tool]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const tool = button.dataset.aiTool;
-      if (tool === "knowledge") {
-        const latest = latestAssistantMessage(activeAiConversation());
-        const point = latest?.knowledgePoints?.[0] || latest?.learningPanel?.relatedKnowledgePoints?.[0]?.label || "";
-        if (point) {
-          state.aiKnowledgePoint = point;
-          renderContent();
-          return;
-        }
-      }
-      showToast("该入口已预留。当前可先在课程资料页上传 PDF/Word/PPTX，或在输入框粘贴题目文字。");
     });
   });
   document.querySelectorAll("[data-ai-action]").forEach((button) => {
