@@ -281,8 +281,26 @@ async function main() {
     });
     assert(chat.response.ok && chat.payload.messages?.[1]?.learningPanel, "AI chat should return learning panel");
 
-    const homeworkId = state.payload.state.homework?.[0]?.id;
-    assert(homeworkId, "seed homework should exist");
+    const createdClass = await request("/api/classes", {
+      method: "POST",
+      cookie,
+      body: { teacherId: "20260001", name: "烟测班级", subject: "物理" }
+    });
+    assert(createdClass.response.status === 201 && createdClass.payload.class?.id, "teacher should create a class before assigning homework");
+
+    const createdHomework = await request("/api/homework", {
+      method: "POST",
+      cookie,
+      body: {
+        teacherId: "20260001",
+        classId: createdClass.payload.class.id,
+        title: "牛顿第二定律应用题",
+        description: "请解释 F=ma 在水平面匀加速运动中的含义，并完成一道自拟例题。",
+        answer: "力等于质量与加速度的乘积。解题时先受力分析，再列出 F=ma，结合运动学公式求解。"
+      }
+    });
+    assert(createdHomework.response.status === 201 && createdHomework.payload.homework?.id, "teacher should create homework from an explicit operation");
+    const homeworkId = createdHomework.payload.homework.id;
 
     const studentLogin = await request("/api/auth/login", {
       method: "POST",
@@ -290,6 +308,13 @@ async function main() {
     });
     assert(studentLogin.response.ok && studentLogin.payload.ok, "student login should succeed");
     const studentCookie = String(studentLogin.response.headers.get("set-cookie") || "").split(";")[0];
+
+    const classApply = await request(`/api/classes/${createdClass.payload.class.id}/apply`, {
+      method: "POST",
+      cookie: studentCookie,
+      body: { studentId: "20260002" }
+    });
+    assert(classApply.response.ok && classApply.payload.application?.status === "approved", "student should join the class before submitting homework");
 
     const submitted = await request(`/api/homework/${homeworkId}/submit`, {
       method: "POST",

@@ -3607,16 +3607,19 @@ function renderLearningProfilePanel() {
   const weak = summary.weak || [];
   const strong = summary.strong || [];
   const wrongNotes = state.data.wrongNotes || [];
-  const avg = Number(summary.average || 0);
+  const hasMastery = summary.average !== null && summary.average !== undefined && Number(summary.count || 0) > 0;
+  const avg = hasMastery ? Number(summary.average) : 0;
   return `
     <section class="ai-side-card profile-card">
       <h3>学习画像</h3>
       <div class="ai-side-card-body">
-        <div class="profile-meter"><span style="width:${clamp(avg * 100, 8, 100)}%"></span></div>
-        <p>${escapeHtml(profile.level || "基础")} · 提问 ${profile.questionCount || 0} 次 · 练习 ${profile.practiceCount || 0} 次 · 学习 ${profile.studyMinutes || 0} 分钟</p>
-        <div class="node-chip-row">
-          ${(weak.length ? weak : [{ topic: "暂无明显薄弱点", status: "继续观察" }]).slice(0, 4).map((item) => `<span class="node-chip">${escapeHtml(item.topic)} ${item.score !== undefined ? percentText(item.score) : ""}</span>`).join("")}
-        </div>
+        <div class="profile-meter"><span style="width:${hasMastery ? clamp(avg * 100, 0, 100) : 0}%"></span></div>
+        <p>${escapeHtml(profile.level || "待诊断")} · 提问 ${profile.questionCount || 0} 次 · 练习 ${profile.practiceCount || 0} 次 · 学习 ${profile.studyMinutes || 0} 分钟${hasMastery ? ` · 平均掌握度 ${percentText(avg)}` : ""}</p>
+        ${weak.length ? `
+          <div class="node-chip-row">
+            ${weak.slice(0, 4).map((item) => `<span class="node-chip">${escapeHtml(item.topic)} ${item.score !== undefined ? percentText(item.score) : ""}</span>`).join("")}
+          </div>
+        ` : `<p class="hint">暂无真实薄弱点记录。完成问答、练习或作业批改后会显示学习画像。</p>`}
         ${strong.length ? `<p class="hint">优势：${escapeHtml(strong.map((item) => item.topic).join("、"))}</p>` : ""}
       </div>
     </section>
@@ -3626,9 +3629,9 @@ function renderLearningProfilePanel() {
         ${wrongNotes.slice(0, 8).map((note) => `
           <article class="mini-note">
             <strong>${escapeHtml(note.topic)}</strong>
-            <p>${escapeHtml(note.analysis || note.recommendation || "建议复习相关前置知识。")}</p>
+            <p>${escapeHtml(note.analysis || note.recommendation || note.question || "用户手动加入，暂无补充说明。")}</p>
           </article>
-        `).join("") || `<p class="hint">暂无错题记录。AI 批改或低置信问答会自动形成错题线索。</p>`}
+        `).join("") || `<p class="hint">暂无错题记录。用户手动加入或完成作业批改后会在这里显示。</p>`}
       </div>
     </section>
   `;

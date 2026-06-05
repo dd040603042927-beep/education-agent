@@ -267,29 +267,11 @@ function sampleGraph(ownerId, subject, title, global = false) {
 }
 
 function createInitialDb() {
-  const adminId = "20260000";
   const teacherId = "20260001";
   const studentId = "20260002";
-  const classId = "class_seed";
-  const physicsGraph = sampleGraph(teacherId, "物理", "物理学科知识图谱", true);
-  const mathGraph = sampleGraph(teacherId, "数学", "高一数学选择性必修一知识图谱", true);
-  const conversationId = uid("conv");
-  const chatThreadId = uid("thread");
-  const homeworkId = uid("homework");
 
   return {
     users: [
-      {
-        id: adminId,
-        name: "平台管理员",
-        role: "admin",
-        passwordHash: hashPassword("123456"),
-        subject: "",
-        className: "",
-        classIds: [],
-        avatar: "管",
-        createdAt: now()
-      },
       {
         id: teacherId,
         name: "黄豆",
@@ -307,80 +289,30 @@ function createInitialDb() {
         role: "student",
         passwordHash: hashPassword("123456"),
         subject: "",
-        className: "豆1班",
-        classIds: [classId],
+        className: "",
+        classIds: [],
         avatar: "绿",
         createdAt: now()
       }
     ],
-    knowledgeGraphs: [physicsGraph, mathGraph],
-    conversations: [
-      {
-        id: conversationId,
-        userId: studentId,
-        role: "student",
-        title: "物理学习方向",
-        mode: "study-plan",
-        messages: [
-          { id: uid("msg"), role: "assistant", content: "你好！我是你的 AI 导师，请提出你的学习问题。", createdAt: now() }
-        ],
-        createdAt: now(),
-        updatedAt: now()
-      }
-    ],
+    knowledgeGraphs: [],
+    conversations: [],
     models: [],
-    friendships: [
-      { userId: teacherId, friendId: studentId, createdAt: now() },
-      { userId: studentId, friendId: teacherId, createdAt: now() }
-    ],
-    chatThreads: [
-      {
-        id: chatThreadId,
-        type: "direct",
-        name: "黄豆 / 绿豆",
-        memberIds: [teacherId, studentId],
-        messages: [
-          { id: uid("chat"), fromUserId: teacherId, content: "作业有问题可以在这里问我。", createdAt: now(), deletedFor: [] }
-        ],
-        createdAt: now(),
-        updatedAt: now()
-      }
-    ],
-    classes: [
-      {
-        id: classId,
-        teacherId,
-        name: "豆1班",
-        subject: "物理",
-        inviteCode: "PHYS2601",
-        studentIds: [studentId],
-        importedRoster: [{ id: studentId, name: "绿豆", source: "seed", createdAt: now() }],
-        applications: [],
-        createdAt: now(),
-        updatedAt: now()
-      }
-    ],
-    homework: [
-      {
-        id: homeworkId,
-        teacherId,
-        classId,
-        title: "牛顿第二定律应用题",
-        description: "请解释 F=ma 在水平面匀加速运动中的含义，并完成一道自拟例题。",
-        answer: "力等于质量与加速度的乘积。解题时先受力分析，再列出 F=ma，结合运动学公式求解。",
-        attachments: [],
-        createdAt: now(),
-        updatedAt: now()
-      }
-    ],
+    friendships: [],
+    chatThreads: [],
+    classes: [],
+    homework: [],
     submissions: [],
-    courseMaterials: seedCourseMaterials(teacherId),
+    courseMaterials: [],
     learningProfiles: [
       createLearningProfile(studentId, "student"),
       createLearningProfile(teacherId, "teacher")
     ],
     wrongNotes: [],
-    agentRuns: []
+    agentRuns: [],
+    auditLogs: [],
+    friendRequests: [],
+    chatInvites: []
   };
 }
 
@@ -402,8 +334,8 @@ function createLearningProfile(userId, role = "student") {
   return {
     userId,
     role,
-    level: role === "teacher" ? "教师" : "基础",
-    goals: role === "teacher" ? ["提升课堂讲解质量", "掌握班级薄弱点"] : ["稳定掌握课程核心概念", "减少重复错题"],
+    level: role === "teacher" ? "教师" : "待诊断",
+    goals: [],
     questionCount: 0,
     practiceCount: 0,
     gradedCount: 0,
@@ -563,22 +495,24 @@ function ensureDbShape(db) {
       changed = true;
     }
   };
-  ["courseMaterials", "learningProfiles", "wrongNotes", "agentRuns", "submissions", "auditLogs", "friendships", "chatThreads", "friendRequests", "chatInvites"].forEach(ensureArray);
+  [
+    "knowledgeGraphs",
+    "conversations",
+    "models",
+    "classes",
+    "homework",
+    "courseMaterials",
+    "learningProfiles",
+    "wrongNotes",
+    "agentRuns",
+    "submissions",
+    "auditLogs",
+    "friendships",
+    "chatThreads",
+    "friendRequests",
+    "chatInvites"
+  ].forEach(ensureArray);
   db.users = Array.isArray(db.users) ? db.users : [];
-  if (!db.users.some((user) => user.role === "admin")) {
-    db.users.unshift({
-      id: "20260000",
-      name: "平台管理员",
-      role: "admin",
-      passwordHash: hashPassword("123456"),
-      subject: "",
-      className: "",
-      classIds: [],
-      avatar: "管",
-      createdAt: now()
-    });
-    changed = true;
-  }
   (db.users || []).forEach((user) => {
     if (!user.passwordHash && user.password !== undefined) {
       migratePasswordIfNeeded(user, user.password);
@@ -593,11 +527,6 @@ function ensureDbShape(db) {
     ensureLearningProfile(db, user.id);
     if (db.learningProfiles.length !== before) changed = true;
   });
-  if (!db.courseMaterials.length && db.users?.length) {
-    const teacher = db.users.find((user) => user.role === "teacher") || db.users[0];
-    db.courseMaterials.push(...seedCourseMaterials(teacher.id));
-    changed = true;
-  }
   db.courseMaterials.forEach((material) => {
     if (!Array.isArray(material.chunks) || !material.chunks.length) {
       material.chunks = chunkCourseMaterialText(material.text || "", material);
@@ -3827,7 +3756,8 @@ function profileMasterySummary(profile) {
   return {
     weak: entries.filter((item) => item.score < 0.58).slice(0, 6),
     strong: entries.filter((item) => item.score >= 0.75).slice(-6).reverse(),
-    average: entries.length ? Number((entries.reduce((sum, item) => sum + item.score, 0) / entries.length).toFixed(2)) : 0.55
+    count: entries.length,
+    average: entries.length ? Number((entries.reduce((sum, item) => sum + item.score, 0) / entries.length).toFixed(2)) : null
   };
 }
 
@@ -4359,13 +4289,13 @@ function buildEducationalAgentAnswer(db, user, body) {
     confidence: agent.confidence,
     minutes: mode === "plan" ? 6 : 3
   });
-  if ((agent.confidence === "low" || mode === "grade") && topics[0]) {
+  if (mode === "grade" && topics[0]) {
     addWrongNote(db, user.id, {
-      source: mode === "grade" ? "批改反馈" : "不确定问答",
+      source: "批改反馈",
       topic: topics[0],
       question: prompt,
-      analysis: mode === "grade" ? "本轮触发批改/错因诊断，建议记录错误类型并生成同类题。" : "课程资料中缺少明确依据，建议补充资料或回看前置概念。",
-      recommendation: mode === "grade" ? "按修改建议重写答案，再完成 1 道同类题。" : "上传对应章节资料后重新提问。"
+      analysis: "本轮触发批改/错因诊断，建议记录错误类型并生成同类题。",
+      recommendation: "按修改建议重写答案，再完成 1 道同类题。"
     });
   }
   const learningPanel = buildLearningPanel({
@@ -4406,15 +4336,18 @@ function learningAnalytics(db, userId) {
   const profile = ensureLearningProfile(db, userId);
   const summary = profileMasterySummary(profile);
   const wrongNotes = (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 10);
+  const recommendations = [];
+  if (summary.weak[0]) {
+    recommendations.push(`优先复习「${summary.weak[0].topic}」，这条建议来自你的掌握度记录。`);
+  }
+  if (wrongNotes[0]) {
+    recommendations.push(`最近错题记录包含「${wrongNotes[0].topic}」，建议先回看对应答案和解析。`);
+  }
   return {
     profile,
     summary,
     wrongNotes,
-    recommendations: [
-      summary.weak[0] ? `优先复习「${summary.weak[0].topic}」，先看定义和前置知识。` : "继续保持稳定练习，系统会根据提问和作业自动识别薄弱点。",
-      wrongNotes[0] ? `最近错题集中在「${wrongNotes[0].topic}」，建议生成 3 道同类题。` : "完成一次阶段测验后可得到更准确的错题分布。",
-      "每次回答都优先查看引用来源，区分资料依据和模型推理。"
-    ]
+    recommendations
   };
 }
 
@@ -5175,8 +5108,8 @@ async function handleApi(req, res, pathname, searchParams) {
       topic: String(body.topic || "待归类").slice(0, 60),
       question: String(body.question || "").slice(0, 500),
       answer: String(body.answer || "").slice(0, 1000),
-      analysis: String(body.analysis || "用户从智能体回答中加入错题本。").slice(0, 500),
-      recommendation: String(body.recommendation || "建议生成同类题，并复盘前置知识。").slice(0, 500)
+      analysis: String(body.analysis || "").slice(0, 500),
+      recommendation: String(body.recommendation || "").slice(0, 500)
     });
     recordAudit(db, actor, "wrong_note.create", { resourceType: "wrongNote", resourceId: note.id, meta: { topic: note.topic } }, req);
     writeDb(db);
