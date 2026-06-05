@@ -18,7 +18,10 @@ PORT=5107
 DATA_DIR=./data
 LOG_DIR=./logs
 COOKIE_SECURE=false
+SESSION_IDLE_TIMEOUT_MS=172800000
 ```
+
+登录态最长 2 天无活动过期；即使旧配置里 `SESSION_TTL_MS` 大于 2 天，服务也会按 2 天上限处理。
 
 启动：
 

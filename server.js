@@ -59,7 +59,10 @@ const PDF_AGENT_TIMEOUT_MS = Math.max(4 * 60 * 1000, Number(process.env.PDF_AGEN
 const SESSION_COOKIE = process.env.SESSION_COOKIE_NAME || "edu_session";
 const SESSION_SECRET_CONFIGURED = Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== "replace-with-a-long-random-secret");
 const SESSION_SECRET = SESSION_SECRET_CONFIGURED ? process.env.SESSION_SECRET : crypto.createHash("sha256").update(`${ROOT}:education-agent-dev-secret`).digest("hex");
-const SESSION_TTL_MS = Math.max(30 * 60 * 1000, Number(process.env.SESSION_TTL_MS || 7 * 24 * 60 * 60 * 1000));
+const SESSION_MAX_IDLE_TIMEOUT_MS = 2 * 24 * 60 * 60 * 1000;
+const REQUESTED_SESSION_IDLE_TIMEOUT_MS = Number(process.env.SESSION_IDLE_TIMEOUT_MS || process.env.SESSION_TTL_MS || SESSION_MAX_IDLE_TIMEOUT_MS);
+const SESSION_IDLE_TIMEOUT_MS = Math.max(30 * 60 * 1000, Math.min(SESSION_MAX_IDLE_TIMEOUT_MS, REQUESTED_SESSION_IDLE_TIMEOUT_MS));
+const SESSION_TTL_MS = SESSION_IDLE_TIMEOUT_MS;
 const LOGIN_MAX_FAILURES = Math.max(3, Number(process.env.LOGIN_MAX_FAILURES || 5));
 const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_MS || 10 * 60 * 1000));
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
@@ -151,6 +154,7 @@ function createSessionToken(user) {
     role: user.role,
     iat: Date.now(),
     exp: Date.now() + SESSION_TTL_MS,
+    idleTtlMs: SESSION_TTL_MS,
     jti: crypto.randomBytes(12).toString("hex")
   });
 }
@@ -766,7 +770,12 @@ function requireRole(actor, roles) {
 }
 
 function send(res, status, payload, headers = {}) {
-  res.writeHead(status, { ...SECURITY_HEADERS, ...JSON_HEADERS, ...headers });
+  const responseHeaders = { ...SECURITY_HEADERS, ...JSON_HEADERS, ...headers };
+  const hasSetCookie = Object.keys(responseHeaders).some((key) => key.toLowerCase() === "set-cookie");
+  if (!hasSetCookie && res.sessionActor) {
+    responseHeaders["set-cookie"] = sessionCookie(res.sessionActor);
+  }
+  res.writeHead(status, responseHeaders);
   res.end(JSON.stringify(payload));
 }
 
@@ -4405,10 +4414,12 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "GET" && pathname === "/api/session") {
     const actor = getSessionUser(req, db);
     if (!actor) return sendError(res, 401, "未登录");
+    res.sessionActor = actor;
     return send(res, 200, { ok: true, user: publicUser(actor), state: getRelevantState(db, actor.id) });
   }
 
   const actor = requireActor(req, db);
+  res.sessionActor = actor;
 
   if (method === "GET" && pathname === "/api/state") {
     return send(res, 200, { ok: true, state: getRelevantState(db, actor.id) });

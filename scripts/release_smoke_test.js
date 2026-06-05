@@ -74,10 +74,14 @@ async function main() {
     });
     assert(login.response.ok && login.payload.ok, "teacher login should succeed");
     const cookie = String(login.response.headers.get("set-cookie") || "").split(";")[0];
+    const loginSetCookie = String(login.response.headers.get("set-cookie") || "");
     assert(cookie.includes("edu_session="), "login should set session cookie");
+    assert(loginSetCookie.includes("Max-Age=172800"), "login cookie should use 2-day idle max age");
 
     const state = await request("/api/state", { cookie });
     assert(state.response.ok && state.payload.state?.user?.id === "20260001", "session state should resolve current user");
+    const refreshedCookie = String(state.response.headers.get("set-cookie") || "");
+    assert(refreshedCookie.includes("edu_session=") && refreshedCookie.includes("Max-Age=172800"), "authenticated state should refresh 2-day session cookie");
 
     const tampered = await request("/api/ai/chat", {
       method: "POST",
