@@ -494,6 +494,31 @@ function showToast(message, type = "ok") {
   setTimeout(() => toast.classList.add("hidden"), 2600);
 }
 
+function authRoleExtraCopy(role) {
+  return role === "student"
+    ? {
+      label: "初始班级或邀请码（选填）",
+      placeholder: "可留空，之后在班级管理中申请加入"
+    }
+    : {
+      label: "任教学科（选填）",
+      placeholder: "例如：数学、物理、机器学习"
+    };
+}
+
+function setAuthSubmitting(form, submitting, busyText) {
+  const button = form?.querySelector('button[type="submit"]');
+  if (!button) return;
+  if (submitting) {
+    button.dataset.idleText = button.textContent;
+    button.textContent = busyText;
+    button.disabled = true;
+  } else {
+    button.textContent = button.dataset.idleText || button.textContent;
+    button.disabled = false;
+  }
+}
+
 async function api(path, options = {}) {
   const init = {
     method: options.method || "GET",
@@ -671,23 +696,26 @@ function renderAuth() {
           <button class="tab" data-auth-tab="register">注册</button>
         </div>
         <form id="loginForm" class="auth-form">
-          <label>账号 ID 或姓名<input name="account" placeholder="建议使用 8 位 ID，重名用户必须用 ID" required /></label>
-          <label>密码<input name="password" type="password" placeholder="示例账号密码：123456" required /></label>
+          <label>账号 ID 或姓名<input name="account" autocomplete="username" placeholder="建议使用 8 位 ID，重名用户必须用 ID" required /></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" placeholder="示例账号密码：123456" required /></label>
           <button class="primary wide" type="submit">进入平台</button>
-          <p class="hint">用户名允许重复，系统分配的 8 位 ID 永远唯一。内置教师：20260001；内置学生：20260002。</p>
+          <p class="hint">2 天内刷新页面会自动保持登录。用户名允许重复，系统分配的 8 位 ID 永远唯一。</p>
+          <p class="hint">内置教师：20260001 / 123456；内置学生：20260002 / 123456。</p>
         </form>
         <form id="registerForm" class="auth-form hidden">
-          <label>姓名<input name="name" placeholder="姓名可重复，登录以 8 位 ID 为准" required /></label>
-          <label>密码<input name="password" type="password" placeholder="设置登录密码" required /></label>
+          <label>姓名<input name="name" autocomplete="name" maxlength="30" placeholder="姓名可重复，登录以 8 位 ID 为准" required /></label>
+          <label>密码<input name="password" type="password" autocomplete="new-password" minlength="6" maxlength="128" placeholder="至少 6 位" required /></label>
+          <label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="6" maxlength="128" placeholder="再次输入密码" required /></label>
           <label>身份
             <select name="role">
               <option value="teacher">教师</option>
               <option value="student">学生</option>
             </select>
           </label>
-          <label>任教学科 / 初始班级<input name="subject" placeholder="教师填学科，学生可填班级" /></label>
-          <button class="primary wide" type="submit">注册并分配 8 位 ID</button>
-          <p id="registerResult" class="hint"></p>
+          <label id="registerExtraLabel">任教学科（选填）<input name="extra" placeholder="例如：数学、物理、机器学习" /></label>
+          <button class="primary wide" type="submit">注册并进入平台</button>
+          <p id="registerResult" class="auth-result hidden"></p>
+          <p class="hint">注册后系统会自动分配 8 位 ID 并直接登录，请记住侧边栏显示的 ID。</p>
         </form>
       </section>
     </main>
@@ -702,9 +730,23 @@ function renderAuth() {
     });
   });
 
+  const roleSelect = document.querySelector('#registerForm select[name="role"]');
+  const extraLabel = document.getElementById("registerExtraLabel");
+  const updateRegisterExtraField = () => {
+    const copy = authRoleExtraCopy(roleSelect?.value || "teacher");
+    if (!extraLabel) return;
+    const input = extraLabel.querySelector("input");
+    extraLabel.firstChild.textContent = copy.label;
+    if (input) input.placeholder = copy.placeholder;
+  };
+  roleSelect?.addEventListener("change", updateRegisterExtraField);
+  updateRegisterExtraField();
+
   document.getElementById("loginForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
+    setAuthSubmitting(formEl, true, "登录中...");
     try {
       const payload = await api("/api/auth/login", {
         method: "POST",
@@ -719,29 +761,46 @@ function renderAuth() {
       showToast("登录成功");
     } catch (error) {
       showToast(error.message, "error");
+    } finally {
+      if (formEl.isConnected) setAuthSubmitting(formEl, false);
     }
   });
 
   document.getElementById("registerForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
     const role = form.get("role");
+    const password = String(form.get("password") || "");
+    const confirmPassword = String(form.get("confirmPassword") || "");
+    const extra = String(form.get("extra") || "");
+    if (password !== confirmPassword) {
+      showToast("两次输入的密码不一致", "error");
+      return;
+    }
+    setAuthSubmitting(formEl, true, "注册中...");
     try {
       const payload = await api("/api/auth/register", {
         method: "POST",
         body: {
           name: form.get("name"),
-          password: form.get("password"),
+          password,
           role,
-          subject: role === "teacher" ? form.get("subject") : "",
-          className: role === "student" ? form.get("subject") : ""
+          subject: role === "teacher" ? extra : "",
+          className: role === "student" ? extra : ""
         }
       });
-      document.getElementById("registerResult").textContent = `${payload.message}，请使用该 ID 登录。`;
-      event.currentTarget.reset();
-      showToast("注册成功");
+      state.user = payload.user;
+      state.data = payload.state;
+      resetSessionSelectionState();
+      localStorage.setItem("edu-user", JSON.stringify(state.user));
+      state.page = "graph";
+      renderShell();
+      showToast(`注册成功，ID：${payload.user.id}`);
     } catch (error) {
       showToast(error.message, "error");
+    } finally {
+      if (formEl.isConnected) setAuthSubmitting(formEl, false);
     }
   });
 }

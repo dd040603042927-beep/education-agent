@@ -68,18 +68,35 @@ async function main() {
     const anonymousState = await request("/api/state");
     assert(anonymousState.response.status === 401, "anonymous /api/state should be rejected");
 
+    const weakRegister = await request("/api/auth/register", {
+      method: "POST",
+      body: { name: "密码测试", password: "123", role: "teacher", subject: "数学" }
+    });
+    assert(weakRegister.response.status === 400, "weak registration password should be rejected");
+
     const duplicateRegister = await request("/api/auth/register", {
       method: "POST",
       body: { name: "黄豆", password: "123456", role: "teacher", subject: "机器学习" }
     });
     assert(duplicateRegister.response.status === 201 && duplicateRegister.payload.user?.id, "duplicate display name registration should succeed");
     const duplicateUserId = duplicateRegister.payload.user.id;
+    const registerSetCookie = String(duplicateRegister.response.headers.get("set-cookie") || "");
+    assert(registerSetCookie.includes("edu_session=") && registerSetCookie.includes("Max-Age=172800"), "registration should auto-login with 2-day session cookie");
+    assert(duplicateRegister.payload.state?.user?.id === duplicateUserId, "registration should return the new user's initial state");
+    assert(duplicateRegister.payload.state.knowledgeGraphs.length === 0, "registered teacher initial state should not inherit graphs");
+    assert(duplicateRegister.payload.state.courseMaterials.length === 0, "registered teacher initial state should not inherit materials");
 
     const duplicateNameLogin = await request("/api/auth/login", {
       method: "POST",
       body: { account: "黄豆", password: "123456" }
     });
     assert(duplicateNameLogin.response.status === 409, "duplicate display name login should require unique ID");
+
+    const idNameLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: `${duplicateUserId}-黄豆`, password: "123456" }
+    });
+    assert(idNameLogin.response.ok && idNameLogin.payload.ok, "ID-name account format should login by the unique ID");
 
     const newTeacherLogin = await request("/api/auth/login", {
       method: "POST",

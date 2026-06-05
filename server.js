@@ -642,6 +642,34 @@ function generateUserId(db) {
   throw new Error("无法生成唯一用户 ID");
 }
 
+function normalizeDisplayName(value) {
+  const name = String(value || "").replace(/\s+/g, " ").trim();
+  if (!name) throw Object.assign(new Error("用户名不能为空"), { status: 400 });
+  if (name.length > 30) throw Object.assign(new Error("用户名不能超过 30 个字符"), { status: 400 });
+  return name;
+}
+
+function normalizeOptionalProfileField(value, maxLength = 60) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function normalizePasswordInput(value) {
+  const password = String(value || "");
+  if (password.length < 6) throw Object.assign(new Error("密码至少 6 位"), { status: 400 });
+  if (password.length > 128) throw Object.assign(new Error("密码不能超过 128 位"), { status: 400 });
+  return password;
+}
+
+function normalizeAccountInput(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function extractLoginId(account) {
+  if (/^\d{8}$/.test(account)) return account;
+  const match = account.match(/\b\d{8}\b/);
+  return match ? match[0] : "";
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -4366,32 +4394,44 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "POST" && pathname === "/api/auth/register") {
     const body = await readBody(req);
     assertRequired(body, ["name", "password", "role"]);
-    if (!["teacher", "student"].includes(body.role)) throw Object.assign(new Error("身份必须是 teacher 或 student"), { status: 400 });
-    const name = String(body.name || "").trim();
-    if (!name) return sendError(res, 400, "用户名不能为空");
-    if (String(body.password).length < 6) return sendError(res, 400, "密码至少 6 位");
+    const role = String(body.role || "").trim();
+    if (!["teacher", "student"].includes(role)) throw Object.assign(new Error("身份必须是 teacher 或 student"), { status: 400 });
+    const name = normalizeDisplayName(body.name);
+    const password = normalizePasswordInput(body.password);
+    const subject = role === "teacher" ? normalizeOptionalProfileField(body.subject, 40) : "";
+    const className = role === "student" ? normalizeOptionalProfileField(body.className || body.subject, 60) : "";
     const user = {
       id: generateUserId(db),
       name,
-      role: body.role,
-      passwordHash: hashPassword(body.password),
-      subject: body.role === "teacher" ? String(body.subject || "") : "",
-      className: String(body.className || ""),
+      role,
+      passwordHash: hashPassword(password),
+      subject,
+      className,
       classIds: [],
       avatar: name.slice(0, 1) || "用",
-      createdAt: now()
+      createdAt: now(),
+      lastLoginAt: now(),
+      lastLoginIp: requestIp(req),
+      failedLoginCount: 0,
+      lockUntil: ""
     };
     db.users.push(user);
     recordAudit(db, user, "auth.register", { resourceType: "user", resourceId: user.id }, req);
+    recordAudit(db, user, "auth.login", { resourceType: "user", resourceId: user.id, meta: { reason: "register_auto_login" } }, req);
+    const state = getRelevantState(db, user.id);
     writeDb(db);
-    return send(res, 201, { ok: true, user: publicUser(user), message: `注册成功，系统分配 ID：${user.id}` });
+    return send(res, 201, { ok: true, user: publicUser(user), state, message: `注册成功，系统分配 ID：${user.id}` }, { "set-cookie": sessionCookie(user) });
   }
 
   if (method === "POST" && pathname === "/api/auth/login") {
     const body = await readBody(req);
     assertRequired(body, ["account", "password"]);
-    const account = String(body.account).trim();
-    let user = db.users.find((item) => item.id === account);
+    const account = normalizeAccountInput(body.account);
+    if (!account) return sendError(res, 400, "账号不能为空");
+    const password = String(body.password || "");
+    if (password.length > 128) return sendError(res, 400, "密码不能超过 128 位");
+    const loginId = extractLoginId(account);
+    let user = loginId ? db.users.find((item) => item.id === loginId) : null;
     if (!user) {
       const nameMatches = db.users.filter((item) => item.name === account);
       if (nameMatches.length > 1) {
@@ -4409,7 +4449,7 @@ async function handleApi(req, res, pathname, searchParams) {
     if (user.lockUntil && new Date(user.lockUntil).getTime() > Date.now()) {
       return sendError(res, 429, "登录失败次数过多，请稍后再试");
     }
-    if (!verifyPassword(user, body.password)) {
+    if (!verifyPassword(user, password)) {
       user.failedLoginCount = Number(user.failedLoginCount || 0) + 1;
       if (user.failedLoginCount >= LOGIN_MAX_FAILURES) {
         user.lockUntil = new Date(Date.now() + LOGIN_COOLDOWN_MS).toISOString();
@@ -4418,7 +4458,7 @@ async function handleApi(req, res, pathname, searchParams) {
       writeDb(db);
       return sendError(res, 401, "账号或密码错误");
     }
-    migratePasswordIfNeeded(user, body.password);
+    migratePasswordIfNeeded(user, password);
     user.failedLoginCount = 0;
     user.lockUntil = "";
     user.lastLoginAt = now();
