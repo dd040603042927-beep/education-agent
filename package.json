@@ -6,8 +6,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/app.js",
-    "test": "node scripts/release_smoke_test.js"
+    "check": "node --check server.js && node --check public/app.js && node --check scripts/release_smoke_test.js && node --check scripts/backup_data.js",
+    "test": "node scripts/release_smoke_test.js",
+    "backup": "node scripts/backup_data.js"
   },
   "engines": {
     "node": ">=20"

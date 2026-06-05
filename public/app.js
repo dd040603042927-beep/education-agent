@@ -4651,6 +4651,7 @@ function renderTeacherHomeworkPage() {
           <label>作业内容<textarea name="description" rows="4" placeholder="可填写文字说明"></textarea></label>
           <label>上传作业图片/视频<input name="attachments" type="file" multiple accept="image/*,video/*" /></label>
           <label>参考答案<textarea name="answer" rows="4" placeholder="用于 AI 批改匹配"></textarea></label>
+          <label>评分标准<textarea name="rubric" rows="4" placeholder="每行一个评分项，例如：核心概念 35分：说明关键定义和条件"></textarea></label>
           <button class="primary" type="submit">发布作业</button>
         </form>
       </section>
@@ -4672,16 +4673,18 @@ function renderTeacherHomeworkPage() {
 function renderTeacherHomeworkItem(item, submissions) {
   const itemSubmissions = submissions.filter((sub) => sub.homeworkId === item.id);
   const graded = itemSubmissions.filter((sub) => sub.status === "graded").length;
+  const reviewPending = itemSubmissions.filter((sub) => sub.status === "review_pending").length;
   return `
     <article class="list-card homework-teacher-card" data-teacher-homework="${item.id}">
       <div>
         <h3>${escapeHtml(item.title)}</h3>
         <p>${escapeHtml(compactText(item.description || "无文字说明", 82))}</p>
-        <small>${fmtTime(item.createdAt)} · 提交 ${itemSubmissions.length} 份 · 已批改 ${graded} 份</small>
+        <small>${fmtTime(item.createdAt)} · 提交 ${itemSubmissions.length} 份 · 已确认 ${graded} 份${reviewPending ? ` · 待确认 ${reviewPending} 份` : ""}</small>
         <div class="mini-submission-row">
           ${itemSubmissions.slice(0, 3).map((sub) => {
             const student = state.data.users.find((user) => user.id === sub.studentId);
-            return `<button class="mini" type="button" data-view-submission="${sub.id}">${escapeHtml(student?.name || sub.studentId)} ${sub.status === "graded" ? `${sub.score}分` : "待批改"}</button>`;
+            const label = sub.status === "graded" ? `${sub.score}分` : sub.status === "review_pending" ? `AI建议${sub.aiSuggestedScore ?? "-"}分` : "待批改";
+            return `<button class="mini" type="button" data-view-submission="${sub.id}">${escapeHtml(student?.name || sub.studentId)} ${escapeHtml(label)}</button>`;
           }).join("") || `<span class="hint">暂无提交</span>`}
         </div>
       </div>
@@ -4711,6 +4714,7 @@ function renderTeacherHomeworkDetailModal() {
             <label>作业内容<textarea name="description" rows="5">${escapeHtml(homework.description || "")}</textarea></label>
             <label>追加作业图片/视频<input name="attachments" type="file" multiple accept="image/*,video/*" /></label>
             <label>参考答案<textarea name="answer" rows="5">${escapeHtml(homework.answer || "")}</textarea></label>
+            <label>评分标准<textarea name="rubric" rows="5">${escapeHtml(homework.rubricText || (homework.rubric || []).map((item) => `${item.title} ${item.points}分：${item.expected}`).join("\n"))}</textarea></label>
             <button class="primary" type="submit">保存修改</button>
           </form>
           <div class="stack">
@@ -4727,14 +4731,19 @@ function renderTeacherHomeworkDetailModal() {
 
 function renderSubmissionCard(homework, submission) {
   const student = state.data.users.find((user) => user.id === submission.studentId);
+  const statusLabel = submission.status === "graded"
+    ? `已确认 ${submission.score} 分`
+    : submission.status === "review_pending"
+      ? `AI建议 ${submission.aiSuggestedScore ?? "-"} 分，待确认`
+      : "待批改";
   return `
     <article class="submission-card">
       <h3>${escapeHtml(homework.title)}</h3>
-      <p>${escapeHtml(student?.name || submission.studentId)} · ${submission.status === "graded" ? `已批改 ${submission.score} 分` : "待批改"}</p>
+      <p>${escapeHtml(student?.name || submission.studentId)} · ${escapeHtml(statusLabel)}</p>
       <small>${fmtTime(submission.updatedAt)}</small>
       <div class="actions">
-        <button class="mini" data-view-submission="${submission.id}">查看/手动批改</button>
-        <button class="mini primary" data-ai-grade="${submission.id}">AI 批改</button>
+        <button class="mini" data-view-submission="${submission.id}">查看/确认批改</button>
+        <button class="mini primary" data-ai-grade="${submission.id}">生成 AI 建议</button>
       </div>
     </article>
   `;
@@ -4745,22 +4754,34 @@ function renderSubmissionModal() {
   if (!submission) return "";
   const homework = state.data.homework.find((item) => item.id === submission.homeworkId);
   const student = state.data.users.find((user) => user.id === submission.studentId);
+  const rubricResults = submission.feedback?.rubricResults || [];
   return `
     <div class="modal-backdrop">
       <section class="modal large">
         <button class="modal-close" id="closeSubmissionModal">×</button>
-        <h2>手动批改 · ${escapeHtml(homework?.title || "")}</h2>
+        <h2>确认批改 · ${escapeHtml(homework?.title || "")}</h2>
         <div class="review-layout">
           <div>
             <h3>学生答案</h3>
             <p class="answer-box">${escapeHtml(submission.answerText || "未填写文字答案")}</p>
             ${renderAttachments(submission.attachments)}
+            ${submission.aiComment ? `
+              <div class="detail-card">
+                <strong>AI 批改建议</strong>
+                <p>${escapeHtml(submission.aiComment)}</p>
+                ${rubricResults.length ? `
+                  <div class="table-list">
+                    ${rubricResults.map((item) => `<div><span>${escapeHtml(item.title)}</span><span>${item.score}/${item.points} 分</span><span>${escapeHtml(item.comment)}</span></div>`).join("")}
+                  </div>
+                ` : ""}
+              </div>
+            ` : ""}
           </div>
           <form id="manualGradeForm" class="stack">
             <p>学生：${escapeHtml(student?.name || submission.studentId)}</p>
-            <label>分数<input name="score" type="number" min="0" max="100" value="${submission.score ?? ""}" /></label>
+            <label>最终分数<input name="score" type="number" min="0" max="100" value="${submission.score ?? submission.aiSuggestedScore ?? ""}" /></label>
             <label>评语<textarea name="comment" rows="5">${escapeHtml(submission.comment || "")}</textarea></label>
-            <button class="primary" type="submit">保存手动批改</button>
+            <button class="primary" type="submit">确认最终成绩</button>
           </form>
         </div>
       </section>
@@ -4787,6 +4808,7 @@ function bindTeacherHomeworkPage() {
           title: form.get("title"),
           description: form.get("description"),
           answer: form.get("answer"),
+          rubric: form.get("rubric"),
           attachments
         }
       });
@@ -4847,6 +4869,7 @@ function bindTeacherHomeworkPage() {
           title: form.get("title"),
           description: form.get("description"),
           answer: form.get("answer"),
+          rubric: form.get("rubric"),
           attachments
         }
       });
@@ -4864,7 +4887,7 @@ function bindTeacherHomeworkPage() {
         await api(`/api/submissions/${button.dataset.aiGrade}/ai-grade`, { method: "POST", body: { teacherId: state.user.id } });
         await loadState();
         renderShell();
-        showToast("AI 批改完成");
+        showToast("AI 批改建议已生成，需教师确认");
       } catch (error) {
         showToast(error.message, "error");
       }

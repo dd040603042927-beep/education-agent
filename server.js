@@ -29,11 +29,14 @@ const PORT = Number(process.env.PORT || 5107);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
-const DATA_DIR = path.join(ROOT, "data");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
-const LOG_DIR = path.join(ROOT, "logs");
+const RUNTIME_DIR = path.join(DATA_DIR, "runtime");
+const LOG_DIR = path.resolve(process.env.LOG_DIR || path.join(ROOT, "logs"));
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const AUDIT_LOG_PATH = path.join(LOG_DIR, "audit.log");
+const GRAPH_JOBS_PATH = path.join(RUNTIME_DIR, "graph_jobs.json");
+const UPLOAD_SESSIONS_PATH = path.join(RUNTIME_DIR, "upload_sessions.json");
 const MAX_BODY_SIZE = 30 * 1024 * 1024;
 const MAX_UPLOAD_SIZE = Number(process.env.MAX_UPLOAD_SIZE_BYTES || Number.MAX_SAFE_INTEGER);
 const MAX_UPLOAD_CHUNK_SIZE = 12 * 1024 * 1024;
@@ -41,6 +44,7 @@ const MAX_GRAPH_SOURCE_CHARS = 320000;
 const RAG_CHUNK_CHARS = 900;
 const RAG_CHUNK_OVERLAP = 160;
 const RAG_MAX_CONTEXT_CHUNKS = 5;
+const RAG_VECTOR_DIM = 64;
 const AI_UNLIMITED_EXTRACTOR = "ai-unlimited-pdf-graph-agent";
 const AI_AGENT_TIMEOUT_MS = Math.max(60 * 1000, Number(process.env.AI_PDF_AGENT_TIMEOUT_MS || 8 * 60 * 1000));
 const PDF_LIMITS = {
@@ -179,18 +183,43 @@ function parseCookies(req) {
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  if (!fs.existsSync(RUNTIME_DIR)) fs.mkdirSync(RUNTIME_DIR, { recursive: true });
   if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-function checkDataDirWritable() {
+function checkDirWritable(dirPath) {
   try {
     ensureDataDir();
-    const probePath = path.join(DATA_DIR, `.ready-${process.pid}-${Date.now()}.tmp`);
+    const probePath = path.join(dirPath, `.ready-${process.pid}-${Date.now()}.tmp`);
     fs.writeFileSync(probePath, "ok", "utf8");
     fs.unlinkSync(probePath);
     return true;
   } catch {
     return false;
+  }
+}
+
+function checkDataDirWritable() {
+  return checkDirWritable(DATA_DIR);
+}
+
+function checkRuntimeDirWritable() {
+  return checkDirWritable(RUNTIME_DIR);
+}
+
+function atomicWriteJson(filePath, data) {
+  ensureDataDir();
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf8");
+  fs.renameSync(tmpPath, filePath);
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
   }
 }
 
@@ -358,10 +387,7 @@ function readDb() {
 }
 
 function writeDb(db) {
-  ensureDataDir();
-  const tmpPath = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2), "utf8");
-  fs.renameSync(tmpPath, DB_PATH);
+  atomicWriteJson(DB_PATH, db);
 }
 
 function createLearningProfile(userId, role = "student") {
@@ -412,6 +438,36 @@ function tokenizeForSearch(text) {
   return Array.from(new Set(tokens)).slice(0, 80);
 }
 
+function tokenHash(token) {
+  const hash = crypto.createHash("sha1").update(String(token)).digest();
+  return hash.readUInt32BE(0);
+}
+
+function embeddingFromTokens(tokens) {
+  const vector = Array(RAG_VECTOR_DIM).fill(0);
+  tokens.forEach((token, index) => {
+    const hash = tokenHash(token);
+    const slot = hash % RAG_VECTOR_DIM;
+    const sign = hash & 1 ? 1 : -1;
+    const weight = Math.max(0.4, 1 - index / Math.max(12, tokens.length * 1.5));
+    vector[slot] += sign * weight;
+  });
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => Number((value / norm).toFixed(5)));
+}
+
+function embeddingForText(text) {
+  return embeddingFromTokens(tokenizeForSearch(text));
+}
+
+function cosineSimilarity(left = [], right = []) {
+  if (!left.length || !right.length) return 0;
+  const length = Math.min(left.length, right.length);
+  let sum = 0;
+  for (let index = 0; index < length; index += 1) sum += Number(left[index] || 0) * Number(right[index] || 0);
+  return Math.max(-1, Math.min(1, sum));
+}
+
 function sourceChapterForText(text, fallback = "课程资料") {
   const match = String(text || "").match(/第\s*[一二三四五六七八九十百\d]+\s*[章节]\s*[^。\n\r]{0,24}|[一二三四五六七八九十百\d]+[.、]\s*[^。\n\r]{2,24}/);
   return match ? match[0].replace(/\s+/g, " ").trim() : fallback;
@@ -436,7 +492,8 @@ function chunkCourseMaterialText(text, material) {
       page,
       chapter,
       text: content.slice(0, RAG_CHUNK_CHARS + RAG_CHUNK_OVERLAP),
-      keywords: tokenizeForSearch(`${material.subject} ${material.title} ${chapter} ${content}`).slice(0, 24)
+      keywords: tokenizeForSearch(`${material.subject} ${material.title} ${chapter} ${content}`).slice(0, 36),
+      embedding: embeddingForText(`${material.subject} ${material.title} ${chapter} ${content}`)
     });
     page += Math.max(1, Math.round(content.length / 1200));
     buffer = content.slice(Math.max(0, content.length - RAG_CHUNK_OVERLAP));
@@ -536,6 +593,23 @@ function ensureDbShape(db) {
   db.courseMaterials.forEach((material) => {
     if (!Array.isArray(material.chunks) || !material.chunks.length) {
       material.chunks = chunkCourseMaterialText(material.text || "", material);
+      changed = true;
+    }
+    (material.chunks || []).forEach((chunk) => {
+      if (!Array.isArray(chunk.embedding) || chunk.embedding.length !== RAG_VECTOR_DIM) {
+        chunk.embedding = embeddingForText(`${material.subject} ${material.title} ${chunk.chapter || ""} ${chunk.text || ""}`);
+        changed = true;
+      }
+      if (!Array.isArray(chunk.keywords) || chunk.keywords.length < 8) {
+        chunk.keywords = tokenizeForSearch(`${material.subject} ${material.title} ${chunk.chapter || ""} ${chunk.text || ""}`).slice(0, 36);
+        changed = true;
+      }
+    });
+  });
+  (db.homework || []).forEach((homework) => {
+    if (!Array.isArray(homework.rubric) || !homework.rubric.length) {
+      homework.rubric = parseRubricInput(homework.rubricText || "", homework);
+      homework.rubricText = rubricToText(homework.rubric);
       changed = true;
     }
   });
@@ -756,6 +830,58 @@ function hasConfiguredUploadLimit() {
   return Number.isFinite(MAX_UPLOAD_SIZE) && MAX_UPLOAD_SIZE < Number.MAX_SAFE_INTEGER;
 }
 
+function persistGraphJobs() {
+  const jobs = Array.from(graphJobs.values()).map((job) => {
+    const { abort, ...safe } = job;
+    return safe;
+  });
+  atomicWriteJson(GRAPH_JOBS_PATH, { version: 1, jobs });
+}
+
+function persistUploadSessions() {
+  atomicWriteJson(UPLOAD_SESSIONS_PATH, { version: 1, sessions: Array.from(uploadSessions.values()) });
+}
+
+function loadRuntimeState() {
+  ensureDataDir();
+  graphJobs.clear();
+  uploadSessions.clear();
+
+  const graphState = readJsonFile(GRAPH_JOBS_PATH, { jobs: [] });
+  (Array.isArray(graphState.jobs) ? graphState.jobs : []).forEach((item) => {
+    if (!item?.id) return;
+    const interrupted = ["queued", "running"].includes(item.status);
+    graphJobs.set(item.id, {
+      ...item,
+      status: interrupted ? "failed" : item.status,
+      stage: interrupted ? "已中断" : item.stage,
+      message: interrupted ? "服务曾重启，原图谱生成任务已中断，请重新上传或重新生成。" : item.message,
+      error: interrupted ? "服务重启导致任务中断" : item.error,
+      cancelRequested: Boolean(item.cancelRequested),
+      abort: null,
+      updatedAt: interrupted ? now() : item.updatedAt
+    });
+  });
+  if (graphJobs.size) persistGraphJobs();
+
+  const uploadState = readJsonFile(UPLOAD_SESSIONS_PATH, { sessions: [] });
+  let uploadChanged = false;
+  (Array.isArray(uploadState.sessions) ? uploadState.sessions : []).forEach((item) => {
+    if (!item?.id || !item.filePath || !fs.existsSync(item.filePath)) {
+      uploadChanged = true;
+      return;
+    }
+    const actualSize = fs.statSync(item.filePath).size;
+    uploadSessions.set(item.id, {
+      ...item,
+      received: Math.min(Number(item.size || actualSize), actualSize),
+      chunks: Number(item.chunks || 0),
+      updatedAt: item.updatedAt || now()
+    });
+  });
+  if (uploadChanged || uploadSessions.size) persistUploadSessions();
+}
+
 function createGraphJob(meta = {}) {
   const job = {
     id: uid("graphjob"),
@@ -772,6 +898,7 @@ function createGraphJob(meta = {}) {
     updatedAt: now()
   };
   graphJobs.set(job.id, job);
+  persistGraphJobs();
   return job;
 }
 
@@ -780,6 +907,7 @@ function updateGraphJob(jobId, patch) {
   if (!job) return null;
   if (job.status === "canceled" && patch.status !== "canceled") return job;
   Object.assign(job, patch, { updatedAt: now() });
+  persistGraphJobs();
   return job;
 }
 
@@ -833,9 +961,14 @@ function publicGraphJob(job) {
 
 function cleanupGraphJobs() {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  let changed = false;
   for (const [id, job] of graphJobs.entries()) {
-    if (new Date(job.updatedAt).getTime() < cutoff) graphJobs.delete(id);
+    if (new Date(job.updatedAt).getTime() < cutoff) {
+      graphJobs.delete(id);
+      changed = true;
+    }
   }
+  if (changed) persistGraphJobs();
 }
 
 function sanitizeFileName(name) {
@@ -949,12 +1082,18 @@ function createUploadSession({ userId, fileName, fileType, size }) {
   };
   fs.writeFileSync(filePath, Buffer.alloc(0));
   uploadSessions.set(uploadId, session);
+  persistUploadSessions();
   return session;
 }
 
 function getUploadSession(uploadId) {
   const session = uploadSessions.get(uploadId);
   if (!session) throw Object.assign(new Error("上传会话不存在或已过期"), { status: 404 });
+  if (!fs.existsSync(session.filePath)) {
+    uploadSessions.delete(uploadId);
+    persistUploadSessions();
+    throw Object.assign(new Error("上传文件已丢失，请重新上传"), { status: 404 });
+  }
   return session;
 }
 
@@ -980,13 +1119,22 @@ function cleanupUploadSession(uploadId, removeFile = true) {
       fs.unlinkSync(session.filePath);
     } catch {}
   }
+  persistUploadSessions();
 }
 
 function cleanupUploadSessions() {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  let changed = false;
   for (const [id, session] of uploadSessions.entries()) {
-    if (new Date(session.updatedAt).getTime() < cutoff) cleanupUploadSession(id, true);
+    if (new Date(session.updatedAt).getTime() < cutoff || !fs.existsSync(session.filePath)) {
+      uploadSessions.delete(id);
+      try {
+        if (session.filePath) fs.unlinkSync(session.filePath);
+      } catch {}
+      changed = true;
+    }
   }
+  if (changed) persistUploadSessions();
 }
 
 function decodeDataUrl(dataUrl) {
@@ -3031,6 +3179,92 @@ function scoreMatch(answer, submission) {
   return score;
 }
 
+function normalizeRubricCriteria(criteria, fallbackText = "") {
+  const rows = (Array.isArray(criteria) ? criteria : []).map((item, index) => ({
+    id: item.id || `criterion_${index + 1}`,
+    title: String(item.title || item.name || `评分项 ${index + 1}`).trim().slice(0, 40),
+    points: Number(item.points ?? item.score ?? 0),
+    expected: String(item.expected || item.description || item.text || fallbackText || "").trim().slice(0, 500)
+  })).filter((item) => item.title || item.expected);
+  if (!rows.length) return [];
+  const explicitTotal = rows.reduce((sum, item) => sum + (Number.isFinite(item.points) && item.points > 0 ? item.points : 0), 0);
+  if (explicitTotal <= 0) {
+    const each = Math.floor(100 / rows.length);
+    rows.forEach((item, index) => {
+      item.points = index === rows.length - 1 ? 100 - each * (rows.length - 1) : each;
+    });
+    return rows;
+  }
+  rows.forEach((item) => {
+    item.points = Math.max(1, Math.round((Math.max(0, item.points) / explicitTotal) * 100));
+  });
+  const total = rows.reduce((sum, item) => sum + item.points, 0);
+  if (total !== 100 && rows.length) rows[rows.length - 1].points += 100 - total;
+  return rows;
+}
+
+function parseRubricInput(input, fallback = {}) {
+  if (Array.isArray(input)) return normalizeRubricCriteria(input, fallback.answer || fallback.description || fallback.title || "");
+  const text = String(input || "").trim();
+  if (text) {
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const parsed = lines.map((line, index) => {
+      const match = line.match(/^(?:\d+[.、]\s*)?(.*?)(?:[:：,，]\s*)?(\d{1,3})\s*分?\s*(?:[:：,，-]\s*)?(.*)$/);
+      if (match && (match[1] || match[3])) {
+        return {
+          id: `criterion_${index + 1}`,
+          title: (match[1] || `评分项 ${index + 1}`).trim(),
+          points: Number(match[2]),
+          expected: (match[3] || match[1] || line).trim()
+        };
+      }
+      return {
+        id: `criterion_${index + 1}`,
+        title: line.slice(0, 24),
+        points: 0,
+        expected: line
+      };
+    });
+    return normalizeRubricCriteria(parsed, text);
+  }
+  const answer = String(fallback.answer || "").trim();
+  const description = String(fallback.description || fallback.title || "").trim();
+  return normalizeRubricCriteria([
+    { title: "核心概念与事实", points: 35, expected: answer || description },
+    { title: "解题步骤与推理", points: 35, expected: [description, answer].filter(Boolean).join(" ") },
+    { title: "关键术语覆盖", points: 20, expected: answer || description },
+    { title: "表达完整与规范", points: 10, expected: "结构清晰，结论明确，必要时说明依据和单位。" }
+  ], answer || description);
+}
+
+function rubricToText(rubric = []) {
+  return (rubric || []).map((item) => `${item.title} ${item.points}分：${item.expected}`).join("\n");
+}
+
+function evaluateCriterion(criterion, submissionText) {
+  const expectedTokens = tokenizeForSearch(`${criterion.title} ${criterion.expected}`).slice(0, 30);
+  const answerTokens = new Set(tokenizeForSearch(submissionText));
+  const matched = expectedTokens.filter((token) => answerTokens.has(token));
+  const missing = expectedTokens.filter((token) => !answerTokens.has(token)).slice(0, 6);
+  const ratio = expectedTokens.length ? matched.length / expectedTokens.length : 0;
+  const hasAnswer = String(submissionText || "").trim().length > 0;
+  const factor = !hasAnswer ? 0 : ratio >= 0.75 ? 1 : ratio >= 0.45 ? 0.78 : ratio >= 0.2 ? 0.48 : ratio > 0 ? 0.28 : 0.12;
+  const score = Math.round(Number(criterion.points || 0) * factor);
+  return {
+    id: criterion.id,
+    title: criterion.title,
+    points: criterion.points,
+    score,
+    matched: matched.slice(0, 6),
+    missing,
+    comment: score >= criterion.points * 0.8
+      ? "覆盖较充分。"
+      : missing.length
+        ? `建议补充：${missing.join("、")}。`
+        : "需要补充更明确的解释或推理过程。"
+  };
+}
+
 function visibleCourseMaterials(db, userId) {
   const user = ensureUser(db, userId);
   const teacherIds = user.role === "student"
@@ -3067,6 +3301,9 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
   const subject = normalizeSubject(options.subject || "");
   const queryTokens = tokenizeForSearch(query);
   const queryTokenSet = new Set(queryTokens);
+  const queryVector = embeddingFromTokens(queryTokens);
+  const queryText = String(query || "");
+  const queryHead = queryText.replace(/\s+/g, "").slice(0, 16);
   const materials = visibleCourseMaterials(db, userId)
     .filter((material) => !subject || subject === "通用" || material.subject === subject || String(query).includes(material.subject));
   const materialHits = [];
@@ -3074,12 +3311,21 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
     (material.chunks || []).forEach((chunk) => {
       const chunkTokens = chunk.keywords?.length ? chunk.keywords : tokenizeForSearch(chunk.text);
       const overlap = chunkTokens.filter((token) => queryTokenSet.has(token));
-      const exactBoost = String(chunk.text || "").includes(String(query || "").slice(0, 12)) ? 4 : 0;
-      const score = overlap.length * 2 + exactBoost + (String(chunk.text || "").includes(subject) ? 1 : 0);
-      if (score <= 0 && materialHits.length > 0) return;
+      const vectorScore = cosineSimilarity(queryVector, chunk.embedding || embeddingForText(chunk.text || ""));
+      const exactBoost = queryHead && String(chunk.text || "").replace(/\s+/g, "").includes(queryHead) ? 5 : 0;
+      const subjectBoost = subject && subject !== "通用" && material.subject === subject ? 2 : 0;
+      const titleBoost = chunkTokens.some((token) => String(material.title || "").includes(token)) ? 1 : 0;
+      const chapterBoost = chunkTokens.some((token) => String(chunk.chapter || "").includes(token)) ? 1 : 0;
+      const score = Number((overlap.length * 2.2 + Math.max(0, vectorScore) * 12 + exactBoost + subjectBoost + titleBoost + chapterBoost).toFixed(3));
+      if (score <= 0.5 && materialHits.length > 0) return;
       materialHits.push({
         type: "material",
         score,
+        scoreDetail: {
+          lexical: overlap.length,
+          vector: Number(vectorScore.toFixed(3)),
+          exact: exactBoost > 0
+        },
         materialId: material.id,
         chunkId: chunk.id,
         title: material.title,
@@ -3101,11 +3347,18 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
         const nodeText = [node.label, node.details, ...(node.knowledgePoints || [])].join(" ");
         const tokens = tokenizeForSearch(nodeText);
         const overlap = tokens.filter((token) => queryTokenSet.has(token));
-        const score = overlap.length * 1.6 + (String(query).includes(node.label) ? 5 : 0);
-        if (score <= 0) return;
+        const vectorScore = cosineSimilarity(queryVector, embeddingFromTokens(tokens));
+        const exactBoost = String(query).includes(node.label) ? 5 : 0;
+        const score = Number((overlap.length * 1.8 + Math.max(0, vectorScore) * 8 + exactBoost).toFixed(3));
+        if (score <= 0.5) return;
         graphHits.push({
           type: "graph",
           score,
+          scoreDetail: {
+            lexical: overlap.length,
+            vector: Number(vectorScore.toFixed(3)),
+            exact: exactBoost > 0
+          },
           graphId: graph.id,
           nodeId: node.id,
           title: graph.title,
@@ -3120,9 +3373,17 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
       });
     });
 
-  return materialHits.concat(graphHits)
+  const ranked = materialHits.concat(graphHits)
     .sort((a, b) => b.score - a.score)
-    .slice(0, options.limit || RAG_MAX_CONTEXT_CHUNKS);
+    .reduce((items, hit) => {
+      const sameSourceCount = items.filter((item) => item.sourceName === hit.sourceName).length;
+      const sameChapterCount = items.filter((item) => item.sourceName === hit.sourceName && item.chapter === hit.chapter).length;
+      const adjustedScore = hit.score - sameSourceCount * 0.6 - sameChapterCount * 0.8;
+      items.push({ ...hit, score: Number(adjustedScore.toFixed(3)) });
+      return items.sort((a, b) => b.score - a.score);
+    }, []);
+
+  return ranked.slice(0, options.limit || RAG_MAX_CONTEXT_CHUNKS);
 }
 
 function citationsFromHits(hits) {
@@ -3937,20 +4198,24 @@ function learningAnalytics(db, userId) {
 }
 
 function gradeSubmissionWithFeedback(db, homework, submission) {
-  const score = scoreMatch(homework.answer, submission.answerText);
-  const referenceTokens = tokenizeForSearch(homework.answer);
+  const rubric = parseRubricInput(homework.rubric?.length ? homework.rubric : homework.rubricText, homework);
+  const rubricResults = rubric.map((criterion) => evaluateCriterion(criterion, submission.answerText));
+  const rubricScore = rubricResults.reduce((sum, item) => sum + item.score, 0);
+  const fallbackScore = scoreMatch(homework.answer, submission.answerText);
+  const score = rubricResults.length ? Math.max(0, Math.min(100, rubricScore)) : fallbackScore;
+  const referenceTokens = tokenizeForSearch(`${homework.answer} ${rubric.map((item) => item.expected).join(" ")}`);
   const answerTokens = new Set(tokenizeForSearch(submission.answerText));
   const missing = referenceTokens.filter((token) => !answerTokens.has(token)).slice(0, 8);
   const topics = inferQuestionTopics(`${homework.title} ${homework.description} ${homework.answer}`, "");
   const strengths = score >= 75 ? "答案覆盖了主要要点，结构基本完整。" : "答案已经给出部分相关内容，但关键条件或步骤还不完整。";
   const weakness = missing.length ? `缺少或表达不清：${missing.join("、")}。` : "主要关键词已覆盖，建议补充更完整的推理过程。";
   const comment = [
-    `AI 评分建议：${score} 分。`,
+    `AI 评分建议：${score} 分（需教师确认后才作为正式成绩）。`,
     strengths,
     weakness,
     "建议教师复核图片/视频附件中的关键步骤，最终分数以教师确认为准。"
   ].join(" ");
-  return { score, comment, missing, topics };
+  return { score, comment, missing, topics, rubric, rubricResults };
 }
 
 function findOrCreateDirectThread(db, userA, userB) {
@@ -4053,14 +4318,17 @@ async function handleApi(req, res, pathname, searchParams) {
   if (method === "GET" && pathname === "/api/readyz") {
     const checks = {
       dataDirWritable: checkDataDirWritable(),
+      runtimeDirWritable: checkRuntimeDirWritable(),
       sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
       cookieSecure: process.env.COOKIE_SECURE === "true",
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing"
+      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
+      uploadSessions: uploadSessions.size,
+      graphJobs: graphJobs.size
     };
     const warnings = [];
     if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
     if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
-    const ready = checks.dataDirWritable && (process.env.NODE_ENV !== "production" || (checks.sessionSecretConfigured && checks.cookieSecure));
+    const ready = checks.dataDirWritable && checks.runtimeDirWritable && (process.env.NODE_ENV !== "production" || (checks.sessionSecretConfigured && checks.cookieSecure));
     return send(res, ready ? 200 : 503, {
       ok: ready,
       status: ready ? "ready" : "not-ready",
@@ -4215,6 +4483,7 @@ async function handleApi(req, res, pathname, searchParams) {
     session.received += chunk.length;
     session.chunks = Math.max(session.chunks, index + 1);
     session.updatedAt = now();
+    persistUploadSessions();
     return send(res, 200, { ok: true, upload: publicUploadSession(session) });
   }
 
@@ -4860,6 +5129,16 @@ async function handleApi(req, res, pathname, searchParams) {
       title: String(body.title),
       description: String(body.description || ""),
       answer: String(body.answer || ""),
+      rubric: parseRubricInput(body.rubric, {
+        title: body.title,
+        description: body.description,
+        answer: body.answer
+      }),
+      rubricText: rubricToText(parseRubricInput(body.rubric, {
+        title: body.title,
+        description: body.description,
+        answer: body.answer
+      })),
       attachments: Array.isArray(body.attachments) ? body.attachments : [],
       createdAt: now(),
       updatedAt: now()
@@ -4884,6 +5163,10 @@ async function handleApi(req, res, pathname, searchParams) {
     if (body.title !== undefined) homework.title = String(body.title || homework.title);
     if (body.description !== undefined) homework.description = String(body.description || "");
     if (body.answer !== undefined) homework.answer = String(body.answer || "");
+    if (body.rubric !== undefined || body.answer !== undefined || body.description !== undefined || body.title !== undefined) {
+      homework.rubric = parseRubricInput(body.rubric !== undefined ? body.rubric : homework.rubricText, homework);
+      homework.rubricText = rubricToText(homework.rubric);
+    }
     if (Array.isArray(body.attachments) && body.attachments.length) homework.attachments = body.attachments;
     homework.updatedAt = now();
     recordAudit(db, actor, "homework.update", { resourceType: "homework", resourceId: homework.id }, req);
@@ -4927,6 +5210,9 @@ async function handleApi(req, res, pathname, searchParams) {
       submission = { id: uid("submission"), ...payload, createdAt: now() };
       db.submissions.unshift(submission);
     }
+    ["score", "comment", "feedback", "aiSuggestedScore", "aiComment", "aiGradedAt", "gradedAt", "confirmedAt", "confirmedBy", "gradeType"].forEach((key) => {
+      delete submission[key];
+    });
     recordAudit(db, actor, "homework.submit", { resourceType: "submission", resourceId: submission.id, meta: { homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, submission });
@@ -4941,41 +5227,21 @@ async function handleApi(req, res, pathname, searchParams) {
     const homework = db.homework.find((item) => item.id === submission.homeworkId);
     if (!homework || homework.teacherId !== body.teacherId) return sendError(res, 403, "无批改权限");
     const feedback = gradeSubmissionWithFeedback(db, homework, submission);
-    submission.score = feedback.score;
-    submission.status = "graded";
-    submission.gradeType = "ai";
-    submission.comment = feedback.comment;
+    submission.aiSuggestedScore = feedback.score;
+    submission.status = "review_pending";
+    submission.gradeType = "ai_suggestion";
+    submission.aiComment = feedback.comment;
     submission.feedback = {
       missing: feedback.missing,
       topics: feedback.topics,
+      rubric: feedback.rubric,
+      rubricResults: feedback.rubricResults,
       teacherReviewRequired: true,
       reliability: "AI 给出评分建议，最终结果建议由教师确认"
     };
-    submission.gradedAt = now();
+    submission.aiGradedAt = now();
     submission.updatedAt = now();
-    const delta = feedback.score >= 80 ? 0.08 : feedback.score >= 60 ? 0.02 : -0.08;
-    updateTopicMastery(db, submission.studentId, feedback.topics, delta, `作业批改：${homework.title} ${feedback.score} 分`);
-    const profile = ensureLearningProfile(db, submission.studentId);
-    profile.gradedCount = Number(profile.gradedCount || 0) + 1;
-    recordLearningActivity(db, submission.studentId, {
-      kind: "graded",
-      mode: "homework",
-      prompt: homework.title,
-      topics: feedback.topics,
-      score: feedback.score,
-      minutes: 5
-    });
-    if (feedback.score < 75 && feedback.topics[0]) {
-      addWrongNote(db, submission.studentId, {
-        source: `作业：${homework.title}`,
-        topic: feedback.topics[0],
-        question: homework.description,
-        answer: submission.answerText,
-        analysis: feedback.comment,
-        recommendation: "先补齐缺失要点，再生成 2 道同类题练习。"
-      });
-    }
-    recordAudit(db, actor, "submission.ai_grade", { resourceType: "submission", resourceId: submission.id, meta: { score: submission.score, homeworkId: homework.id } }, req);
+    recordAudit(db, actor, "submission.ai_grade", { resourceType: "submission", resourceId: submission.id, meta: { suggestedScore: feedback.score, homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, submission });
   }
@@ -4988,14 +5254,42 @@ async function handleApi(req, res, pathname, searchParams) {
     if (!submission) return notFound(res);
     const homework = db.homework.find((item) => item.id === submission.homeworkId);
     if (!homework || homework.teacherId !== body.teacherId) return sendError(res, 403, "无批改权限");
-    submission.score = Number(body.score);
+    const finalScore = Number.isFinite(Number(body.score)) ? Number(body.score) : Number(submission.aiSuggestedScore || 0);
+    submission.score = Math.max(0, Math.min(100, Math.round(finalScore)));
     submission.status = "graded";
-    submission.gradeType = "manual";
+    submission.gradeType = submission.aiSuggestedScore !== undefined ? "teacher_confirmed" : "manual";
     submission.comment = String(body.comment || "");
     submission.gradedAt = now();
+    submission.confirmedAt = now();
+    submission.confirmedBy = actor.id;
     submission.updatedAt = now();
-    const topics = inferQuestionTopics(`${homework.title} ${homework.description}`, "");
-    updateTopicMastery(db, submission.studentId, topics, Number(body.score) >= 80 ? 0.06 : Number(body.score) >= 60 ? 0.01 : -0.06, `教师手动批改：${homework.title}`);
+    const topics = submission.feedback?.topics?.length ? submission.feedback.topics : inferQuestionTopics(`${homework.title} ${homework.description}`, "");
+    updateTopicMastery(db, submission.studentId, topics, submission.score >= 80 ? 0.06 : submission.score >= 60 ? 0.01 : -0.06, `教师确认批改：${homework.title} ${submission.score} 分`);
+    const profile = ensureLearningProfile(db, submission.studentId);
+    profile.gradedCount = Number(profile.gradedCount || 0) + 1;
+    recordLearningActivity(db, submission.studentId, {
+      kind: "graded",
+      mode: "homework",
+      prompt: homework.title,
+      topics,
+      score: submission.score,
+      minutes: 5
+    });
+    if (submission.score < 75 && topics[0]) {
+      addWrongNote(db, submission.studentId, {
+        source: `作业：${homework.title}`,
+        topic: topics[0],
+        question: homework.description,
+        answer: submission.answerText,
+        analysis: submission.comment || submission.aiComment || "教师确认分数较低，建议回看评分标准。",
+        recommendation: "先补齐缺失要点，再生成 2 道同类题练习。"
+      });
+    }
+    if (submission.feedback) {
+      submission.feedback.teacherReviewRequired = false;
+      submission.feedback.confirmedScore = submission.score;
+      submission.feedback.confirmedAt = submission.confirmedAt;
+    }
     recordAudit(db, actor, "submission.manual_grade", { resourceType: "submission", resourceId: submission.id, meta: { score: submission.score, homeworkId: homework.id } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, submission });
@@ -5071,6 +5365,7 @@ function listenWithFallback(port, attemptsLeft = 20) {
   });
   server.listen(port, HOST, () => {
     ensureDataDir();
+    loadRuntimeState();
     readDb();
     console.log(`智慧教育智能体平台已启动：http://${HOST}:${port}`);
   });

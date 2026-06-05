@@ -43,7 +43,11 @@ node server.js
 - API 和静态资源带基础安全响应头。
 - 健康检查接口：`/api/healthz`、`/api/readyz`。
 - `data/db.json` 写入改为临时文件 + rename 的原子写入方式。
+- 上传会话和图谱生成任务持久化到 `data/runtime/`，服务重启后不会直接丢失任务状态。
 - 上传入口增加后端文件格式白名单和基础文件头校验，阻断可执行文件、脚本类文件和伪装格式。
+- 课程资料 RAG 增强为关键词召回 + 本地语义指纹 + 重排，回答引用来源更稳定。
+- 作业批改增加 rubric 分项评分，AI 只生成建议分，教师确认后才成为正式成绩并更新学习画像。
+- 增加 `npm run backup`，可备份 `data/` 和 `logs/` 到 `backups/`。
 - 增加 Dockerfile、Docker Compose 和部署说明，便于局域网小范围内测。
 
 检查和烟测：
@@ -51,9 +55,10 @@ node server.js
 ```powershell
 npm run check
 npm test
+npm run backup
 ```
 
-`npm test` 会临时启动一个测试端口，验证健康检查、登录 cookie、会话恢复、越权阻断和 AI 对话结构。
+`npm test` 会临时启动一个测试端口，验证健康检查、登录 cookie、会话恢复、越权阻断、恶意上传拦截和 AI 对话结构。
 
 部署说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。小范围内测可以使用 `HOST=0.0.0.0` 暴露到局域网；公网访问必须放在 HTTPS 反向代理后。
 

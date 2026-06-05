@@ -3,6 +3,7 @@
 .env
 data
 logs
+backups
 node_modules
 *.log
 *.pdf

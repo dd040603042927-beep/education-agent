@@ -15,6 +15,8 @@ Copy-Item .env.example .env
 ```text
 HOST=0.0.0.0
 PORT=5107
+DATA_DIR=./data
+LOG_DIR=./logs
 COOKIE_SECURE=false
 ```
 
@@ -97,7 +99,20 @@ npm.cmd test
 ```text
 data/db.json
 data/uploads/
+data/runtime/
 logs/audit.log
+```
+
+可以直接运行：
+
+```powershell
+npm run backup
+```
+
+备份会生成到：
+
+```text
+backups/backup-时间戳/
 ```
 
 恢复时停止服务，替换 `data/` 和 `logs/` 后重新启动。多人并发和长期运行建议尽快迁移到 SQLite WAL 或 PostgreSQL。

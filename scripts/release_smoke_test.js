@@ -1,4 +1,7 @@
 const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const PORT = Number(process.env.TEST_PORT || 5199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -39,12 +42,15 @@ function assert(condition, message) {
 }
 
 async function main() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "education-agent-smoke-"));
   const child = spawn(process.execPath, ["server.js"], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       PORT: String(PORT),
       HOST: "127.0.0.1",
+      DATA_DIR: path.join(tempRoot, "data"),
+      LOG_DIR: path.join(tempRoot, "logs"),
       SESSION_SECRET: "release-smoke-test-secret",
       COOKIE_SECURE: "false"
     },
@@ -101,12 +107,54 @@ async function main() {
     });
     assert(chat.response.ok && chat.payload.messages?.[1]?.learningPanel, "AI chat should return learning panel");
 
+    const homeworkId = state.payload.state.homework?.[0]?.id;
+    assert(homeworkId, "seed homework should exist");
+
+    const studentLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: "20260002", password: "123456" }
+    });
+    assert(studentLogin.response.ok && studentLogin.payload.ok, "student login should succeed");
+    const studentCookie = String(studentLogin.response.headers.get("set-cookie") || "").split(";")[0];
+
+    const submitted = await request(`/api/homework/${homeworkId}/submit`, {
+      method: "POST",
+      cookie: studentCookie,
+      body: {
+        studentId: "20260002",
+        answerText: "F=ma 表示合外力等于质量乘加速度。解题时要先受力分析，再建立坐标轴列牛顿第二定律，并结合运动学公式求解。"
+      }
+    });
+    assert(submitted.response.ok && submitted.payload.submission?.id, "student homework submission should succeed");
+    const submissionId = submitted.payload.submission.id;
+
+    const aiGrade = await request(`/api/submissions/${submissionId}/ai-grade`, {
+      method: "POST",
+      cookie,
+      body: { teacherId: "20260001" }
+    });
+    assert(aiGrade.response.ok, "AI grade suggestion should succeed");
+    assert(aiGrade.payload.submission.status === "review_pending", "AI grading should require teacher confirmation");
+    assert(Number.isFinite(Number(aiGrade.payload.submission.aiSuggestedScore)), "AI grading should return suggested score");
+    assert(Array.isArray(aiGrade.payload.submission.feedback?.rubricResults), "AI grading should return rubric results");
+
+    const confirmed = await request(`/api/submissions/${submissionId}/manual-grade`, {
+      method: "POST",
+      cookie,
+      body: { teacherId: "20260001", score: aiGrade.payload.submission.aiSuggestedScore, comment: "确认 AI 建议，答案覆盖主要步骤。" }
+    });
+    assert(confirmed.response.ok, "teacher confirmation should succeed");
+    assert(confirmed.payload.submission.status === "graded", "confirmed grade should become official");
+    assert(confirmed.payload.submission.confirmedBy === "20260001", "confirmed grade should record teacher");
+
     const logout = await request("/api/auth/logout", { method: "POST", cookie, body: {} });
     assert(logout.response.ok && logout.payload.ok, "logout should succeed");
 
     console.log("release smoke test passed");
   } finally {
     child.kill();
+    await sleep(300);
+    fs.rmSync(tempRoot, { recursive: true, force: true });
     if (stderr.trim()) console.error(stderr.trim());
   }
 }
