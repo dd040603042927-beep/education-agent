@@ -846,6 +846,29 @@ p {
   justify-content: flex-end;
 }
 
+.mode-switch {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, auto));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fafc;
+}
+
+.mode-switch button {
+  min-height: 34px;
+  padding: 7px 10px;
+  border-radius: calc(var(--radius) - 2px);
+  color: var(--muted);
+  background: transparent;
+}
+
+.mode-switch button.active {
+  color: #fff;
+  background: var(--primary);
+}
+
 .import-graph-panel {
   align-content: start;
 }
@@ -3672,6 +3695,185 @@ p {
   align-items: center;
 }
 
+.simulation-stage,
+.pbl-stage {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 18px;
+  padding: 24px;
+  overflow: auto;
+  background: #fbfdff;
+}
+
+.simulation-head span,
+.pbl-stage span {
+  color: var(--primary-strong);
+  font-weight: 900;
+}
+
+.simulation-head h2,
+.pbl-stage h2 {
+  margin: 8px 0;
+  font-size: 28px;
+}
+
+.simulation-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+  min-height: 320px;
+}
+
+.simulation-controls {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.simulation-controls label {
+  display: grid;
+  gap: 8px;
+}
+
+.simulation-output {
+  padding: 12px;
+  border-radius: var(--radius);
+  background: #eef7fb;
+  color: var(--primary-strong);
+  font-weight: 900;
+}
+
+.knn-plane {
+  position: relative;
+  min-height: 360px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(#e7edf5 1px, transparent 1px),
+    linear-gradient(90deg, #e7edf5 1px, transparent 1px),
+    #fff;
+  background-size: 32px 32px;
+}
+
+.knn-point {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: var(--shadow);
+}
+
+.knn-point.A {
+  background: #2f7bdc;
+}
+
+.knn-point.B {
+  background: #f0a43b;
+}
+
+.knn-point.query {
+  width: 24px;
+  height: 24px;
+  background: #18a777;
+  border-color: #0f6b50;
+}
+
+.knn-radius {
+  position: absolute;
+  left: 48%;
+  top: 46%;
+  width: 170px;
+  height: 170px;
+  transform: translate(-50%, -50%);
+  border: 2px dashed #18a777;
+  border-radius: 50%;
+  background: rgba(24, 167, 119, 0.08);
+}
+
+.address-sim {
+  display: grid;
+  grid-template-columns: 2fr 1.2fr 0.8fr;
+  align-content: center;
+  gap: 8px;
+  min-height: 320px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.addr-part {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius);
+  color: #fff;
+  font-size: 26px;
+  font-weight: 900;
+}
+
+.addr-part.tag {
+  background: #2f7bdc;
+}
+
+.addr-part.index {
+  background: #18a777;
+}
+
+.addr-part.offset {
+  background: #f0a43b;
+}
+
+.address-sim p {
+  grid-column: 1 / -1;
+  text-align: center;
+  font-weight: 900;
+}
+
+.process-sim {
+  min-height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.process-sim span {
+  padding: 14px 18px;
+  border-radius: var(--radius);
+  background: #eef7fb;
+  color: var(--primary-strong);
+  font-weight: 900;
+}
+
+.pbl-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.pbl-grid section {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
 .agent-list,
 .citation-list,
 .classroom-events {
@@ -3719,6 +3921,8 @@ p {
   .classroom-layout,
   .lesson-editor-grid,
   .classroom-bottom,
+  .simulation-body,
+  .pbl-grid,
   .dashboard-grid {
     grid-template-columns: 1fr;
   }
@@ -3800,6 +4004,8 @@ p {
   .classroom-layout,
   .lesson-editor-grid,
   .classroom-bottom,
+  .simulation-body,
+  .pbl-grid,
   .chat-action-grid,
   .chat-layout,
   .review-layout,

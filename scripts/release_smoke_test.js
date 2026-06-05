@@ -78,9 +78,9 @@ async function main() {
     const homepage = await requestText("/");
     assert(homepage.response.ok, "homepage should load");
     assert(homepage.response.headers.get("cache-control")?.includes("no-store"), "homepage should disable stale static cache");
-    assert(homepage.text.includes("/app.js?v=interactive-classroom-20260605"), "homepage should reference the current app bundle");
-    assert(homepage.text.includes("/styles.css?v=interactive-classroom-20260605"), "homepage should reference the current styles");
-    const appBundle = await requestText("/app.js?v=interactive-classroom-20260605");
+    assert(homepage.text.includes("/app.js?v=interactive-classroom-full-20260605"), "homepage should reference the current app bundle");
+    assert(homepage.text.includes("/styles.css?v=interactive-classroom-full-20260605"), "homepage should reference the current styles");
+    const appBundle = await requestText("/app.js?v=interactive-classroom-full-20260605");
     assert(appBundle.response.ok, "app bundle should load with version query");
     assert(appBundle.response.headers.get("cache-control")?.includes("no-store"), "app bundle should disable stale static cache");
     assert(appBundle.text.includes("renderTeacherHomePage") && appBundle.text.includes("renderStudentHomePage"), "app bundle should contain role dashboards");
@@ -332,6 +332,8 @@ async function main() {
     });
     assert(generatedLesson.response.status === 201 && generatedLesson.payload.lesson?.id, "teacher should generate an interactive classroom lesson");
     assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "quiz"), "generated lesson should include a classroom quiz scene");
+    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "simulation"), "generated lesson should include an interactive simulation scene");
+    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "pbl"), "generated lesson should include a PBL project scene");
 
     const studentLessonState = await request("/api/state", { cookie: studentCookie });
     assert(studentLessonState.payload.state.lessons.some((lesson) => lesson.id === generatedLesson.payload.lesson.id), "published classroom lesson should be visible to class student");
@@ -377,6 +379,14 @@ async function main() {
       body: { userId: "20260001", format: "markdown" }
     });
     assert(lessonExport.response.ok && lessonExport.payload.export?.content.includes("牛顿第二定律互动课堂"), "teacher should export lesson markdown");
+
+    const pptxExport = await request(`/api/lessons/${generatedLesson.payload.lesson.id}/export`, {
+      method: "POST",
+      cookie,
+      body: { userId: "20260001", format: "pptx" }
+    });
+    assert(pptxExport.response.ok && pptxExport.payload.export?.fileName.endsWith(".pptx"), "teacher should export lesson pptx");
+    assert(String(pptxExport.payload.export.contentBase64 || "").startsWith("UEs"), "pptx export should return a zip-based pptx payload");
 
     const submitted = await request(`/api/homework/${homeworkId}/submit`, {
       method: "POST",

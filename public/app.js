@@ -60,6 +60,8 @@ const state = {
     materialId: "",
     graphId: "",
     nodeId: "",
+    homeworkId: "",
+    weaknessTopic: "",
     classIds: [],
     duration: 20
   },
@@ -588,6 +590,55 @@ function downloadText(filename, content, type = "text/plain;charset=utf-8") {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function downloadBase64File(filename, base64, type = "application/octet-stream") {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  const blob = new Blob([bytes], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function classroomSpeechText(lesson, scene) {
+  return [
+    lesson?.title,
+    scene?.title,
+    scene?.objective,
+    scene?.content?.headline,
+    ...(scene?.content?.bullets || []),
+    ...(scene?.script || []).map((line) => `${line.agentName || classroomAgentLabel(line.agentRole)}说：${line.text}`),
+    scene?.simulation?.description,
+    scene?.pbl?.drivingQuestion
+  ].filter(Boolean).join("。").slice(0, 1200);
+}
+
+function speakClassroomText(text, rate = 1) {
+  if (!("speechSynthesis" in window)) return showToast("当前浏览器不支持 TTS 语音讲课", "error");
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "zh-CN";
+  utterance.rate = Number(rate || 1);
+  window.speechSynthesis.speak(utterance);
+  showToast("正在语音讲课");
+}
+
+function startClassroomSpeechInput(callback) {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) return showToast("当前浏览器不支持 ASR 语音提问", "error");
+  const recognition = new Recognition();
+  recognition.lang = "zh-CN";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  recognition.onresult = (event) => callback(event.results?.[0]?.[0]?.transcript || "");
+  recognition.onerror = () => showToast("语音识别失败，请改用文字输入", "error");
+  recognition.start();
+  showToast("正在听取语音提问");
 }
 
 function getCurrentUser() {
@@ -1290,7 +1341,12 @@ function classroomAgentLabel(role) {
     assistant: "AI助教",
     "student-basic": "基础同学",
     "student-misconception": "易错同学",
-    grader: "评分Agent"
+    "student-advanced": "进阶同学",
+    grader: "评分Agent",
+    graph: "图谱Agent",
+    material: "资料Agent",
+    whiteboard: "白板Agent",
+    simulation: "仿真Agent"
   }[role] || role || "智能体";
 }
 
@@ -1327,6 +1383,8 @@ function renderTeacherClassroomPage() {
   const materials = state.data.courseMaterials || [];
   const graphs = state.data.knowledgeGraphs || [];
   const classes = state.data.classes || [];
+  const homework = state.data.homework || [];
+  const weakTopics = state.data.learningAnalytics?.summary?.weak || [];
   const attempts = state.data.quizAttempts || [];
   return `
     <section class="dashboard-hero classroom-hero">
@@ -1355,6 +1413,8 @@ function renderTeacherClassroomPage() {
                 <option value="topic" ${state.classroomDraft.sourceType === "topic" ? "selected" : ""}>教师输入主题</option>
                 <option value="material" ${state.classroomDraft.sourceType === "material" ? "selected" : ""}>课程资料生成</option>
                 <option value="graph_node" ${state.classroomDraft.sourceType === "graph_node" ? "selected" : ""}>知识图谱节点生成</option>
+                <option value="homework" ${state.classroomDraft.sourceType === "homework" ? "selected" : ""}>作业错因生成</option>
+                <option value="weakness" ${state.classroomDraft.sourceType === "weakness" ? "selected" : ""}>班级薄弱点生成</option>
               </select>
             </label>
             <label>学科
@@ -1382,6 +1442,20 @@ function renderTeacherClassroomPage() {
               ${classroomDraftNodeOptions()}
             </select>
           </label>
+          <div class="form-grid">
+            <label>关联作业
+              <select name="homeworkId">
+                <option value="">不指定作业</option>
+                ${homework.map((item) => `<option value="${item.id}">${escapeHtml(item.title)}</option>`).join("")}
+              </select>
+            </label>
+            <label>薄弱点 / 错因
+              <input name="weaknessTopic" list="lessonWeakTopics" placeholder="例如：地址划分、受力分析、KNN 参数选择" />
+              <datalist id="lessonWeakTopics">
+                ${weakTopics.map((item) => `<option value="${escapeHtml(item.topic)}"></option>`).join("")}
+              </datalist>
+            </label>
+          </div>
           <div class="form-grid">
             <label>课堂时长（分钟）<input name="duration" type="number" min="10" max="90" value="${state.classroomDraft.duration || 20}" /></label>
             <label>发布状态
@@ -1455,6 +1529,7 @@ function renderLessonEditor(lesson) {
           <button class="mini" type="button" data-start-classroom="${lesson.id}">启动课堂</button>
           <button class="mini" type="button" data-export-lesson="${lesson.id}" data-format="markdown">导出 Markdown</button>
           <button class="mini" type="button" data-export-lesson="${lesson.id}" data-format="html">导出 HTML</button>
+          <button class="mini" type="button" data-export-lesson="${lesson.id}" data-format="pptx">导出 PPTX</button>
         </div>
       </div>
       <form id="lessonEditorForm" class="lesson-editor-grid">
@@ -1494,6 +1569,15 @@ function renderClassroomStage(lesson, session, mode) {
         </div>
         <div class="actions compact-actions">
           ${mode === "teacher" ? renderClassroomStartControls(lesson) : ""}
+          ${scene ? `
+            <select id="classroomVoiceRate" title="语速">
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x</option>
+              <option value="1.25">1.25x</option>
+            </select>
+            <button class="mini" type="button" id="speakClassroomScene">语音讲课</button>
+            ${session ? `<button class="mini" type="button" id="voiceClassroomAsk">语音提问</button>` : ""}
+          ` : ""}
           ${!session ? `<button class="primary" type="button" data-start-classroom="${lesson.id}">${mode === "teacher" ? "启动课堂" : "开始学习"}</button>` : ""}
           ${session ? `<button class="mini" type="button" data-next-classroom="${session.id}">${sceneIndex >= scenes.length - 1 ? "完成课堂" : "下一环节"}</button>` : ""}
         </div>
@@ -1554,6 +1638,8 @@ function renderClassroomStartControls(lesson) {
 function renderClassroomScene(scene, lesson, mode, session) {
   if (scene.type === "whiteboard") return renderWhiteboardScene(scene);
   if (scene.type === "discussion") return renderDiscussionScene(scene);
+  if (scene.type === "simulation") return renderSimulationScene(scene);
+  if (scene.type === "pbl") return renderPblScene(scene);
   if (scene.type === "quiz") return renderQuizScene(scene, lesson, mode, session);
   return `
     <div class="stage-slide">
@@ -1563,6 +1649,90 @@ function renderClassroomScene(scene, lesson, mode, session) {
       <ul>
         ${(scene.content?.bullets || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
       </ul>
+    </div>
+  `;
+}
+
+function renderSimulationScene(scene) {
+  const sim = scene.simulation || {};
+  return `
+    <div class="simulation-stage" data-simulation-kind="${escapeHtml(sim.kind || "process")}">
+      <div class="simulation-head">
+        <span>交互式仿真</span>
+        <h2>${escapeHtml(sim.title || scene.title)}</h2>
+        <p>${escapeHtml(sim.description || scene.objective || "")}</p>
+      </div>
+      <div class="simulation-body">
+        ${renderSimulationVisual(sim)}
+        <div class="simulation-controls">
+          ${(sim.controls || []).map((control) => `
+            <label>${escapeHtml(control.label)}
+              <input type="range" min="${control.min || 0}" max="${control.max || 10}" step="${control.step || 1}" value="${control.value || 1}" data-simulation-control="${escapeHtml(control.key)}" />
+              <strong data-simulation-value="${escapeHtml(control.key)}">${escapeHtml(control.value || 1)}</strong>
+            </label>
+          `).join("") || `<p class="hint">该仿真没有可调变量。</p>`}
+          <p class="simulation-output" id="simulationOutput">${simulationOutputText(sim)}</p>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSimulationVisual(sim) {
+  if (sim.kind === "knn") {
+    return `
+      <div class="knn-plane">
+        ${(sim.points || []).map((point) => `<span class="knn-point ${escapeHtml(point.group)}" style="left:${point.x}%;top:${point.y}%"></span>`).join("")}
+        <div class="knn-radius"></div>
+      </div>
+    `;
+  }
+  if (sim.kind === "address") {
+    return `
+      <div class="address-sim">
+        <div class="addr-part tag">Tag</div>
+        <div class="addr-part index">Index</div>
+        <div class="addr-part offset">Offset</div>
+        <p>${escapeHtml(sim.formula || "主存地址 = Tag + Index + Offset")}</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="process-sim">
+      ${(sim.steps || []).map((step, index) => `<span>${escapeHtml(step)}</span>${index < (sim.steps || []).length - 1 ? "<b>→</b>" : ""}`).join("")}
+    </div>
+  `;
+}
+
+function simulationOutputText(sim) {
+  if (sim.kind === "knn") return "K 值越小越敏感，K 值越大越平滑，但可能忽略局部结构。";
+  if (sim.kind === "address") return "Tag 用于匹配主存块，Index 定位 Cache 行/组，Offset 定位块内字节。";
+  return "拖动变量后，观察流程节奏和学习路径提示的变化。";
+}
+
+function renderPblScene(scene) {
+  const pbl = scene.pbl || {};
+  return `
+    <div class="pbl-stage">
+      <div class="simulation-head">
+        <span>项目制学习 PBL</span>
+        <h2>${escapeHtml(pbl.drivingQuestion || scene.title)}</h2>
+        <p>${escapeHtml(scene.objective || "生成项目任务、角色分工和评价标准。")}</p>
+      </div>
+      <div class="pbl-grid">
+        <section>
+          <strong>项目任务</strong>
+          ${(pbl.tasks || []).map((task) => `<p>${escapeHtml(task)}</p>`).join("")}
+        </section>
+        <section>
+          <strong>角色分工</strong>
+          ${(pbl.roles || []).map((role) => `<p><b>${escapeHtml(role.name)}</b>：${escapeHtml(role.task)}</p>`).join("")}
+        </section>
+        <section>
+          <strong>评价标准</strong>
+          ${(pbl.rubric || []).map((item) => `<p>${escapeHtml(item.item)}：${item.score} 分</p>`).join("")}
+        </section>
+      </div>
     </div>
   `;
 }
@@ -1612,8 +1782,8 @@ function renderQuizScene(scene, lesson, mode, session) {
         ${questions.map((question, index) => `
           <fieldset>
             <legend>${index + 1}. ${escapeHtml(question.stem)}</legend>
-            ${question.type === "short" ? `<textarea name="${question.id}" rows="3" placeholder="输入你的解释"></textarea>` : (question.options || []).map((option) => `<label><input type="radio" name="${question.id}" value="${escapeHtml(option)}" />${escapeHtml(option)}</label>`).join("")}
-            <small>${escapeHtml(question.topic || "")}</small>
+            ${renderQuizAnswerInput(question)}
+            <small>${escapeHtml(classroomQuizTypeLabel(question.type))} · ${escapeHtml(question.topic || "")}</small>
           </fieldset>
         `).join("")}
         <button class="primary" type="submit">提交课堂测验</button>
@@ -1625,13 +1795,40 @@ function renderQuizScene(scene, lesson, mode, session) {
       ${questions.map((question, index) => `
         <article>
           <strong>${index + 1}. ${escapeHtml(question.stem)}</strong>
-          <p>答案：${escapeHtml(question.answer)}</p>
+          <p>类型：${escapeHtml(classroomQuizTypeLabel(question.type))}</p>
+          <p>答案：${escapeHtml(Array.isArray(question.answer) ? question.answer.join("、") : question.answer)}</p>
           <small>${escapeHtml(question.explanation || "")}</small>
         </article>
       `).join("")}
       <p class="hint">学生提交 ${attempts.length} 次${attempts.length ? `，最近得分 ${attempts[0].score}` : ""}。</p>
     </div>
   `;
+}
+
+function classroomQuizTypeLabel(type) {
+  return {
+    single: "单选题",
+    multi: "多选题",
+    truefalse: "判断题",
+    fill: "填空题",
+    short: "简答题",
+    step: "步骤题",
+    code: "代码题",
+    "graph-locate": "图谱定位题"
+  }[type] || "课堂题";
+}
+
+function renderQuizAnswerInput(question) {
+  if (question.type === "multi") {
+    return (question.options || []).map((option) => `<label><input type="checkbox" name="${question.id}" value="${escapeHtml(option)}" />${escapeHtml(option)}</label>`).join("");
+  }
+  if (question.type === "truefalse") {
+    return ["正确", "错误"].map((option) => `<label><input type="radio" name="${question.id}" value="${option}" />${option}</label>`).join("");
+  }
+  if (["single"].includes(question.type)) {
+    return (question.options || []).map((option) => `<label><input type="radio" name="${question.id}" value="${escapeHtml(option)}" />${escapeHtml(option)}</label>`).join("");
+  }
+  return `<textarea name="${question.id}" rows="${question.type === "code" ? 6 : 3}" placeholder="${question.type === "code" ? "输入代码或伪代码" : "输入你的答案"}"></textarea>`;
 }
 
 function renderClassroomEvent(event) {
@@ -1653,7 +1850,7 @@ function renderLessonExportModal() {
         <button class="modal-close" id="closeLessonExportModal">×</button>
         <h2>课堂导出</h2>
         <p class="hint">${escapeHtml(item.fileName)} · ${item.characters || item.content?.length || 0} 字符</p>
-        <pre class="export-preview">${escapeHtml(item.content || "")}</pre>
+        ${item.contentBase64 ? `<div class="export-preview">已生成 ${escapeHtml(item.format.toUpperCase())} 文件，可直接下载到本地使用。</div>` : `<pre class="export-preview">${escapeHtml(item.content || "")}</pre>`}
         <div class="actions">
           <button class="primary" id="downloadLessonExport">下载文件</button>
           <button class="ghost" id="closeLessonExportBottom">关闭</button>
@@ -1686,6 +1883,8 @@ function bindClassroomPage() {
       materialId: form.get("materialId"),
       graphId: form.get("graphId"),
       nodeId: form.get("nodeId"),
+      homeworkId: form.get("homeworkId"),
+      weaknessTopic: form.get("weaknessTopic"),
       classIds,
       duration: Number(form.get("duration") || 20)
     };
@@ -1793,7 +1992,12 @@ function bindClassroomPage() {
     if (!session) return;
     const answers = {};
     for (const [key, value] of form.entries()) {
-      if (key !== "sceneId") answers[key] = value;
+      if (key === "sceneId") continue;
+      if (answers[key] !== undefined) {
+        answers[key] = Array.isArray(answers[key]) ? [...answers[key], value] : [answers[key], value];
+      } else {
+        answers[key] = value;
+      }
     }
     try {
       const payload = await api(`/api/classrooms/${session.id}/quiz/submit`, {
@@ -1820,13 +2024,45 @@ function bindClassroomPage() {
       showToast(error.message, "error");
     }
   });
+  document.querySelectorAll("[data-simulation-control]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const valueEl = Array.from(document.querySelectorAll("[data-simulation-value]")).find((item) => item.dataset.simulationValue === input.dataset.simulationControl);
+      if (valueEl) valueEl.textContent = input.value;
+      const output = document.getElementById("simulationOutput");
+      const kind = document.querySelector("[data-simulation-kind]")?.dataset.simulationKind;
+      if (output) {
+        if (kind === "knn") output.textContent = `当前 K=${input.value}。K 小时边界更灵活，K 大时边界更平滑。`;
+        else if (kind === "address") output.textContent = `${input.dataset.simulationControl}=${input.value}，请观察 Tag、Index、Offset 的划分变化。`;
+        else output.textContent = `当前参数 ${input.dataset.simulationControl}=${input.value}，课堂流程会按该节奏演示。`;
+      }
+    });
+  });
+  document.getElementById("speakClassroomScene")?.addEventListener("click", () => {
+    const lesson = selectedLesson();
+    const session = selectedClassroomSession(lesson);
+    const scene = (lesson?.scenes || [])[session ? Number(session.currentSceneIndex || 0) : 0] || (lesson?.scenes || [])[0];
+    speakClassroomText(classroomSpeechText(lesson, scene), document.getElementById("classroomVoiceRate")?.value || 1);
+  });
+  document.getElementById("voiceClassroomAsk")?.addEventListener("click", () => {
+    startClassroomSpeechInput((text) => {
+      const input = document.querySelector("#classroomAskForm input[name='question']");
+      if (input) {
+        input.value = text;
+        input.focus();
+      }
+    });
+  });
   document.querySelectorAll("[data-export-lesson]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
         const payload = await api(`/api/lessons/${button.dataset.exportLesson}/export`, { method: "POST", body: { userId: state.user.id, format: button.dataset.format } });
         state.lessonExport = payload.export;
-        const type = payload.export.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
-        downloadText(payload.export.fileName, payload.export.content, type);
+        if (payload.export.contentBase64) {
+          downloadBase64File(payload.export.fileName, payload.export.contentBase64, payload.export.mimeType);
+        } else {
+          const type = payload.export.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
+          downloadText(payload.export.fileName, payload.export.content, type);
+        }
         await loadState();
         renderContent();
         showToast("课堂已导出");
@@ -1845,8 +2081,12 @@ function bindClassroomPage() {
   });
   document.getElementById("downloadLessonExport")?.addEventListener("click", () => {
     if (!state.lessonExport) return;
-    const type = state.lessonExport.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
-    downloadText(state.lessonExport.fileName, state.lessonExport.content, type);
+    if (state.lessonExport.contentBase64) {
+      downloadBase64File(state.lessonExport.fileName, state.lessonExport.contentBase64, state.lessonExport.mimeType);
+    } else {
+      const type = state.lessonExport.format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8";
+      downloadText(state.lessonExport.fileName, state.lessonExport.content, type);
+    }
   });
 }
 
@@ -2152,7 +2392,13 @@ function renderGraphDetailPanel(graph, mode = "teacher") {
       <div class="detail-actions">
         <button class="mini" type="button" data-graph-node-action="explain">讲解</button>
         <button class="mini" type="button" data-graph-node-action="exercise">出题</button>
-        ${isTeacherLike() ? `<button class="mini" type="button" data-graph-node-action="classroom">生成互动微课</button>` : ""}
+        ${isTeacherLike() ? `
+          <button class="mini" type="button" data-graph-node-action="classroom">生成互动微课</button>
+          <button class="mini" type="button" data-graph-node-action="script">加入课堂脚本</button>
+          <button class="mini" type="button" data-graph-node-action="quiz">生成课堂测验</button>
+          <button class="mini" type="button" data-graph-node-action="whiteboard">生成白板讲解</button>
+          <button class="mini" type="button" data-graph-node-action="remedy">生成补救课堂</button>
+        ` : ""}
         <button class="mini" type="button" data-graph-node-action="path">学习路径</button>
         <button class="mini" type="button" data-graph-node-action="compare">对比</button>
       </div>
@@ -3857,22 +4103,31 @@ function bindGraphPage() {
 
   document.querySelectorAll("[data-graph-node-action]").forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.dataset.graphNodeAction === "classroom") {
+      if (["classroom", "script", "quiz", "whiteboard", "remedy"].includes(button.dataset.graphNodeAction)) {
         const graph = graphListForCurrentRole().find((item) => item.id === state.selectedGraphId) || graphListForCurrentRole()[0];
         const node = graph ? graphSelectedNode(graph) : null;
+        const suffix = {
+          classroom: "互动微课",
+          script: "课堂脚本",
+          quiz: "课堂测验",
+          whiteboard: "白板讲解",
+          remedy: "补救课堂"
+        }[button.dataset.graphNodeAction] || "互动课堂";
         state.classroomDraft = {
           ...state.classroomDraft,
           sourceType: "graph_node",
           subject: graph?.subject || state.classroomDraft.subject || "",
-          topic: node?.label || graph?.title || "",
+          topic: `${node?.label || graph?.title || ""}${suffix}`,
           graphId: graph?.id || "",
           nodeId: node?.id || "",
           materialId: "",
+          homeworkId: "",
+          weaknessTopic: button.dataset.graphNodeAction === "remedy" ? (node?.label || "") : "",
           duration: 15
         };
         state.page = "classroom";
         renderShell();
-        showToast("已带入图谱节点，可生成互动微课");
+        showToast(`已带入图谱节点，可生成${suffix}`);
         return;
       }
       const actionText = {
@@ -4344,7 +4599,13 @@ function renderMaterialsPage() {
                 <small>${escapeHtml(item.sourceName || "课程资料")} · ${fmtTime(item.createdAt)}</small>
               </div>
               <div class="row-actions">
-                ${isTeacherLike() ? `<button class="mini" data-material-classroom="${item.id}">生成课堂</button>` : ""}
+                ${isTeacherLike() ? `
+                  <button class="mini" data-material-next="${item.id}" data-action="graph">生成图谱</button>
+                  <button class="mini" data-material-classroom="${item.id}">生成课堂</button>
+                  <button class="mini" data-material-next="${item.id}" data-action="quiz">生成测验</button>
+                  <button class="mini" data-material-next="${item.id}" data-action="plan">生成教案</button>
+                  <button class="mini" data-material-next="${item.id}" data-action="handout">生成讲义</button>
+                ` : ""}
                 ${item.ownerId === state.user.id ? `<button class="mini danger" data-delete-material="${item.id}">删除</button>` : ""}
               </div>
             </article>
@@ -4461,6 +4722,43 @@ function bindMaterialsPage() {
       state.page = "classroom";
       renderShell();
       showToast("已带入课程资料，可生成互动课堂");
+    });
+  });
+  document.querySelectorAll("[data-material-next]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const material = (state.data.courseMaterials || []).find((item) => item.id === button.dataset.materialNext);
+      if (!material) return;
+      const action = button.dataset.action;
+      if (action === "graph") {
+        state.graphDraft = {
+          subject: material.subject || "",
+          title: `${material.title}知识图谱`,
+          sourceText: material.textSample || "",
+          extractor: DEFAULT_GRAPH_EXTRACTOR
+        };
+        state.page = "graph";
+        renderShell();
+        showToast("已带入资料信息，可继续上传原文件或粘贴内容生成图谱");
+        return;
+      }
+      state.page = "ai";
+      const prompts = {
+        quiz: `请根据课程资料《${material.title}》生成 5 道课堂测验题，包含答案和解析。`,
+        plan: `请根据课程资料《${material.title}》生成一份 45 分钟课堂教案，包括目标、重难点、流程、提问和作业。`,
+        handout: `请根据课程资料《${material.title}》生成一份课堂讲义，包含知识结构、例题、易错点和复习建议。`
+      };
+      state.aiMode = action === "quiz" ? "practice" : "plan";
+      state.aiSubject = material.subject || "";
+      renderShell();
+      setTimeout(() => {
+        const input = document.querySelector("#aiForm input[name='prompt']");
+        if (input) {
+          input.value = prompts[action] || "";
+          input.focus();
+        }
+      }, 60);
+      showToast("已生成提示词，可在教学指导中确认发送");
     });
   });
   document.querySelectorAll("[data-view-material]").forEach((card) => {
@@ -4625,7 +4923,13 @@ function renderAiPage() {
             <strong>${isTeacher ? "教学指导" : "学习对话"}</strong>
             <span>${active ? `${(active.messages || []).length} 条消息` : "新会话"} · ${escapeHtml(modeTitle)} · ${escapeHtml(aiDepthLabel(state.aiAnswerDepth))}</span>
           </div>
-          <button id="newConversationBtn" class="primary">新建对话</button>
+          <div class="actions compact-actions">
+            <div class="mode-switch">
+              <button class="active" type="button">单人问答</button>
+              <button type="button" id="openClassroomMode">${isTeacher ? "多智能体课堂" : "AI课堂"}</button>
+            </div>
+            <button id="newConversationBtn" class="primary">新建对话</button>
+          </div>
         </div>
         <div class="ai-control-bar">
           <label>当前课程
@@ -4668,6 +4972,10 @@ function renderAiPage() {
 }
 
 function bindAiPage() {
+  document.getElementById("openClassroomMode")?.addEventListener("click", () => {
+    state.page = "classroom";
+    renderShell();
+  });
   const syncAiControls = () => {
     state.aiSubject = document.getElementById("aiSubjectSelect")?.value || state.aiSubject || "";
     state.aiChapter = document.getElementById("aiChapterInput")?.value || "";

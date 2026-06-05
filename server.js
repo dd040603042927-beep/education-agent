@@ -4372,7 +4372,12 @@ function defaultLessonAgents() {
     { id: uid("agent"), role: "assistant", name: "AI助教", style: "补充解释、引用资料、提示前置知识" },
     { id: uid("agent"), role: "student-basic", name: "基础同学", style: "提出基础问题和易忽略条件" },
     { id: uid("agent"), role: "student-misconception", name: "易错同学", style: "暴露常见误区并等待纠正" },
-    { id: uid("agent"), role: "grader", name: "评分Agent", style: "批改课堂小测并回流学习画像" }
+    { id: uid("agent"), role: "student-advanced", name: "进阶同学", style: "提出迁移应用和开放问题" },
+    { id: uid("agent"), role: "grader", name: "评分Agent", style: "批改课堂小测并回流学习画像" },
+    { id: uid("agent"), role: "graph", name: "图谱Agent", style: "查询前置知识、相关节点和学习路径" },
+    { id: uid("agent"), role: "material", name: "资料Agent", style: "检索课程资料引用和页码线索" },
+    { id: uid("agent"), role: "whiteboard", name: "白板Agent", style: "生成画图、公式和流程图动作" },
+    { id: uid("agent"), role: "simulation", name: "仿真Agent", style: "生成交互式实验或算法可视化" }
   ];
 }
 
@@ -4422,6 +4427,7 @@ function buildLessonQuiz(topic, subject, topics = []) {
   const first = focus[0] || topic;
   const second = focus[1] || "前置知识";
   const third = focus[2] || "应用场景";
+  const fourth = focus[3] || "课堂总结";
   return [
     {
       id: uid("quiz"),
@@ -4436,6 +4442,36 @@ function buildLessonQuiz(topic, subject, topics = []) {
       ],
       answer: "核心概念、适用条件和前置知识",
       explanation: `课堂重点是把「${first}」放回 ${subject} 的知识结构中理解。`
+    },
+    {
+      id: uid("quiz"),
+      type: "truefalse",
+      topic: first,
+      stem: `判断：学习「${topic}」时，只记结论、不看适用条件也能稳定迁移到新题。`,
+      answer: "错误",
+      explanation: "教育图谱强调概念边界、前置依赖和应用条件，不能只记结论。"
+    },
+    {
+      id: uid("quiz"),
+      type: "multi",
+      topic: second,
+      stem: `围绕「${topic}」设计复习路径时，哪些信息应该被纳入？`,
+      options: [
+        "前置知识",
+        "常见误区",
+        "课堂测验结果",
+        "与主题无关的随机材料"
+      ],
+      answer: ["前置知识", "常见误区", "课堂测验结果"],
+      explanation: "学习路径应由资料、图谱关系、测验表现和错题证据共同决定。"
+    },
+    {
+      id: uid("quiz"),
+      type: "fill",
+      topic: third,
+      stem: `填空：「${topic}」的课堂结果会回流到学生的____和错题本。`,
+      answer: "学习画像",
+      explanation: "课堂表现必须回流画像，才能形成持续学习闭环。"
     },
     {
       id: uid("quiz"),
@@ -4458,8 +4494,81 @@ function buildLessonQuiz(topic, subject, topics = []) {
       stem: `请用一句话说明「${topic}」最容易混淆的地方或使用边界。`,
       answer: topic,
       explanation: "简答题由教师复核，系统先根据关键词给出课堂反馈。"
+    },
+    {
+      id: uid("quiz"),
+      type: "step",
+      topic: fourth,
+      stem: `请写出用互动课堂学习「${topic}」的 3 个步骤。`,
+      answer: "概念,白板,测验",
+      explanation: "标准路径是概念导入、白板推导/仿真、测验反馈与补救。"
     }
   ];
+}
+
+function buildLessonSimulation(topic, subject, topics = []) {
+  const text = `${subject} ${topic} ${topics.join(" ")}`.toLowerCase();
+  if (/knn|k近邻|机器学习|分类/.test(text)) {
+    return {
+      kind: "knn",
+      title: "KNN 分类边界可视化",
+      description: "拖动 K 值观察近邻数量变化对分类稳定性的影响。",
+      controls: [
+        { key: "k", label: "K 值", type: "range", min: 1, max: 15, step: 2, value: 5 }
+      ],
+      points: [
+        { x: 16, y: 28, group: "A" }, { x: 22, y: 44, group: "A" }, { x: 34, y: 24, group: "A" },
+        { x: 66, y: 56, group: "B" }, { x: 76, y: 36, group: "B" }, { x: 58, y: 70, group: "B" },
+        { x: 48, y: 46, group: "query" }
+      ]
+    };
+  }
+  if (/cache|地址|组成|计算机/.test(text)) {
+    return {
+      kind: "address",
+      title: "地址划分仿真",
+      description: "调整地址位数和块内偏移，观察 Tag、Index、Offset 的分段关系。",
+      controls: [
+        { key: "addressBits", label: "地址位数", type: "range", min: 8, max: 32, step: 1, value: 16 },
+        { key: "offsetBits", label: "Offset 位数", type: "range", min: 1, max: 8, step: 1, value: 4 }
+      ],
+      formula: "主存地址 = Tag + Index + Offset"
+    };
+  }
+  return {
+    kind: "process",
+    title: `${topic} 流程仿真`,
+    description: "通过流程节点观察概念、条件、例题和反馈之间的关系。",
+    controls: [
+      { key: "speed", label: "演示速度", type: "range", min: 1, max: 5, step: 1, value: 3 }
+    ],
+    steps: ["概念", topics[1] || "前置知识", topics[2] || "例题", "课堂测验", "补救建议"]
+  };
+}
+
+function buildLessonPbl(topic, subject, topics = []) {
+  return {
+    drivingQuestion: `如何用「${topic}」解决一个真实的 ${subject} 学习或应用问题？`,
+    roles: [
+      { name: "资料负责人", task: "整理课程资料和引用来源" },
+      { name: "图谱负责人", task: "标注前置知识、易错点和关联节点" },
+      { name: "仿真负责人", task: "用白板或仿真说明关键过程" },
+      { name: "汇报负责人", task: "输出 5 分钟课堂展示和反思" }
+    ],
+    tasks: [
+      `拆解「${topic}」的核心概念和使用条件`,
+      `找出至少 2 个前置知识：${topics.slice(1, 3).join("、") || "由小组自行确定"}`,
+      "设计一个小测题并给出答案解析",
+      "形成项目报告、白板说明和补救建议"
+    ],
+    rubric: [
+      { item: "概念准确", score: 30 },
+      { item: "证据引用", score: 20 },
+      { item: "仿真/白板表达", score: 20 },
+      { item: "测验与反馈", score: 20 },
+      { item: "协作分工", score: 10 }
+    ]
+  };
 }
 
 function buildLessonScenes({ subject, topic, objectives, topics, citations, duration }) {
@@ -4508,6 +4617,22 @@ function buildLessonScenes({ subject, topic, objectives, topics, citations, dura
         { agentRole: "student-basic", agentName: "基础同学", text: `${topic} 和 ${topics[1] || "前置知识"} 的关系是什么？` },
         { agentRole: "student-misconception", agentName: "易错同学", text: `如果只记结论不看条件，会不会也能做题？` }
       ]
+    },
+    {
+      id: uid("scene"),
+      type: "simulation",
+      title: "交互式仿真",
+      duration: Math.round(minutes * 0.16 * 60),
+      objective: "用可操作组件理解变量变化对结果的影响",
+      simulation: buildLessonSimulation(topic, subject, topics)
+    },
+    {
+      id: uid("scene"),
+      type: "pbl",
+      title: "项目制学习任务",
+      duration: Math.round(minutes * 0.18 * 60),
+      objective: "把知识点迁移到项目任务和小组协作",
+      pbl: buildLessonPbl(topic, subject, topics)
     },
     {
       id: uid("scene"),
@@ -4580,6 +4705,23 @@ function collectLessonGenerationContext(db, userId, body) {
         contextParts.push(graph.title || "", (graph.nodes || []).slice(0, 12).map((nodeItem) => nodeItem.label).join("\n"));
       }
     }
+  }
+
+  if (body.homeworkId) {
+    const homework = (db.homework || []).find((item) => item.id === body.homeworkId && item.teacherId === userId);
+    if (homework) {
+      source.type = "homework";
+      source.homeworkId = homework.id;
+      topic = topic || `${homework.title}错因补救`;
+      contextParts.push(homework.title || "", homework.description || "", homework.answer || "", homework.rubricText || "");
+    }
+  }
+
+  if (body.weaknessTopic) {
+    source.type = "weakness";
+    source.weaknessTopic = String(body.weaknessTopic || "").trim().slice(0, 80);
+    topic = topic || `${source.weaknessTopic}补救课堂`;
+    contextParts.push(source.weaknessTopic);
   }
 
   topic = topic || subject || "互动课堂";
@@ -4797,10 +4939,16 @@ function scoreLessonQuiz(scene, answers = {}) {
   if (!questions.length) return { score: 0, results: [] };
   const results = questions.map((question) => {
     const raw = answers[question.id] ?? answers[question.stem] ?? "";
-    const given = String(raw || "").trim();
-    const expected = String(question.answer || "").trim();
+    const givenValues = Array.isArray(raw) ? raw.map((item) => String(item || "").trim()).filter(Boolean) : [String(raw || "").trim()].filter(Boolean);
+    const given = givenValues.join("、");
+    const expectedValues = Array.isArray(question.answer) ? question.answer.map((item) => String(item || "").trim()).filter(Boolean) : [String(question.answer || "").trim()].filter(Boolean);
+    const expected = expectedValues.join("、");
     let correct = false;
-    if (question.type === "short") {
+    if (question.type === "multi") {
+      const givenSet = new Set(givenValues);
+      const expectedSet = new Set(expectedValues);
+      correct = givenSet.size === expectedSet.size && expectedValues.every((item) => givenSet.has(item));
+    } else if (["short", "fill", "step", "code", "graph-locate"].includes(question.type)) {
       const tokens = tokenizeForSearch(expected);
       const givenTokens = new Set(tokenizeForSearch(given));
       correct = Boolean(given) && (tokens.some((token) => givenTokens.has(token)) || given.includes(expected) || expected.includes(given));
@@ -4824,8 +4972,133 @@ function scoreLessonQuiz(scene, answers = {}) {
   };
 }
 
+function xmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+const CRC32_TABLE = (() => {
+  const table = [];
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let j = 0; j < 8; j += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buffer.length; i += 1) crc = CRC32_TABLE[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { dosTime, dosDate };
+}
+
+function zipStore(entries) {
+  const fileParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const { dosTime, dosDate } = dosDateTime();
+  entries.forEach((entry) => {
+    const name = Buffer.from(entry.name, "utf8");
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(String(entry.data || ""), "utf8");
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    fileParts.push(local, name, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+    offset += local.length + name.length + data.length;
+  });
+  const centralOffset = offset;
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(centralOffset, 16);
+  return Buffer.concat([...fileParts, ...centralParts, end]);
+}
+
+function pptxTextShape(id, x, y, w, h, text, size = 2400, bold = false) {
+  const lines = String(text || "").split(/\n+/).filter(Boolean);
+  const body = lines.length ? lines.map((line) => `<a:p><a:r><a:rPr lang="zh-CN" sz="${size}" ${bold ? "b=\"1\"" : ""}/><a:t>${xmlEscape(line)}</a:t></a:r></a:p>`).join("") : "<a:p/>";
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="Text ${id}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${body}</p:txBody></p:sp>`;
+}
+
+function pptxSlideXml(title, bullets = []) {
+  const bodyText = bullets.filter(Boolean).slice(0, 8).map((item) => `• ${item}`).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${pptxTextShape(2, 650000, 450000, 7800000, 720000, title, 3200, true)}${pptxTextShape(3, 780000, 1380000, 7600000, 4300000, bodyText, 2100)}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
+}
+
+function lessonPptxBuffer(lesson) {
+  const slides = [
+    { title: lesson.title, bullets: [`学科：${lesson.subject}`, `来源：${lessonSourceLabel(lesson.source)} ${lesson.source?.topic || ""}`, `时长：${lesson.duration || 20} 分钟`] },
+    { title: "课堂目标", bullets: lesson.objectives || [] },
+    { title: "多智能体角色", bullets: (lesson.agents || []).map((agent) => `${agent.name}：${agent.style || agent.role}`) },
+    ...(lesson.scenes || []).map((scene, index) => ({
+      title: `${index + 1}. ${scene.title}`,
+      bullets: [
+        `类型：${scene.type}`,
+        scene.objective || "",
+        ...(scene.content?.bullets || []),
+        ...(scene.script || []).map((line) => `${line.agentName || line.agentRole}：${line.text}`),
+        ...(scene.quiz?.questions || []).slice(0, 3).map((q) => `题：${q.stem}`),
+        ...(scene.pbl?.tasks || []).slice(0, 3).map((task) => `项目任务：${task}`),
+        scene.simulation?.title ? `仿真：${scene.simulation.title}` : ""
+      ]
+    }))
+  ].slice(0, 16);
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>${slides.map((_, i) => `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join("")}</Types>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>`;
+  const presentationRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${slides.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`).join("")}</Relationships>`;
+  const presentation = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldSz cx="10000000" cy="5625000" type="wide"/><p:sldIdLst>${slides.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join("")}</p:sldIdLst></p:presentation>`;
+  const entries = [
+    { name: "[Content_Types].xml", data: contentTypes },
+    { name: "_rels/.rels", data: rels },
+    { name: "ppt/presentation.xml", data: presentation },
+    { name: "ppt/_rels/presentation.xml.rels", data: presentationRels },
+    ...slides.map((slide, i) => ({ name: `ppt/slides/slide${i + 1}.xml`, data: pptxSlideXml(slide.title, slide.bullets) }))
+  ];
+  return zipStore(entries);
+}
+
 function lessonExportContent(lesson, format = "markdown") {
   if (format === "json") return JSON.stringify(lesson, null, 2);
+  if (format === "pptx") return lessonPptxBuffer(lesson);
   const sceneMarkdown = (lesson.scenes || []).map((scene, index) => {
     const lines = [
       `## ${index + 1}. ${scene.title}`,
@@ -4833,7 +5106,9 @@ function lessonExportContent(lesson, format = "markdown") {
       scene.objective ? `目标：${scene.objective}` : "",
       ...(scene.content?.bullets || []).map((item) => `- ${item}`),
       ...(scene.script || []).map((line) => `- ${line.agentName || line.agentRole}：${line.text}`),
-      ...(scene.quiz?.questions || []).map((q, qIndex) => `- 题 ${qIndex + 1}：${q.stem}\n  答案：${q.answer}\n  解析：${q.explanation || ""}`)
+      ...(scene.simulation ? [`- 仿真：${scene.simulation.title}。${scene.simulation.description || ""}`] : []),
+      ...(scene.pbl?.tasks || []).map((task) => `- 项目任务：${task}`),
+      ...(scene.quiz?.questions || []).map((q, qIndex) => `- 题 ${qIndex + 1}：${q.stem}\n  答案：${Array.isArray(q.answer) ? q.answer.join("、") : q.answer}\n  解析：${q.explanation || ""}`)
     ];
     return lines.filter(Boolean).join("\n");
   }).join("\n\n");
@@ -5369,16 +5644,19 @@ async function handleApi(req, res, pathname, searchParams) {
     } catch (error) {
       return sendError(res, error.status || 500, error.message);
     }
-    const format = ["markdown", "html", "json"].includes(body.format) ? body.format : "markdown";
+    const format = ["markdown", "html", "json", "pptx"].includes(body.format) ? body.format : "markdown";
     const content = lessonExportContent(lesson, format);
+    const isBinary = Buffer.isBuffer(content);
     const exportRecord = {
       id: uid("lesson_export"),
       lessonId: lesson.id,
       teacherId: lesson.teacherId,
       format,
       fileName: `${lesson.title}.${format === "markdown" ? "md" : format}`,
-      characters: content.length,
-      content,
+      characters: isBinary ? content.length : String(content).length,
+      content: isBinary ? "" : content,
+      contentBase64: isBinary ? content.toString("base64") : "",
+      mimeType: format === "pptx" ? "application/vnd.openxmlformats-officedocument.presentationml.presentation" : format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8",
       createdAt: now()
     };
     db.lessonExports.unshift(exportRecord);
