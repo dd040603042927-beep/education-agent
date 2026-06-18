@@ -1,10 +1,12 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
+const http = require("http");
 const os = require("os");
 const path = require("path");
 
 const PORT = Number(process.env.TEST_PORT || 5199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const CALLBACK_TOKEN = "smoke-callback-token";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -15,9 +17,24 @@ async function request(path, options = {}) {
     method: options.method || "GET",
     headers: {
       "content-type": "application/json",
-      ...(options.cookie ? { cookie: options.cookie } : {})
+      ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...(options.headers || {})
     },
     body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const payload = await response.json().catch(() => ({}));
+  return { response, payload };
+}
+
+async function requestBinary(path, options = {}) {
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method: options.method || "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...(options.headers || {})
+    },
+    body: options.body
   });
   const payload = await response.json().catch(() => ({}));
   return { response, payload };
@@ -31,6 +48,117 @@ async function requestText(path, options = {}) {
     }
   });
   return { response, text: await response.text() };
+}
+
+function startMockDify() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const bodyText = Buffer.concat(chunks).toString("utf8");
+      const body = bodyText ? JSON.parse(bodyText) : {};
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body });
+      if (req.method !== "POST" || req.url !== "/v1/workflows/run") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+        return;
+      }
+      const inputs = body.inputs || {};
+      const evidence = [
+        {
+          id: "E1",
+          type: "material",
+          title: "教师端课程资料",
+          quote: "KNN 根据距离选取最近邻，并通过投票或平均完成预测。",
+          ragChannel: "project"
+        }
+      ];
+      const finalAnswer = [
+        "## 知识点定位",
+        "KNN（置信度 1）",
+        "",
+        "## 掌握度",
+        "未诊断，得分 0",
+        "",
+        "## 标准解释",
+        "KNN 的核心思想是根据距离找到最相似的 K 个训练样本，分类时多数投票，回归时取平均或加权平均。",
+        "",
+        "## 诊断反馈",
+        "未提供学生自我理解，当前为知识问答模式，暂不进行掌握度扣分诊断。",
+        "",
+        "## 追问题",
+        "1. KNN 为什么通常需要标准化？"
+      ].join("\n");
+      const structured = {
+        topic_label: "KNN",
+        topic_probability: 1,
+        top_topic_candidates: [{ topic: "KNN", probability: 1 }],
+        mastery_score: 0,
+        mastery_level: "未诊断",
+        error_tags: [],
+        missing_points: ["未提供学生自我理解，当前仅生成标准解释。"],
+        rag_evidence: evidence,
+        final_answer: finalAnswer,
+        question: inputs.question || "",
+        request_user_id: inputs.request_user_id || "",
+        request_user_role: inputs.request_user_role || "",
+        assistant_task: inputs.assistant_task || "",
+        assistant_task_label: inputs.assistant_task_label || "",
+        subject: inputs.subject || "",
+        chapter: inputs.chapter || "",
+        knowledge_point: inputs.knowledge_point || ""
+      };
+      const callbackPayload = {
+        student_id: inputs.student_id || "",
+        class_id: inputs.class_id || "",
+        conversation_id: inputs.conversation_id || "",
+        request_id: inputs.request_id || "",
+        sync_mode: inputs.sync_mode || "",
+        request_user_id: inputs.request_user_id || "",
+        request_user_role: inputs.request_user_role || "",
+        assistant_task: inputs.assistant_task || "",
+        assistant_task_label: inputs.assistant_task_label || "",
+        subject: inputs.subject || "",
+        chapter: inputs.chapter || "",
+        knowledge_point: inputs.knowledge_point || "",
+        question: inputs.question || "",
+        student_answer: inputs.student_answer || "",
+        topic_label: "KNN",
+        mastery_score: 0,
+        mastery_level: "未诊断",
+        error_tags: [],
+        missing_points: ["未提供学生自我理解，当前仅生成标准解释。"],
+        rag_evidence: evidence,
+        final_answer: finalAnswer,
+        structured_result: structured
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        workflow_run_id: "wf-smoke",
+        task_id: "task-smoke",
+        data: {
+          status: "succeeded",
+          outputs: {
+            final_answer: finalAnswer,
+            structured_json: JSON.stringify(structured),
+            callback_payload: JSON.stringify(callbackPayload),
+            rag_evidence: JSON.stringify(evidence),
+            topic_label: "KNN",
+            topic_probability: 1,
+            mastery_score: 0,
+            mastery_level: "未诊断",
+            error_tags: JSON.stringify([])
+          }
+        }
+      }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, requests, baseUrl: `http://127.0.0.1:${server.address().port}/v1` });
+    });
+  });
 }
 
 async function waitForReady() {
@@ -51,8 +179,43 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assetVersionFromHomepage(html, assetName) {
+  const match = String(html || "").match(new RegExp(`/${assetName.replace(".", "\\.")}\\?v=([^"']+)`));
+  assert(match?.[1], `homepage should reference ${assetName} with a version query`);
+  return match[1];
+}
+
+async function uploadTextFile(cookie, userId, fileName, text) {
+  const buffer = Buffer.from(text, "utf8");
+  const started = await request("/api/uploads/start", {
+    method: "POST",
+    cookie,
+    body: { userId, fileName, fileType: "text/plain", size: buffer.length }
+  });
+  assert(started.response.status === 201 && started.payload.upload?.id, `upload session should start for ${fileName}`);
+  const chunk = await requestBinary(`/api/uploads/${started.payload.upload.id}/chunk?index=0&offset=0`, {
+    cookie,
+    body: buffer
+  });
+  assert(chunk.response.ok && chunk.payload.upload?.received === buffer.length, `upload chunk should complete for ${fileName}`);
+  return started.payload.upload;
+}
+
+async function waitForGraphJob(jobId, cookie) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const jobResult = await request(`/api/graphs/jobs/${jobId}`, { cookie });
+    const job = jobResult.payload.job;
+    if (job?.status === "complete") return job;
+    if (job?.status === "failed") throw new Error(job.error || job.message || "graph generation failed");
+    await sleep(250);
+  }
+  throw new Error(`graph job ${jobId} did not complete`);
+}
+
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "education-agent-smoke-"));
+  const mockDify = await startMockDify();
   const child = spawn(process.execPath, ["server.js"], {
     cwd: process.cwd(),
     env: {
@@ -61,8 +224,15 @@ async function main() {
       HOST: "127.0.0.1",
       DATA_DIR: path.join(tempRoot, "data"),
       LOG_DIR: path.join(tempRoot, "logs"),
+      BACKUP_DIR: path.join(tempRoot, "backups"),
       SESSION_SECRET: "release-smoke-test-secret",
-      COOKIE_SECURE: "false"
+      COOKIE_SECURE: "false",
+      DIFY_BASE_URL: mockDify.baseUrl,
+      DIFY_WORKFLOW_API_KEY: "app-smoke-test",
+      DIFY_TEACHER_WORKFLOW_API_KEY: "app-smoke-test",
+      DIFY_PROJECT_BASE_URL: BASE_URL,
+      DIFY_GRAPH_CONTEXT_URL: `${BASE_URL}/api/integrations/dify/graph-context`,
+      DIFY_CALLBACK_TOKEN: CALLBACK_TOKEN
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -78,15 +248,27 @@ async function main() {
     const homepage = await requestText("/");
     assert(homepage.response.ok, "homepage should load");
     assert(homepage.response.headers.get("cache-control")?.includes("no-store"), "homepage should disable stale static cache");
-    assert(homepage.text.includes("/app.js?v=interactive-classroom-full-20260605"), "homepage should reference the current app bundle");
-    assert(homepage.text.includes("/styles.css?v=interactive-classroom-full-20260605"), "homepage should reference the current styles");
-    const appBundle = await requestText("/app.js?v=interactive-classroom-full-20260605");
+    const appAssetVersion = assetVersionFromHomepage(homepage.text, "app.js");
+    const styleAssetVersion = assetVersionFromHomepage(homepage.text, "styles.css");
+    assert(appAssetVersion === styleAssetVersion, "app and style assets should use the same cache-busting version");
+    const appBundle = await requestText(`/app.js?v=${appAssetVersion}`);
     assert(appBundle.response.ok, "app bundle should load with version query");
     assert(appBundle.response.headers.get("cache-control")?.includes("no-store"), "app bundle should disable stale static cache");
     assert(appBundle.text.includes("renderTeacherHomePage") && appBundle.text.includes("renderStudentHomePage"), "app bundle should contain role dashboards");
-    assert(appBundle.text.includes("renderTeacherClassroomPage") && appBundle.text.includes("renderStudentClassroomPage"), "app bundle should contain interactive classroom pages");
+    assert(!appBundle.text.includes("new Function(") && !appBundle.text.includes("eval("), "math modeling lab should avoid CSP-blocked dynamic JavaScript evaluation");
+    assert(appBundle.text.includes("tokenizeMathExpression") && appBundle.text.includes("renderMathFunctionSvg"), "math modeling lab should include the CSP-safe expression plotter");
+    const removedModuleKey = ["class", "room"].join("");
+    const removedModulePascal = ["Class", "room"].join("");
+    assert(!appBundle.text.includes(`render${removedModulePascal}Page`) && !appBundle.text.includes(`renderTeacher${removedModulePascal}Page`) && !appBundle.text.includes(`renderStudent${removedModulePascal}Page`), "removed module pages should stay out of the app bundle");
+    assert(!appBundle.text.includes(`key: "${removedModuleKey}"`) && !appBundle.text.includes(`data-dashboard-page="${removedModuleKey}"`), "removed module navigation and dashboard entry should stay out");
+    assert(!appBundle.text.includes(`data-material-${removedModuleKey}`), "removed material action should stay out of the app bundle");
+    assert(!appBundle.text.includes(`data-graph-node-action="${removedModuleKey}"`), "removed graph action should stay out of the app bundle");
+    assert(!appBundle.text.includes("ai-history-rail"), "AI page should not render a separate left history rail");
     assert(appBundle.text.includes("renderChatActionCards"), "app bundle should contain the unified chat action cards");
     assert(appBundle.text.includes("创建并发送邀请"), "app bundle should contain approval-based group creation UI");
+    assert(appBundle.text.includes('data-chat-tool="pending"') && appBundle.text.includes('data-chat-tool="contacts"'), "chat page should expose pending and contacts as top toolbar actions");
+    assert(appBundle.text.includes("class-management-grid") && appBundle.text.includes("class-active-panel"), "class management should render the coordinated workspace layout");
+    assert(!appBundle.text.includes("${renderChatInfoPanel(active, friends)}"), "chat layout should not render the old fixed right info rail");
     assert(!appBundle.text.includes("chat-action-head"), "app bundle should not contain the old chat action header");
     assert(!appBundle.text.includes("面向备课、授课、班级与作业闭环"), "top bar should not contain the old teacher subtitle");
     assert(!appBundle.text.includes("内置教师：20260001"), "release login should not expose demo account credentials");
@@ -94,6 +276,17 @@ async function main() {
 
     const anonymousState = await request("/api/state");
     assert(anonymousState.response.status === 401, "anonymous /api/state should be rejected");
+
+    const adminLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { account: "20260000", password: "123456" }
+    });
+    const adminCookie = String(adminLogin.response.headers.get("set-cookie") || "").split(";")[0];
+    assert(adminLogin.response.ok && adminLogin.payload.user?.role === "admin", "built-in admin should be able to log in");
+    const adminOverview = await request("/api/admin/overview", { cookie: adminCookie });
+    assert(adminOverview.response.ok && adminOverview.payload.overview?.counts?.users >= 3, "admin overview should load after RBAC");
+    const adminBackup = await request("/api/admin/backup", { method: "POST", cookie: adminCookie, body: {} });
+    assert(adminBackup.response.ok && adminBackup.payload.fileName?.endsWith(".json"), "admin backup should write to configured backup directory");
 
     const weakRegister = await request("/api/auth/register", {
       method: "POST",
@@ -179,11 +372,172 @@ async function main() {
     const newStudentId = studentRegister.payload.user.id;
     const newStudentCookie = String(newStudentLogin.response.headers.get("set-cookie") || "").split(";")[0];
     const newStudentState = newStudentLogin.payload.state;
-    assert(newStudentState.knowledgeGraphs.length === 0, "new registered student should not inherit global graphs");
-    assert(newStudentState.courseMaterials.length === 0, "new registered student should not inherit global course materials");
+    assert(newStudentState.knowledgeGraphs.length === 0, "new registered student should not see private teacher graphs by default");
+    assert(newStudentState.courseMaterials.some((item) => item.global && item.subject === "机器学习"), "new registered student should see teacher-published global course materials");
     assert(newStudentState.classes.length === 0, "new registered student should start without classes");
     assert(newStudentState.homework.length === 0, "new registered student should start without homework");
     assert(newStudentState.friends.length === 0 && newStudentState.chatThreads.length === 0, "new registered student should start without friends or chats");
+
+    const publicMlMaterial = newStudentState.courseMaterials.find((item) => item.global && item.subject === "机器学习" && item.chunkCount > 0);
+    assert(publicMlMaterial, "new registered student should have a usable public machine learning material for knowledge tests");
+    const knowledgeQuiz = await request("/api/knowledge-tests/generate", {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: {
+        subject: "机器学习",
+        materialId: publicMlMaterial.id,
+        count: 4
+      }
+    });
+    assert(knowledgeQuiz.response.ok, "student knowledge test generation should use visible teacher materials");
+    assert((knowledgeQuiz.payload.quiz?.questions || []).length >= 3, "knowledge test should generate multiple material-grounded questions");
+    assert((knowledgeQuiz.payload.quiz?.citations || []).some((item) => item.type === "material" && item.global), "knowledge test should expose teacher material citations");
+    const quizQuestion = knowledgeQuiz.payload.quiz.questions[0];
+    const quizAnswer = [
+      `首先，${quizQuestion.topic}需要结合资料中的关键点说明。`,
+      `本题答案覆盖 ${quizQuestion.expectedKeywords.slice(0, 8).join("、")}。`,
+      "其次，需要说明定义、条件、步骤、作用和一个例子，最后给出结论。"
+    ].join("");
+    const knowledgeEvaluation = await request("/api/knowledge-tests/evaluate", {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: {
+        quizId: knowledgeQuiz.payload.quiz.id,
+        subject: "机器学习",
+        materialId: publicMlMaterial.id,
+        question: quizQuestion,
+        answer: quizAnswer,
+        attempts: [],
+        questionCount: knowledgeQuiz.payload.quiz.questions.length
+      }
+    });
+    assert(knowledgeEvaluation.response.ok, "student knowledge test answer should be evaluated");
+    assert(knowledgeEvaluation.payload.result?.overall?.accuracy > 0, "knowledge test evaluation should return cumulative accuracy");
+    assert(knowledgeEvaluation.payload.result?.overall?.masteryLevel, "knowledge test evaluation should return a mastery level");
+    const afterKnowledgeTestState = await request("/api/state", { cookie: newStudentCookie });
+    assert(afterKnowledgeTestState.payload.state.learningAnalytics?.profile?.mastery?.[quizQuestion.topic], "knowledge test should update the student's learning profile mastery");
+
+    const publicMaterialChat = await request("/api/ai/chat", {
+      method: "POST",
+      cookie: newStudentCookie,
+      body: {
+        userId: newStudentId,
+        subject: "机器学习",
+        mode: "qa",
+        prompt: "KNN 的核心思想是什么？"
+      }
+    });
+    assert(publicMaterialChat.response.ok, "student AI chat should call the workflow");
+    const publicMaterialAssistant = publicMaterialChat.payload.messages?.find((message) => message.role === "assistant");
+    const studentCitations = publicMaterialAssistant?.citations || [];
+    const studentRetrieved = publicMaterialAssistant?.retrieved || [];
+    assert(studentCitations.length > 0, "student AI chat should expose teacher-uploaded citation sources");
+    assert(studentCitations.some((item) => item.subject === "机器学习" && item.global), "student AI chat citations should include visible machine learning teacher materials");
+    assert(studentRetrieved.length > 0, "student AI chat should expose retrieved source chunks for citation display");
+    assert(publicMaterialAssistant?.workflow?.name?.includes("机器学习知识点问答"), "student AI chat should return the Dify diagnosis workflow trace");
+    const publicMaterialAnswer = String(publicMaterialAssistant?.content || "");
+    const expectedDifyFinalAnswer = [
+      "## 知识点定位",
+      "KNN（置信度 1）",
+      "",
+      "## 掌握度",
+      "未诊断，得分 0",
+      "",
+      "## 标准解释",
+      "KNN 的核心思想是根据距离找到最相似的 K 个训练样本，分类时多数投票，回归时取平均或加权平均。",
+      "",
+      "## 诊断反馈",
+      "未提供学生自我理解，当前为知识问答模式，暂不进行掌握度扣分诊断。",
+      "",
+      "## 追问题",
+      "1. KNN 为什么通常需要标准化？"
+    ].join("\n");
+    assert(publicMaterialAnswer === expectedDifyFinalAnswer, "student AI chat answer should exactly match Dify final_answer");
+    assert(publicMaterialAnswer.includes("## 知识点定位") && publicMaterialAnswer.includes("KNN"), "student AI chat answer should use the Dify final_answer topic section");
+    assert(publicMaterialAnswer.includes("## 掌握度") && publicMaterialAnswer.includes("未诊断，得分 0"), "student AI chat answer should use the Dify final_answer mastery section");
+    assert(publicMaterialAnswer.includes("## 标准解释"), "student AI chat answer should include the Dify standard explanation section");
+    assert(publicMaterialAnswer.includes("## 诊断反馈"), "student AI chat answer should include the Dify diagnosis feedback section");
+    assert(publicMaterialAnswer.includes("## 追问题"), "student AI chat answer should include the Dify follow-up question section");
+    assert(publicMaterialAssistant?.workflowResult?.topic_label === "KNN", "student AI chat should expose the structured Dify workflow result");
+    assert(publicMaterialAssistant?.workflowResult?.source === "dify-api", "student AI chat should call Dify workflow API when configured");
+    const difyRun = mockDify.requests.find((item) => item.method === "POST" && item.url === "/v1/workflows/run");
+    assert(difyRun, "mock Dify should receive the student workflow run");
+    assert(difyRun.headers.authorization === "Bearer app-smoke-test", "Dify workflow run should use the configured API key");
+    assert(difyRun.body.inputs?.student_id === newStudentId, "Dify workflow run should receive the logged-in student ID");
+    assert(difyRun.body.inputs?.sync_mode === "api-return", "Dify workflow run should use api-return sync mode from the project backend");
+    assert(difyRun.body.inputs?.request_user_id === newStudentId && difyRun.body.inputs?.request_user_role === "student", "Dify workflow run should receive request user metadata");
+    assert(difyRun.body.inputs?.assistant_task === "qa", "student workflow run should receive the AI assistant task mode");
+    assert(difyRun.body.inputs?.graph_context_url && difyRun.body.inputs?.graph_context_token, "Dify workflow run should receive the graph database query endpoint");
+    assert(difyRun.body.inputs?.callback_url?.includes("/api/integrations/dify/diagnosis-callback"), "Dify workflow run should receive the project callback endpoint");
+    const studentRoleContext = JSON.parse(difyRun.body.inputs.assistant_role_context || "{}");
+    const studentClassContext = JSON.parse(difyRun.body.inputs.project_class_context || "{}");
+    assert(studentRoleContext.request_user_role === "student" && studentRoleContext.assistant_task === "qa", "student workflow run should receive structured role context");
+    assert(studentClassContext.role === "student", "student workflow run should receive structured student class context");
+    const difyProjectDocs = JSON.parse(difyRun.body.inputs.project_rag_context || "[]");
+    const difyMasteryContext = JSON.parse(difyRun.body.inputs.project_mastery_context || "{}");
+    assert(difyProjectDocs.some((item) => item.subject === "机器学习" && item.global), "student workflow run should receive visible teacher course citation context");
+    assert(difyMasteryContext.student_id === newStudentId && difyMasteryContext.mastery, "Dify workflow run should receive the student's project mastery context");
+
+    const beforeApiReturnCallbackState = await request("/api/state", { cookie: newStudentCookie });
+    const beforeApiReturnConversationCount = beforeApiReturnCallbackState.payload.state.conversations.length;
+    const difyApiReturnCallback = await request("/api/integrations/dify/diagnosis-callback", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLBACK_TOKEN}` },
+      body: {
+        callback_payload: JSON.stringify({
+          student_id: newStudentId,
+          conversation_id: publicMaterialChat.payload.conversation.id,
+          request_id: "smoke-api-return",
+          sync_mode: "api-return",
+          question: "KNN 的核心思想是什么？",
+          student_answer: "KNN 根据距离选择近邻并投票，但我还没有解释 K 值选择。",
+          topic_label: "KNN",
+          mastery_score: 68,
+          mastery_level: "基本理解",
+          error_tags: ["K值选择缺失"],
+          missing_points: ["缺少 K 值选择说明"],
+          final_answer: "## 知识点定位\nKNN\n\n## 掌握度\n基本理解，得分 68"
+        })
+      }
+    });
+    const afterApiReturnCallbackState = await request("/api/state", { cookie: newStudentCookie });
+    assert(difyApiReturnCallback.response.ok && difyApiReturnCallback.payload.synced?.skippedConversationWrite === true, "Dify api-return callback should skip duplicate conversation writes");
+    assert(afterApiReturnCallbackState.payload.state.conversations.length === beforeApiReturnConversationCount, "Dify api-return callback should not create another student conversation");
+    assert(difyApiReturnCallback.payload.synced?.masteryUpdated === true, "Dify api-return callback should still update mastery from structured diagnosis");
+
+    const difyCallback = await request("/api/integrations/dify/diagnosis-callback", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLBACK_TOKEN}` },
+      body: {
+        student_id: newStudentId,
+        question: "KNN 的核心思想是什么？",
+        student_answer: "KNN 根据距离选择近邻并投票，但我没有说明评价指标。",
+        topic_label: "KNN",
+        mastery_score: 72,
+        mastery_level: "基本掌握",
+        error_tags: ["评价指标缺失"],
+        missing_points: ["缺少评价指标说明"],
+        final_answer: "Dify 工作流诊断：KNN 需要说明距离度量、K 值选择、近邻投票和评价指标。"
+      }
+    });
+    assert(difyCallback.response.ok && difyCallback.payload.synced?.wrongNoteId, "Dify diagnosis callback should sync mastery and wrong notes");
+
+    const difyDryRunCallback = await request("/api/integrations/dify/diagnosis-callback", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLBACK_TOKEN}` },
+      body: {
+        callback_payload: JSON.stringify({
+          question: "KNN 的核心思想是什么？",
+          topic_label: "KNN",
+          mastery_score: 0,
+          mastery_level: "未诊断",
+          error_tags: [],
+          missing_points: ["未提供学生自我理解，当前仅生成标准解释。"],
+          final_answer: "## 知识点定位\nKNN（置信度 1.0）"
+        })
+      }
+    });
+    assert(difyDryRunCallback.response.ok && difyDryRunCallback.payload.synced?.skipped === true, "Dify workflow dry run without student_id should not fail the HTTP callback node");
 
     const login = await request("/api/auth/login", {
       method: "POST",
@@ -199,6 +553,119 @@ async function main() {
     assert(state.response.ok && state.payload.state?.user?.id === "20260001", "session state should resolve current user");
     const refreshedCookie = String(state.response.headers.get("set-cookie") || "");
     assert(refreshedCookie.includes("edu_session=") && refreshedCookie.includes("Max-Age=172800"), "authenticated state should refresh 2-day session cookie");
+    assert(state.payload.state.user.subject === "机器学习", "seed teacher should default to the machine learning course example");
+    const mlMaterial = state.payload.state.courseMaterials.find((item) => item.subject === "机器学习" && item.title.includes("动手学机器学习"));
+    assert(mlMaterial && mlMaterial.chunkCount > 0, "machine learning seed material should be searchable");
+    const mlGraph = state.payload.state.knowledgeGraphs.find((item) => item.subject === "机器学习" && item.title.includes("动手学机器学习"));
+    assert(mlGraph && mlGraph.nodes.length >= 30 && mlGraph.links.length >= 20, "machine learning seed graph should be available");
+    const knnNode = mlGraph.nodes.find((node) => /K\s*近邻|KNN|最近邻/i.test(node.label)) || mlGraph.nodes.find((node) => /机器学习|监督学习/.test(node.label)) || mlGraph.nodes[0];
+    assert(knnNode?.id, "machine learning graph should expose an actionable node");
+
+    const graphContext = await request("/api/integrations/dify/graph-context", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLBACK_TOKEN}` },
+      body: {
+        request_user_id: "20260001",
+        subject: "机器学习",
+        question: `请讲解 ${knnNode.label}`,
+        graph_id: mlGraph.id,
+        node_id: knnNode.id
+      }
+    });
+    assert(graphContext.response.ok && graphContext.payload.source === "project-knowledge-graph-db", "Dify graph context endpoint should query the project graph database");
+    const graphContextDocs = graphContext.payload.documents || [];
+    assert(graphContextDocs.some((item) => item.graphId === mlGraph.id && item.nodeId === knnNode.id), "Dify graph context endpoint should return the selected graph node");
+
+    const graphUploadA = await uploadTextFile(cookie, "20260001", "ml-multifile-a.txt", [
+      "机器学习多文件图谱 A",
+      "KNN 通过距离度量寻找最近的 K 个样本，分类任务使用多数投票。",
+      "关键步骤包括选择 K 值、标准化特征、计算距离和汇总邻居标签。"
+    ].join("\n"));
+    const graphUploadB = await uploadTextFile(cookie, "20260001", "ml-multifile-b.txt", [
+      "机器学习多文件图谱 B",
+      "逻辑回归使用 sigmoid 函数输出类别概率，适合二分类任务。",
+      "KNN 与逻辑回归的差异包括训练方式、决策边界和特征尺度敏感性。"
+    ].join("\n"));
+    const multiFileGraphStart = await request("/api/graphs/generate-upload", {
+      method: "POST",
+      cookie,
+      body: {
+        userId: "20260001",
+        subject: "机器学习",
+        title: "多文件汇总图谱 smoke",
+        sourceName: "ml-multifile-a.txt、ml-multifile-b.txt",
+        sourceText: "汇总生成 KNN、逻辑回归、距离度量、标准化、二分类等节点，并建立对比关系。",
+        uploadIds: [graphUploadA.id, graphUploadB.id]
+      }
+    });
+    assert(multiFileGraphStart.response.status === 202 && multiFileGraphStart.payload.job?.id, "multi-file graph generation should create one graph job");
+    const multiFileGraphJob = await waitForGraphJob(multiFileGraphStart.payload.job.id, cookie);
+    assert(multiFileGraphJob.meta?.fileCount === 2, "multi-file graph job should keep the source file count");
+    assert((multiFileGraphJob.meta?.sourceFiles || []).length === 2, "multi-file graph job should keep both source files");
+    assert(multiFileGraphJob.meta?.extraction?.fileCount === 2, "multi-file graph extraction should aggregate both files");
+    const afterMultiGraphState = await request("/api/state", { cookie });
+    const multiFileGraph = afterMultiGraphState.payload.state.knowledgeGraphs.find((item) => item.id === multiFileGraphJob.graphId);
+    assert(multiFileGraph?.nodes?.length > 0, "multi-file graph generation should save one merged graph");
+
+    const graphActionChats = [
+      {
+        mode: "explain",
+        answerDepth: "layered",
+        prompt: `请基于课程资料和知识图谱，分层讲解「${knnNode.label}」。请包含定义、算法流程、关键条件、例子和常见误区。`
+      },
+      {
+        mode: "practice",
+        answerDepth: "layered",
+        prompt: `请基于课程资料和当前图谱节点「${knnNode.label}」生成课堂练习题，包含答案解析。`
+      },
+      {
+        mode: "plan",
+        answerDepth: "layered",
+        prompt: `请根据知识图谱前置关系，为「${knnNode.label}」生成学习路径。`
+      },
+      {
+        mode: "explain",
+        answerDepth: "full",
+        prompt: `请对比「${knnNode.label}」与「逻辑回归」，说明适用场景、关键假设、参数影响和易混淆点。`
+      }
+    ];
+    const graphWorkflowRunStart = mockDify.requests.length;
+    for (const actionChat of graphActionChats) {
+      const actionResult = await request("/api/ai/chat", {
+        method: "POST",
+        cookie,
+        body: {
+          userId: "20260001",
+          subject: "机器学习",
+          chapter: "《动手学机器学习》知识图谱",
+          knowledgePoint: knnNode.label,
+          graphId: mlGraph.id,
+          nodeId: knnNode.id,
+          ...actionChat
+        }
+      });
+      assert(actionResult.response.ok, `graph AI action ${actionChat.mode} should succeed`);
+      const assistant = actionResult.payload.messages?.find((message) => message.role === "assistant");
+      assert(assistant?.content && assistant.learningPanel, "graph AI action should return assistant content and learning panel");
+      assert((assistant.citations || []).length || actionResult.payload.conversation?.messages?.some((message) => message.citations?.length), "graph AI action should attach course or graph citations");
+    }
+    const graphWorkflowRuns = mockDify.requests
+      .slice(graphWorkflowRunStart)
+      .filter((item) => item.method === "POST" && item.url === "/v1/workflows/run");
+    assert(graphWorkflowRuns.length >= graphActionChats.length, "graph AI actions should call the Dify workflow");
+    const graphFocusRun = graphWorkflowRuns.find((run) => {
+      const docs = JSON.parse(run.body.inputs?.project_rag_context || "[]");
+      return docs.some((item) => item.type === "graph" && item.graphId === mlGraph.id && item.nodeId === knnNode.id && item.ragChannel === "graph-focus");
+    });
+    assert(graphFocusRun, "graph AI workflow run should include the selected knowledge graph node in project_rag_context");
+    assert(graphFocusRun.body.inputs?.student_id === "", "teacher graph workflow run should not sync as a student diagnosis");
+    assert(["lesson_plan", "quiz_generation", "grading", "class_analysis", "remedial_plan"].includes(graphFocusRun.body.inputs?.assistant_task), "teacher graph workflow run should include the assistant task mode");
+    const graphMasteryContext = JSON.parse(graphFocusRun.body.inputs?.project_mastery_context || "{}");
+    const graphRoleContext = JSON.parse(graphFocusRun.body.inputs?.assistant_role_context || "{}");
+    const graphClassContext = JSON.parse(graphFocusRun.body.inputs?.project_class_context || "{}");
+    assert(graphMasteryContext.request_user_id === "20260001" && graphMasteryContext.request_user_role === "teacher", "teacher graph workflow run should include request user metadata");
+    assert(graphRoleContext.request_user_role === "teacher", "teacher graph workflow run should include structured role context");
+    assert(graphClassContext.role === "teacher", "teacher graph workflow run should include teacher class context");
 
     const friendRequest = await request("/api/friends", {
       method: "POST",
@@ -289,6 +756,20 @@ async function main() {
     });
     assert(createdClass.response.status === 201 && createdClass.payload.class?.id, "teacher should create a class before assigning homework");
 
+    const classPrivateMaterial = await request("/api/materials", {
+      method: "POST",
+      cookie,
+      body: {
+        userId: "20260001",
+        subject: "物理",
+        title: "烟测班级非公开资料",
+        sourceText: "这是一份只应教师可见的班级内部资料。",
+        global: false,
+        classId: createdClass.payload.class.id
+      }
+    });
+    assert(classPrivateMaterial.response.status === 201 && classPrivateMaterial.payload.material?.id, "teacher should create a private class material");
+
     const createdHomework = await request("/api/homework", {
       method: "POST",
       cookie,
@@ -315,78 +796,50 @@ async function main() {
       cookie: studentCookie,
       body: { studentId: "20260002" }
     });
-    assert(classApply.response.ok && classApply.payload.application?.status === "approved", "student should join the class before submitting homework");
+    assert(classApply.response.ok && classApply.payload.application?.status === "pending", "student outside imported roster should wait for teacher approval");
 
-    const generatedLesson = await request("/api/lessons/generate", {
+    const approveClassApply = await request(`/api/classes/${createdClass.payload.class.id}/applications/${classApply.payload.application.id}`, {
       method: "POST",
       cookie,
-      body: {
-        teacherId: "20260001",
-        sourceType: "topic",
-        subject: "物理",
-        topic: "牛顿第二定律互动课堂",
-        classIds: [createdClass.payload.class.id],
-        status: "published",
-        duration: 15
-      }
+      body: { teacherId: "20260001", action: "accept" }
     });
-    assert(generatedLesson.response.status === 201 && generatedLesson.payload.lesson?.id, "teacher should generate an interactive classroom lesson");
-    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "quiz"), "generated lesson should include a classroom quiz scene");
-    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "simulation"), "generated lesson should include an interactive simulation scene");
-    assert(generatedLesson.payload.lesson.scenes.some((scene) => scene.type === "pbl"), "generated lesson should include a PBL project scene");
+    assert(approveClassApply.response.ok && approveClassApply.payload.application?.status === "approved", "teacher should approve the class join request before homework submission");
 
-    const studentLessonState = await request("/api/state", { cookie: studentCookie });
-    assert(studentLessonState.payload.state.lessons.some((lesson) => lesson.id === generatedLesson.payload.lesson.id), "published classroom lesson should be visible to class student");
-
-    const classroomStart = await request(`/api/classrooms/${generatedLesson.payload.lesson.id}/start`, {
+    const secondClass = await request("/api/classes", {
       method: "POST",
       cookie,
-      body: { userId: "20260001", classId: createdClass.payload.class.id }
+      body: { teacherId: "20260001", name: "烟测第二班", subject: "数学" }
     });
-    assert(classroomStart.response.status === 201 && classroomStart.payload.session?.id, "teacher should start classroom session");
-    assert(classroomStart.payload.session.participantIds.includes("20260002"), "classroom session should include class student");
-    const sessionId = classroomStart.payload.session.id;
+    assert(secondClass.response.status === 201 && secondClass.payload.class?.id, "teacher should create a second class");
 
-    for (let i = 0; i < 3; i += 1) {
-      const nextScene = await request(`/api/classrooms/${sessionId}/next`, {
-        method: "POST",
-        cookie,
-        body: { userId: "20260001" }
-      });
-      assert(nextScene.response.ok, "teacher should advance classroom scenes");
-    }
-
-    const classroomAsk = await request(`/api/classrooms/${sessionId}/ask`, {
+    const secondClassApply = await request(`/api/classes/${secondClass.payload.class.inviteCode}/apply`, {
       method: "POST",
       cookie: studentCookie,
-      body: { userId: "20260002", question: "这节课最容易错在哪里？" }
+      body: { studentId: "20260002" }
     });
-    assert(classroomAsk.response.ok && classroomAsk.payload.session.events.some((event) => event.type === "student_question"), "student should ask during classroom");
+    assert(secondClassApply.response.ok && secondClassApply.payload.application?.status === "pending", "student should need approval when joining a second class by invite code");
 
-    const quizScene = generatedLesson.payload.lesson.scenes.find((scene) => scene.type === "quiz");
-    const quizAnswers = Object.fromEntries((quizScene.quiz.questions || []).map((question) => [question.id, question.answer]));
-    const quizSubmit = await request(`/api/classrooms/${sessionId}/quiz/submit`, {
-      method: "POST",
-      cookie: studentCookie,
-      body: { studentId: "20260002", sceneId: quizScene.id, answers: quizAnswers }
-    });
-    assert(quizSubmit.response.status === 201 && quizSubmit.payload.attempt?.score >= 80, "classroom quiz should score and create an attempt");
-    assert(quizSubmit.payload.learningAnalytics.summary.count > 0, "classroom quiz should update learning mastery evidence");
-
-    const lessonExport = await request(`/api/lessons/${generatedLesson.payload.lesson.id}/export`, {
+    const approveSecondClassApply = await request(`/api/classes/${secondClass.payload.class.id}/applications/${secondClassApply.payload.application.id}`, {
       method: "POST",
       cookie,
-      body: { userId: "20260001", format: "markdown" }
+      body: { teacherId: "20260001", action: "accept" }
     });
-    assert(lessonExport.response.ok && lessonExport.payload.export?.content.includes("牛顿第二定律互动课堂"), "teacher should export lesson markdown");
+    assert(approveSecondClassApply.response.ok && approveSecondClassApply.payload.application?.status === "approved", "teacher should approve the second class join request");
 
-    const pptxExport = await request(`/api/lessons/${generatedLesson.payload.lesson.id}/export`, {
-      method: "POST",
-      cookie,
-      body: { userId: "20260001", format: "pptx" }
+    const multiClassState = await request("/api/state", { cookie: studentCookie });
+    const joinedClassIds = new Set((multiClassState.payload.state.classes || []).map((item) => item.id));
+    assert(joinedClassIds.has(createdClass.payload.class.id) && joinedClassIds.has(secondClass.payload.class.id), "student state should include multiple joined classes");
+    assert(!multiClassState.payload.state.courseMaterials.some((item) => item.id === classPrivateMaterial.payload.material.id), "joining a class should not expose private teacher class materials");
+
+    const leaveSecondClass = await request(`/api/classes/${secondClass.payload.class.id}/students/20260002`, {
+      method: "DELETE",
+      cookie: studentCookie
     });
-    assert(pptxExport.response.ok && pptxExport.payload.export?.fileName.endsWith(".pptx"), "teacher should export lesson pptx");
-    assert(String(pptxExport.payload.export.contentBase64 || "").startsWith("UEs"), "pptx export should return a zip-based pptx payload");
+    assert(leaveSecondClass.response.ok && leaveSecondClass.payload.removed === true, "student should leave one joined class");
+
+    const afterLeaveSecondState = await request("/api/state", { cookie: studentCookie });
+    const afterLeaveClassIds = new Set((afterLeaveSecondState.payload.state.classes || []).map((item) => item.id));
+    assert(afterLeaveClassIds.has(createdClass.payload.class.id) && !afterLeaveClassIds.has(secondClass.payload.class.id), "leaving one class should keep other class memberships");
 
     const submitted = await request(`/api/homework/${homeworkId}/submit`, {
       method: "POST",
@@ -418,12 +871,27 @@ async function main() {
     assert(confirmed.payload.submission.status === "graded", "confirmed grade should become official");
     assert(confirmed.payload.submission.confirmedBy === "20260001", "confirmed grade should record teacher");
 
+    const removeClassStudent = await request(`/api/classes/${createdClass.payload.class.id}/students/20260002`, {
+      method: "DELETE",
+      cookie
+    });
+    assert(removeClassStudent.response.ok && removeClassStudent.payload.removed === true, "teacher should remove a student from their class");
+
+    const afterRemovalTeacherState = await request("/api/state", { cookie });
+    const afterRemovalClass = afterRemovalTeacherState.payload.state.classes.find((item) => item.id === createdClass.payload.class.id);
+    assert(afterRemovalClass && !afterRemovalClass.studentIds.includes("20260002"), "removed student should disappear from teacher class roster");
+
+    const afterRemovalStudentState = await request("/api/state", { cookie: studentCookie });
+    assert(!afterRemovalStudentState.payload.state.classes.some((item) => item.id === createdClass.payload.class.id), "removed student should no longer see the class");
+    assert(!afterRemovalStudentState.payload.state.homework.some((item) => item.id === homeworkId), "removed student should no longer see class homework");
+
     const logout = await request("/api/auth/logout", { method: "POST", cookie, body: {} });
     assert(logout.response.ok && logout.payload.ok, "logout should succeed");
 
     console.log("release smoke test passed");
   } finally {
     child.kill();
+    mockDify.server.close();
     await sleep(300);
     fs.rmSync(tempRoot, { recursive: true, force: true });
     if (stderr.trim()) console.error(stderr.trim());

@@ -1,0 +1,1448 @@
+﻿app:
+  description: 基于《动手学机器学习》知识库的多 RAG 机器学习问答与学习诊断工作流。包含输入清洗、课程知识库检索、错因知识库检索、证据整理、朴素贝叶斯知识点分类、掌握度评分、条件分支、标准解释、诊断反馈、结构化 JSON 输出和项目回调。
+  icon: 🤖
+  icon_background: '#E0F2FE'
+  mode: workflow
+  name: 机器学习知识点问答与学习诊断助手_升级版_多RAG_朴素贝叶斯诊断_0_6_0
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions: []
+      allowed_file_types:
+      - document
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: true
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: start
+        targetType: code
+      id: start-source-input_cleaning
+      source: start
+      sourceHandle: source
+      target: input_cleaning
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: knowledge-retrieval
+      id: input_cleaning-source-course_rag
+      source: input_cleaning
+      sourceHandle: source
+      target: course_rag
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: knowledge-retrieval
+      id: input_cleaning-source-mistake_rag
+      source: input_cleaning
+      sourceHandle: source
+      target: mistake_rag
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: code
+      id: input_cleaning-source-graph_context_http
+      source: input_cleaning
+      sourceHandle: source
+      target: graph_context_http
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: code
+      id: graph_context_http-source-evidence_merge
+      source: graph_context_http
+      sourceHandle: source
+      target: evidence_merge
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: knowledge-retrieval
+        targetType: code
+      id: course_rag-source-evidence_merge
+      source: course_rag
+      sourceHandle: source
+      target: evidence_merge
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: knowledge-retrieval
+        targetType: code
+      id: mistake_rag-source-evidence_merge
+      source: mistake_rag
+      sourceHandle: source
+      target: evidence_merge
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: code
+      id: evidence_merge-source-nb_classifier
+      source: evidence_merge
+      sourceHandle: source
+      target: nb_classifier
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: code
+      id: nb_classifier-source-mastery_scoring
+      source: nb_classifier
+      sourceHandle: source
+      target: mastery_scoring
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: llm
+      id: mastery_scoring-source-llm_standard
+      source: mastery_scoring
+      sourceHandle: source
+      target: llm_standard
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: if-else
+      id: llm_standard-source-mode_branch
+      source: llm_standard
+      sourceHandle: source
+      target: mode_branch
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: mode_branch-true-llm_diagnosis
+      source: mode_branch
+      sourceHandle: 'true'
+      target: llm_diagnosis
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: mode_branch-false-llm_diagnosis
+      source: mode_branch
+      sourceHandle: 'false'
+      target: llm_diagnosis
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: llm_diagnosis-source-json_output
+      source: llm_diagnosis
+      sourceHandle: source
+      target: json_output
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: http-request
+      id: json_output-source-http_callback
+      source: json_output
+      sourceHandle: source
+      target: http_callback
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: http-request
+        targetType: end
+      id: http_callback-source-end
+      source: http_callback
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: 输入机器学习问题、学生自我理解、学习目标、诊断深度和可选项目回流 ID。
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: 机器学习问题
+          max_length: 1200
+          options: []
+          required: true
+          type: paragraph
+          variable: question
+        - label: 学生自我理解
+          max_length: 2500
+          options: []
+          required: false
+          type: paragraph
+          variable: student_answer
+        - label: 学习目标
+          max_length: 48
+          options:
+          - 入门理解
+          - 考试复习
+          - 代码实践
+          - 原理推导
+          required: true
+          type: select
+          variable: target_level
+        - label: 诊断深度
+          max_length: 48
+          options:
+          - 简洁
+          - 标准
+          - 深度
+          required: true
+          type: select
+          variable: diagnosis_depth
+        - label: 学生ID（可选）
+          max_length: 80
+          options: []
+          required: false
+          type: text-input
+          variable: student_id
+        - label: 班级ID（可选）
+          max_length: 80
+          options: []
+          required: false
+          type: text-input
+          variable: class_id
+        - label: 前端会话ID（系统自动传入，可选）
+          max_length: 120
+          options: []
+          required: false
+          type: text-input
+          variable: conversation_id
+        - label: 请求ID（系统自动传入，可选）
+          max_length: 120
+          options: []
+          required: false
+          type: text-input
+          variable: request_id
+        - label: 同步模式（系统自动传入，可选）
+          max_length: 40
+          options: []
+          required: false
+          type: text-input
+          variable: sync_mode
+        - label: 课程（系统自动传入，可选）
+          max_length: 80
+          options: []
+          required: false
+          type: text-input
+          variable: subject
+        - label: 章节（系统自动传入，可选）
+          max_length: 160
+          options: []
+          required: false
+          type: text-input
+          variable: chapter
+        - label: 知识点（系统自动传入，可选）
+          max_length: 160
+          options: []
+          required: false
+          type: text-input
+          variable: knowledge_point
+        - label: 请求用户ID（系统自动传入）
+          max_length: 80
+          options: []
+          required: false
+          type: text-input
+          variable: request_user_id
+        - label: 请求用户角色（系统自动传入）
+          max_length: 40
+          options: []
+          required: false
+          type: text-input
+          variable: request_user_role
+        - label: AI助教任务模式（系统自动传入）
+          max_length: 60
+          options: []
+          required: false
+          type: text-input
+          variable: assistant_task
+        - label: AI助教任务名称（系统自动传入）
+          max_length: 80
+          options: []
+          required: false
+          type: text-input
+          variable: assistant_task_label
+        - label: 项目角色与任务上下文（系统自动传入）
+          max_length: 6000
+          options: []
+          required: false
+          type: paragraph
+          variable: assistant_role_context
+        - label: 图谱ID（系统自动传入，可选）
+          max_length: 120
+          options: []
+          required: false
+          type: text-input
+          variable: graph_id
+        - label: 图谱节点ID（系统自动传入，可选）
+          max_length: 120
+          options: []
+          required: false
+          type: text-input
+          variable: node_id
+        - label: 项目知识图谱查询接口（系统自动传入）
+          max_length: 500
+          options: []
+          required: false
+          type: text-input
+          variable: graph_context_url
+        - label: 项目知识图谱查询令牌（系统自动传入）
+          max_length: 200
+          options: []
+          required: false
+          type: text-input
+          variable: graph_context_token
+        - label: 项目知识图谱上下文（系统自动传入）
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: project_graph_context
+        - label: 项目诊断结果回调接口（系统自动传入）
+          max_length: 500
+          options: []
+          required: false
+          type: text-input
+          variable: callback_url
+        - label: 项目教师端课程资料RAG（系统自动传入）
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: project_rag_context
+        - label: 项目错因题库资料（系统自动传入）
+          max_length: 10000
+          options: []
+          required: false
+          type: paragraph
+          variable: project_misconception_context
+        - label: 项目学生画像与掌握度（系统自动传入）
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: project_mastery_context
+        - label: 项目班级与教学上下文（系统自动传入）
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: project_class_context
+      height: 760
+      id: start
+      position:
+        x: 80
+        y: 280
+      positionAbsolute:
+        x: 80
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 清洗空格、截断超长文本，判断问答模式或诊断模式，抽取候选关键词并生成两个 RAG 查询词。
+        selected: false
+        title: 输入清洗与任务识别_代码节点
+        type: code
+        code: "import json\nimport re\n\nTOPIC_KEYWORDS = {\n    \"机器学习基础\": [\"机器学习\", \"监督学习\", \"无监督学习\", \"强化学习\", \"泛化\", \"归纳偏置\", \"训练集\", \"测试集\"],\n    \"KNN\": [\"KNN\", \"K近邻\", \"最近邻\", \"距离\", \"投票\", \"K值\", \"标准化\"],\n    \"线性回归\": [\"线性回归\", \"平方损失\", \"均方误差\", \"MSE\", \"梯度下降\", \"学习率\"],\n    \"逻辑回归\": [\"逻辑回归\", \"Sigmoid\", \"交叉熵\", \"二分类\", \"精确率\", \"召回率\", \"F1\"],\n    \"SVM\": [\"SVM\", \"支持向量机\", \"支持向量\", \"最大间隔\", \"核函数\", \"C\", \"gamma\"],\n    \"决策树\": [\"决策树\", \"信息增益\", \"基尼\", \"剪枝\", \"CART\", \"ID3\", \"C4.5\"],\n    \"集成学习\": [\"集成学习\", \"随机森林\", \"Bagging\", \"Boosting\", \"GBDT\", \"AdaBoost\"],\n    \"KMeans聚类\": [\"KMeans\", \"K均值\", \"聚类\", \"簇中心\", \"SSE\", \"轮廓系数\"],\n    \"PCA降维\": [\"PCA\", \"主成分\", \"降维\", \"协方差\", \"特征值\", \"解释方差率\"],\n    \"朴素贝叶斯\": [\"朴素贝叶斯\", \"贝叶斯\", \"先验\", \"似然\", \"后验\", \"条件独立\"],\n    \"神经网络\": [\"神经网络\", \"感知机\", \"反向传播\", \"激活函数\", \"ReLU\", \"Dropout\"],\n    \"EM与GMM\": [\"EM\", \"GMM\", \"高斯混合\", \"隐变量\", \"E步\"\
+          , \"M步\"],\n    \"自编码器\": [\"自编码器\", \"编码器\", \"解码器\", \"重构误差\", \"隐表示\"],\n}\n\ndef _text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value, ensure_ascii=False)\n    except Exception:\n        return str(value)\n\ndef _clean(value, limit):\n    value = re.sub(r\"\\s+\", \" \", _text(value)).strip()\n    return value[:limit]\n\ndef _norm_option(value, allowed, default):\n    value = _clean(value, 40)\n    return value if value in allowed else default\n\ndef _extract_keywords(text):\n    lower = text.lower()\n    hits = []\n    for topic, kws in TOPIC_KEYWORDS.items():\n        score = 0\n        for kw in kws:\n            if kw.lower() in lower:\n                score += 1\n                hits.append(kw)\n        if score:\n            hits.append(topic)\n    tokens = re.findall(r\"[A-Za-z][A-Za-z0-9_+#.-]{1,30}\", text)\n    hits.extend(tokens[:8])\n    unique = []\n    seen =\
+          \ set()\n    for item in hits:\n        key = item.lower()\n        if key and key not in seen:\n            seen.add(key)\n            unique.append(item)\n    return unique[:16]\n\ndef main(question: str, student_answer: str = \"\", target_level: str = \"考试复习\", diagnosis_depth: str = \"标准\", student_id: str = \"\", class_id: str = \"\", conversation_id: str = \"\", request_id: str = \"\", sync_mode: str = \"\", assistant_task: str = \"qa\") -> dict:\n    question_clean = _clean(question, 1200)\n    student_answer_clean = _clean(student_answer, 2500)\n    target_level_norm = _norm_option(target_level, [\"入门理解\", \"考试复习\", \"代码实践\", \"原理推导\"], \"考试复习\")\n    diagnosis_depth_norm = _norm_option(diagnosis_depth, [\"简洁\", \"标准\", \"深度\"], \"标准\")\n    student_id_clean = _clean(student_id, 80)\n    class_id_clean = _clean(class_id, 80)\n    conversation_id_clean = _clean(conversation_id, 120)\n    request_id_clean = _clean(request_id, 120)\n    sync_mode_clean = _clean(sync_mode, 40)\n    assistant_task_clean = _clean(assistant_task, 40) or \"qa\"\n\n    has_answer = bool(student_answer_clean)\n    diagnosis_mode = \"学习诊断模式\" if has_answer else \"知识问答模式\"\n    task_hints = {\n        \"qa\": \"课程问答 资料依据 概念解释\",\n        \"explain\": \"分层讲解 原理 例子 易错点\",\n        \"guided\": \"提示 追问 前置知识 引导\",\n        \"practice\": \"题库 练习 标准答案 答案解析\",\n        \"grade\": \"评分标准 错因标签 缺漏点 批改建议\",\n        \"plan\": \"学习路径 教学设计 学情分析 分层补救\",\n    }\n    task_hint = task_hints.get(assistant_task_clean, \"课程问答 资料依据\")\n    keywords = _extract_keywords(question_clean + \" \" + student_answer_clean + \" \" + task_hint)\n    keyword_text = \" \".join(keywords)\n\n    rag_query = f\"\
+          {question_clean} {keyword_text} 学习目标:{target_level_norm} 任务:{assistant_task_clean} {task_hint}\".strip()\n    if has_answer:\n        rag_query = f\"{rag_query} 学生理解摘要:{student_answer_clean[:220]}\"\n    misconception_query = f\"常见误区 易混淆 评分标准 错因标签 {task_hint} {question_clean} {keyword_text} {student_answer_clean[:260]}\".strip()\n\n    return {\n        \"question_clean\": question_clean,\n        \"student_answer_clean\": student_answer_clean,\n        \"target_level_norm\": target_level_norm,\n        \"diagnosis_depth_norm\": diagnosis_depth_norm,\n        \"diagnosis_mode\": diagnosis_mode,\n        \"has_student_answer\": \"true\" if has_answer else \"false\",\n        \"candidate_keywords\": json.dumps(keywords, ensure_ascii=False),\n        \"rag_query\": rag_query[:1500],\n        \"misconception_query\": misconception_query[:1500],\n        \"student_id_clean\": student_id_clean,\n        \"class_id_clean\": class_id_clean,\n        \"conversation_id_clean\": conversation_id_clean,\n        \"request_id_clean\": request_id_clean,\n        \"sync_mode_clean\": sync_mode_clean,\n    }"
+        code_language: python3
+        outputs:
+          question_clean:
+            children: null
+            type: string
+          student_answer_clean:
+            children: null
+            type: string
+          target_level_norm:
+            children: null
+            type: string
+          diagnosis_depth_norm:
+            children: null
+            type: string
+          diagnosis_mode:
+            children: null
+            type: string
+          has_student_answer:
+            children: null
+            type: string
+          candidate_keywords:
+            children: null
+            type: string
+          rag_query:
+            children: null
+            type: string
+          misconception_query:
+            children: null
+            type: string
+          student_id_clean:
+            children: null
+            type: string
+          class_id_clean:
+            children: null
+            type: string
+          conversation_id_clean:
+            children: null
+            type: string
+          request_id_clean:
+            children: null
+            type: string
+          sync_mode_clean:
+            children: null
+            type: string
+        variables:
+        - value_selector:
+          - start
+          - question
+          variable: question
+        - value_selector:
+          - start
+          - student_answer
+          variable: student_answer
+        - value_selector:
+          - start
+          - target_level
+          variable: target_level
+        - value_selector:
+          - start
+          - diagnosis_depth
+          variable: diagnosis_depth
+        - value_selector:
+          - start
+          - student_id
+          variable: student_id
+        - value_selector:
+          - start
+          - class_id
+          variable: class_id
+        - value_selector:
+          - start
+          - conversation_id
+          variable: conversation_id
+        - value_selector:
+          - start
+          - request_id
+          variable: request_id
+        - value_selector:
+          - start
+          - sync_mode
+          variable: sync_mode
+        - value_selector:
+          - start
+          - assistant_task
+          variable: assistant_task
+      height: 92
+      id: input_cleaning
+      position:
+        x: 390
+        y: 280
+      positionAbsolute:
+        x: 390
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 导入后在此节点绑定课程知识库，建议包含 ml_keypoints.md 和 ml_quiz_bank.md。dataset_ids 需在 Dify 中手动选择。
+        selected: false
+        title: 课程知识库检索_RAG
+        type: knowledge-retrieval
+        dataset_ids: []
+        multiple_retrieval_config:
+          reranking_enable: false
+          reranking_mode: reranking_model
+          reranking_model:
+            model: ''
+            provider: ''
+          score_threshold: 0.35
+          top_k: 5
+        query_variable_selector:
+        - input_cleaning
+        - rag_query
+        retrieval_mode: multiple
+      height: 92
+      id: course_rag
+      position:
+        x: 700
+        y: 205
+      positionAbsolute:
+        x: 700
+        y: 205
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 导入后在此节点绑定错因知识库，建议包含 ml_misconceptions.md，也可加入评分细则和历年错题。
+        selected: false
+        title: 错因知识库检索_RAG
+        type: knowledge-retrieval
+        dataset_ids: []
+        multiple_retrieval_config:
+          reranking_enable: false
+          reranking_mode: reranking_model
+          reranking_model:
+            model: ''
+            provider: ''
+          score_threshold: 0.3
+          top_k: 5
+        query_variable_selector:
+        - input_cleaning
+        - misconception_query
+        retrieval_mode: multiple
+      height: 92
+      id: mistake_rag
+      position:
+        x: 700
+        y: 380
+      positionAbsolute:
+        x: 700
+        y: 380
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 从开始节点已传入的项目上下文中构造项目知识图谱证据，返回与原 HTTP 节点兼容的 body，避免测试运行未传 graph_context_url 时出现 url is required，也避免本地地址触发 Dify SSRF 拦截。
+        selected: false
+        title: 项目知识图谱数据库_代码节点
+        type: code
+        code: |
+          import json
+          import re
+
+          def _text(value):
+              if value is None:
+                  return ""
+              if isinstance(value, str):
+                  return value.strip()
+              try:
+                  return json.dumps(value, ensure_ascii=False)
+              except Exception:
+                  return str(value).strip()
+
+          def _context_docs(label, value, limit=3):
+              text = _text(value)
+              if not text:
+                  return []
+              chunks = [p.strip() for p in re.split(r"\n\s*\n|(?<=。)\s*", text) if p.strip()]
+              docs = []
+              for index, chunk in enumerate(chunks[:limit], 1):
+                  docs.append({
+                      "title": f"{label}{index}",
+                      "content": chunk[:900],
+                      "score": max(0.1, 0.72 - (index - 1) * 0.05),
+                      "source": "project-knowledge-graph-context",
+                      "source_type": "项目知识图谱数据库",
+                  })
+              return docs
+
+          def _graph_docs(value, limit=8):
+              text = _text(value)
+              if not text:
+                  return []
+              try:
+                  payload = json.loads(text)
+              except Exception:
+                  return _context_docs("项目知识图谱上下文", text, min(limit, 3))
+              if isinstance(payload, dict):
+                  for key in ["documents", "result", "records", "data"]:
+                      if isinstance(payload.get(key), list):
+                          payload = payload[key]
+                          break
+                  else:
+                      payload = [payload]
+              if not isinstance(payload, list):
+                  return []
+              docs = []
+              for index, item in enumerate(payload[:limit], 1):
+                  if isinstance(item, dict):
+                      content = _text(item.get("content") or item.get("text") or item.get("quote") or item)
+                      title = _text(item.get("title") or item.get("nodeLabel") or item.get("sourceName") or f"项目知识图谱节点{index}")
+                      try:
+                          score = float(item.get("score") or item.get("similarity") or 0.75)
+                      except Exception:
+                          score = 0.75
+                      source_type = _text(item.get("source_type") or item.get("sourceType") or "项目知识图谱数据库")
+                      if source_type == "project_knowledge_graph":
+                          source_type = "项目知识图谱数据库"
+                      docs.append({
+                          "title": title,
+                          "content": content[:900],
+                          "score": score,
+                          "source": "project-knowledge-graph-context",
+                          "source_type": source_type,
+                          "graphId": _text(item.get("graphId") or item.get("graph_id")),
+                          "nodeId": _text(item.get("nodeId") or item.get("node_id")),
+                      })
+                  else:
+                      docs.append({
+                          "title": f"项目知识图谱节点{index}",
+                          "content": _text(item)[:900],
+                          "score": 0.75,
+                          "source": "project-knowledge-graph-context",
+                          "source_type": "项目知识图谱数据库",
+                      })
+              return [doc for doc in docs if doc.get("content")]
+
+          def main(
+              question="",
+              request_user_id="",
+              request_user_role="",
+              subject="",
+              chapter="",
+              knowledge_point="",
+              graph_id="",
+              node_id="",
+              project_graph_context="",
+              assistant_role_context="",
+              project_mastery_context="",
+              project_class_context="",
+          ) -> dict:
+              docs = _graph_docs(project_graph_context, 8)
+              summary_parts = []
+              for label, value in [
+                  ("用户", request_user_id),
+                  ("角色", request_user_role),
+                  ("学科", subject),
+                  ("章节", chapter),
+                  ("知识点", knowledge_point),
+                  ("图谱ID", graph_id),
+                  ("节点ID", node_id),
+                  ("问题", question),
+              ]:
+                  text = _text(value)
+                  if text:
+                      summary_parts.append(f"{label}: {text}")
+              has_project_graph_hint = any([
+                  _text(graph_id),
+                  _text(node_id),
+                  _text(chapter),
+                  _text(knowledge_point),
+                  _text(project_graph_context),
+                  _text(project_mastery_context),
+                  _text(project_class_context),
+                  _text(assistant_role_context),
+              ])
+              if summary_parts and has_project_graph_hint:
+                  docs.append({
+                      "title": "项目知识图谱查询上下文",
+                      "content": "；".join(summary_parts),
+                      "score": 0.62,
+                      "source": "project-knowledge-graph-context",
+                      "source_type": "项目知识图谱数据库",
+                  })
+
+              docs.extend(_context_docs("项目学生画像与掌握度", project_mastery_context, 2))
+              docs.extend(_context_docs("项目班级与教学上下文", project_class_context, 2))
+              docs.extend(_context_docs("项目角色与任务上下文", assistant_role_context, 2))
+
+              payload = {
+                  "ok": True,
+                  "source": "project-knowledge-graph-context",
+                  "request_user_id": _text(request_user_id),
+                  "graph_id": _text(graph_id),
+                  "node_id": _text(node_id),
+                  "documents": docs[:8],
+              }
+              return {
+                  "status_code": 200,
+                  "body": json.dumps(payload, ensure_ascii=False),
+              }
+        code_language: python3
+        outputs:
+          body:
+            children: null
+            type: string
+          status_code:
+            children: null
+            type: number
+        variables:
+        - value_selector:
+          - input_cleaning
+          - question_clean
+          variable: question
+        - value_selector:
+          - start
+          - request_user_id
+          variable: request_user_id
+        - value_selector:
+          - start
+          - request_user_role
+          variable: request_user_role
+        - value_selector:
+          - start
+          - subject
+          variable: subject
+        - value_selector:
+          - start
+          - chapter
+          variable: chapter
+        - value_selector:
+          - start
+          - knowledge_point
+          variable: knowledge_point
+        - value_selector:
+          - start
+          - graph_id
+          variable: graph_id
+        - value_selector:
+          - start
+          - node_id
+          variable: node_id
+        - value_selector:
+          - start
+          - project_graph_context
+          variable: project_graph_context
+        - value_selector:
+          - start
+          - assistant_role_context
+          variable: assistant_role_context
+        - value_selector:
+          - start
+          - project_mastery_context
+          variable: project_mastery_context
+        - value_selector:
+          - start
+          - project_class_context
+          variable: project_class_context
+      height: 92
+      id: graph_context_http
+      position:
+        x: 700
+        y: 580
+      positionAbsolute:
+        x: 700
+        y: 580
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 合并课程知识库和错因知识库结果，去重后保留前 3-5 条证据，输出 evidence_summary 和 citation_items。
+        selected: false
+        title: RAG片段去重与证据整理_代码节点
+        type: code
+        code: "import json\nimport re\n\ndef _as_text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value, ensure_ascii=False)\n    except Exception:\n        return str(value)\n\ndef _load(value):\n    if isinstance(value, (list, dict)):\n        return value\n    text = _as_text(value).strip()\n    if not text:\n        return []\n    try:\n        return json.loads(text)\n    except Exception:\n        return text\n\ndef _docs(value, source_type):\n    value = _load(value)\n    docs = []\n    if isinstance(value, dict):\n        for key in [\"documents\", \"result\", \"records\", \"data\"]:\n            if isinstance(value.get(key), list):\n                value = value[key]\n                break\n        else:\n            value = [value]\n    if isinstance(value, list):\n        for i, item in enumerate(value):\n            if isinstance(item, dict):\n                metadata = item.get(\"\
+          metadata\") or {}\n                segment = item.get(\"segment\") or {}\n                content = (\n                    item.get(\"content\")\n                    or item.get(\"text\")\n                    or item.get(\"page_content\")\n                    or segment.get(\"content\")\n                    or metadata.get(\"content\")\n                    or _as_text(item)\n                )\n                title = item.get(\"title\") or item.get(\"nodeLabel\") or metadata.get(\"document_name\") or metadata.get(\"source\") or segment.get(\"document\", {}).get(\"name\") or source_type\n                score = item.get(\"score\") or item.get(\"similarity\") or item.get(\"rerank_score\") or 0\n            else:\n                content = _as_text(item)\n                title = source_type\n                score = 0\n            docs.append({\"content\": _as_text(content), \"title\": _as_text(title), \"score\": float(score or 0), \"source_type\": source_type, \"idx\": i + 1})\n    else:\n        parts = [p.strip()\
+          \ for p in re.split(r\"\\n\\s*\\n\", _as_text(value)) if p.strip()]\n        for i, part in enumerate(parts[:8]):\n            docs.append({\"content\": part, \"title\": source_type, \"score\": 0, \"source_type\": source_type, \"idx\": i + 1})\n    return docs\n\ndef _key(text):\n    text = re.sub(r\"\\s+\", \"\", text.lower())\n    return text[:120]\n\ndef main(course_context=\"\", misconception_context=\"\", project_course_context=\"\", project_misconception_context=\"\", graph_db_context=\"\") -> dict:\n    all_docs = _docs(graph_db_context, \"Project knowledge graph database\") + _docs(project_course_context, \"Project course materials\") + _docs(project_misconception_context, \"Project misconception bank\") + _docs(course_context, \"Dify course knowledge base\") + _docs(misconception_context, \"Dify misconception knowledge base\")\n    seen = set()\n    deduped = []\n    for doc in all_docs:\n        content = re.sub(r\"\\s+\", \" \", doc[\"content\"]).strip()\n        if not content:\n            continue\n        key = _key(content)\n        if key in seen:\n            continue\n        seen.add(key)\n        doc[\"content\"] = content[:650]\n        deduped.append(doc)\n    deduped.sort(key=lambda x: (x[\"score\"], len(x[\"content\"])), reverse=True)\n    selected = deduped[:5]\n    citations = []\n\
+          \    lines = []\n    for i, doc in enumerate(selected, 1):\n        item = {\n            \"id\": f\"E{i}\",\n            \"source\": doc[\"source_type\"],\n            \"title\": doc[\"title\"],\n            \"score\": round(doc[\"score\"], 4),\n            \"content\": doc[\"content\"],\n        }\n        citations.append(item)\n        lines.append(f\"[E{i}] {doc['source_type']}｜{doc['title']}｜{doc['content']}\")\n    evidence_summary = \"\\n\".join(lines) if lines else \"未检索到足够证据。请确认教师端已上传并发布课程资料，或在 Dify 中绑定课程知识库、题库和错因知识库。\"\n    return {\n        \"evidence_summary\": evidence_summary,\n        \"citation_items\": json.dumps(citations, ensure_ascii=False),\n        \"evidence_count\": len(citations),\n    }"
+        code_language: python3
+        outputs:
+          evidence_summary:
+            children: null
+            type: string
+          citation_items:
+            children: null
+            type: string
+          evidence_count:
+            children: null
+            type: number
+        variables:
+        - value_selector:
+          - course_rag
+          - result
+          variable: course_context
+        - value_selector:
+          - mistake_rag
+          - result
+          variable: misconception_context
+        - value_selector:
+          - start
+          - project_rag_context
+          variable: project_course_context
+        - value_selector:
+          - start
+          - project_misconception_context
+          variable: project_misconception_context
+        - value_selector:
+          - graph_context_http
+          - body
+          variable: graph_db_context
+      height: 92
+      id: evidence_merge
+      position:
+        x: 1010
+        y: 280
+      positionAbsolute:
+        x: 1010
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 使用多项式朴素贝叶斯 + 关键词特征，对问题、学生回答和 RAG 证据进行知识点分类，输出概率和 Top3 候选。
+        selected: false
+        title: 朴素贝叶斯知识点分类_代码节点
+        type: code
+        code: "import json\nimport math\nimport re\n\nTOPIC_KEYWORDS = {\n    \"机器学习基础\": [\"机器学习\", \"监督学习\", \"无监督学习\", \"强化学习\", \"泛化\", \"归纳偏置\", \"训练集\", \"测试集\"],\n    \"数学基础\": [\"向量\", \"矩阵\", \"梯度\", \"凸函数\", \"范数\", \"内积\", \"协方差\", \"优化\"],\n    \"KNN\": [\"KNN\", \"K近邻\", \"最近邻\", \"距离\", \"投票\", \"回归平均\", \"标准化\", \"K值\"],\n    \"线性回归\": [\"线性回归\", \"平方损失\", \"均方误差\", \"MSE\", \"正规方程\", \"梯度下降\", \"学习率\"],\n    \"过拟合与泛化\": [\"过拟合\", \"欠拟合\", \"泛化\", \"正则化\", \"L1\", \"L2\", \"验证集\", \"交叉验证\", \"数据泄漏\"],\n    \"逻辑回归\": [\"逻辑回归\", \"逻辑斯谛\", \"Sigmoid\", \"二分类\", \"交叉熵\", \"最大似然\", \"精确率\", \"召回率\", \"F1\"],\n    \"矩阵分解与推荐\": [\"矩阵分解\", \"推荐\", \"隐因子\", \"用户向量\", \"物品向量\", \"评分预测\", \"冷启动\"],\n    \"神经网络\": [\"神经网络\", \"感知机\", \"多层感知机\", \"隐藏层\", \"激活函数\", \"反向传播\", \"ReLU\", \"Dropout\"],\n    \"卷积神经网络\": [\"CNN\", \"卷积\", \"卷积核\", \"特征图\", \"池化\", \"padding\", \"stride\", \"权值共享\"],\n    \"循环神经网络\": [\"RNN\", \"GRU\", \"LSTM\", \"序列\", \"隐藏状态\", \"时间步\", \"门控\", \"梯度消失\"],\n\
+          \    \"支持向量机\": [\"SVM\", \"支持向量机\", \"支持向量\", \"最大间隔\", \"软间隔\", \"核函数\", \"C\", \"gamma\"],\n    \"决策树\": [\"决策树\", \"ID3\", \"C4.5\", \"CART\", \"信息增益\", \"增益率\", \"基尼\", \"剪枝\"],\n    \"集成学习\": [\"集成学习\", \"Bagging\", \"随机森林\", \"Boosting\", \"AdaBoost\", \"GBDT\", \"残差\", \"负梯度\"],\n    \"KMeans聚类\": [\"KMeans\", \"K均值\", \"聚类\", \"簇\", \"簇中心\", \"SSE\", \"肘部法\", \"轮廓系数\", \"KMeans++\"],\n    \"PCA降维\": [\"PCA\", \"主成分\", \"降维\", \"方差\", \"协方差\", \"特征值\", \"特征向量\", \"解释方差率\"],\n    \"朴素贝叶斯\": [\"朴素贝叶斯\", \"贝叶斯\", \"先验\", \"似然\", \"后验\", \"条件独立\", \"拉普拉斯平滑\", \"文本分类\"],\n    \"EM与GMM\": [\"EM\", \"GMM\", \"高斯混合\", \"隐变量\", \"E步\", \"M步\", \"似然\", \"软聚类\"],\n    \"自编码器\": [\"自编码器\", \"编码器\", \"解码器\", \"隐表示\", \"重构误差\", \"异常检测\"],\n}\n\nVOCAB = sorted({kw.lower() for kws in TOPIC_KEYWORDS.values() for kw in kws})\n\ndef _text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value, ensure_ascii=False)\n\
+          \    except Exception:\n        return str(value)\n\ndef _feature_counts(text):\n    lower = _text(text).lower()\n    counts = {}\n    for token in VOCAB:\n        c = lower.count(token)\n        if c:\n            counts[token] = c\n    for token in re.findall(r\"[A-Za-z][A-Za-z0-9_+#.-]{1,30}\", lower):\n        if token in VOCAB:\n            counts[token] = counts.get(token, 0) + 1\n    return counts\n\ndef _softmax(log_scores):\n    top = max(log_scores.values())\n    exp_scores = {k: math.exp(v - top) for k, v in log_scores.items()}\n    total = sum(exp_scores.values()) or 1.0\n    return {k: v / total for k, v in exp_scores.items()}\n\ndef main(question_clean: str, student_answer_clean: str = \"\", evidence_summary: str = \"\", diagnosis_mode: str = \"知识问答模式\", knowledge_point_hint: str = \"\") -> dict:\n    hint = _text(knowledge_point_hint).strip()\n    text = f\"{question_clean}\\n{student_answer_clean}\\n{hint}\\n{_text(evidence_summary)[:1500]}\"\n    observed = _feature_counts(text)\n    class_count = len(TOPIC_KEYWORDS)\n    alpha = 0.35\n    log_scores\
+          \ = {}\n    for topic, kws in TOPIC_KEYWORDS.items():\n        class_tokens = [kw.lower() for kw in kws]\n        total = len(class_tokens) + alpha * len(VOCAB)\n        logp = math.log(1.0 / class_count)\n        for token, count in observed.items():\n            token_count = class_tokens.count(token)\n            logp += count * math.log((token_count + alpha) / total)\n        if topic.lower() in text.lower():\n            logp += 1.25\n        if hint and (hint == topic or hint.lower() in [kw.lower() for kw in kws]):\n            logp += 2.2\n        log_scores[topic] = logp\n    probs = _softmax(log_scores)\n    ranked = sorted(probs.items(), key=lambda x: x[1], reverse=True)\n    if not observed:\n        ranked = [(\"机器学习基础\", 0.35)] + [(t, p) for t, p in ranked if t != \"机器学习基础\"][:2]\n    topic_label = ranked[0][0]\n    probability = round(float(ranked[0][1]), 4)\n    top3 = [{\"topic\": t, \"probability\": round(float(p), 4)} for t, p in ranked[:3]]\n    return {\n        \"topic_label\": topic_label,\n        \"topic_probability\": probability,\n        \"top_topic_candidates\"\
+          : json.dumps(top3, ensure_ascii=False),\n        \"diagnosis_mode\": diagnosis_mode,\n    }"
+        code_language: python3
+        outputs:
+          topic_label:
+            children: null
+            type: string
+          topic_probability:
+            children: null
+            type: number
+          top_topic_candidates:
+            children: null
+            type: string
+          diagnosis_mode:
+            children: null
+            type: string
+        variables:
+        - value_selector:
+          - input_cleaning
+          - question_clean
+          variable: question_clean
+        - value_selector:
+          - input_cleaning
+          - student_answer_clean
+          variable: student_answer_clean
+        - value_selector:
+          - evidence_merge
+          - evidence_summary
+          variable: evidence_summary
+        - value_selector:
+          - input_cleaning
+          - diagnosis_mode
+          variable: diagnosis_mode
+        - value_selector:
+          - start
+          - knowledge_point
+          variable: knowledge_point_hint
+      height: 92
+      id: nb_classifier
+      position:
+        x: 1320
+        y: 280
+      positionAbsolute:
+        x: 1320
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 根据回答长度、关键词覆盖、RAG 证据匹配、公式/流程/场景/指标和错因扣分输出掌握度。
+        selected: false
+        title: 掌握度评分_代码节点
+        type: code
+        code: "import json\nimport re\n\nTOPIC_KEYWORDS = {\n    \"KNN\": [\"KNN\", \"K近邻\", \"距离\", \"最近邻\", \"投票\", \"平均\", \"标准化\", \"K值\"],\n    \"线性回归\": [\"线性回归\", \"平方损失\", \"均方误差\", \"MSE\", \"梯度下降\", \"学习率\", \"解析解\"],\n    \"逻辑回归\": [\"逻辑回归\", \"Sigmoid\", \"二分类\", \"交叉熵\", \"概率\", \"阈值\", \"精确率\", \"召回率\"],\n    \"支持向量机\": [\"SVM\", \"支持向量\", \"最大间隔\", \"软间隔\", \"核函数\", \"C\", \"gamma\"],\n    \"决策树\": [\"决策树\", \"信息增益\", \"基尼\", \"剪枝\", \"CART\", \"树深度\"],\n    \"集成学习\": [\"随机森林\", \"Bagging\", \"Boosting\", \"GBDT\", \"残差\", \"负梯度\"],\n    \"KMeans聚类\": [\"KMeans\", \"K均值\", \"聚类\", \"簇中心\", \"SSE\", \"迭代\", \"轮廓系数\"],\n    \"PCA降维\": [\"PCA\", \"主成分\", \"降维\", \"方差\", \"协方差\", \"特征值\", \"解释方差率\"],\n    \"朴素贝叶斯\": [\"朴素贝叶斯\", \"先验\", \"似然\", \"后验\", \"条件独立\", \"平滑\"],\n}\n\nFORMULA_TERMS = [\"目标\", \"损失\", \"函数\", \"最小化\", \"最大化\", \"MSE\", \"SSE\", \"交叉熵\", \"似然\", \"间隔\", \"方差\", \"概率\"]\nPROCESS_TERMS = [\"步骤\", \"流程\", \"初始化\", \"训练\", \"预测\", \"更新\", \"迭代\", \"分配\", \"\
+          反向传播\", \"梯度下降\"]\nSCENARIO_TERMS = [\"适合\", \"场景\", \"优点\", \"缺点\", \"局限\", \"用于\", \"当\", \"如果\"]\nMETRIC_TERMS = [\"准确率\", \"精确率\", \"召回率\", \"F1\", \"AUC\", \"MSE\", \"RMSE\", \"MAE\", \"轮廓系数\", \"SSE\"]\nPREPROCESS_TERMS = [\"标准化\", \"归一化\", \"缺失值\", \"类别不平衡\", \"数据泄漏\", \"尺度\", \"量纲\"]\n\ndef _text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value, ensure_ascii=False)\n    except Exception:\n        return str(value)\n\ndef _has_any(text, terms):\n    return any(term.lower() in text.lower() for term in terms)\n\ndef _coverage(answer, topic):\n    kws = TOPIC_KEYWORDS.get(topic, [])\n    if not kws:\n        kws = []\n    matched = [kw for kw in kws if kw.lower() in answer.lower()]\n    return matched, (len(matched) / max(len(kws), 1))\n\ndef _level(score):\n    if score <= 0:\n        return \"未诊断\"\n    if score < 45:\n        return \"薄弱\"\n    if score < 65:\n        return\
+          \ \"基本理解\"\n    if score < 85:\n        return \"较好掌握\"\n    return \"熟练掌握\"\n\ndef main(question_clean: str, student_answer_clean: str = \"\", topic_label: str = \"机器学习基础\", evidence_summary: str = \"\", target_level_norm: str = \"考试复习\", diagnosis_mode: str = \"知识问答模式\", project_mastery_context: str = \"\") -> dict:\n    answer = _text(student_answer_clean).strip()\n    question = _text(question_clean)\n    topic = _text(topic_label) or \"机器学习基础\"\n    try:\n        mastery_ctx = json.loads(_text(project_mastery_context) or \"{}\")\n    except Exception:\n        mastery_ctx = {}\n    profile_mastery = mastery_ctx.get(\"mastery\") if isinstance(mastery_ctx, dict) else {}\n    topic_profile = profile_mastery.get(topic) if isinstance(profile_mastery, dict) else {}\n    if not answer:\n        raw_profile_score = topic_profile.get(\"score\") if isinstance(topic_profile, dict) else None\n        if raw_profile_score is not None:\n            try:\n                profile_score = float(raw_profile_score)\n                score = int(round(profile_score * 100 if profile_score <= 1 else profile_score))\n                score = max(0, min(100, score))\n            except Exception:\n                score = 0\n            level = _text(topic_profile.get(\"status\") if isinstance(topic_profile, dict) else \"\") or _level(score)\n            missing = [\"未提供本轮学生自我理解，当前掌握度来自项目学习画像。\"]\n            return {\n                \"mastery_score\": score,\n                \"mastery_level\": level,\n                \"error_tags\": json.dumps([], ensure_ascii=False),\n                \"missing_points\": json.dumps(missing, ensure_ascii=False),\n                \"positive_points\": json.dumps([\"已读取项目学习画像和历史掌握度\"], ensure_ascii=False),\n                \"project_sync_suggestion\": \"已按 student_id 读取项目 learningProfiles，本轮仅保存问答记录。\",\n            }\n        missing = [\"未提供学生自我理解，且项目中暂无该知识点历史掌握度，当前仅生成标准解释。\"]\n        return {\n            \"mastery_score\": 0,\n            \"mastery_level\": \"未诊断\",\n            \"error_tags\": json.dumps([], ensure_ascii=False),\n            \"missing_points\": json.dumps(missing, ensure_ascii=False),\n            \"positive_points\": json.dumps([], ensure_ascii=False),\n            \"project_sync_suggestion\": \"未提供 student_answer 且无历史掌握度，建议仅保存问答记录。\",\n        }\n\n    matched, coverage = _coverage(answer, topic)\n    score = 28\n    score += min(len(answer) / 10, 22)\n \
+          \   score += coverage * 26\n\n    dimensions = {\n        \"公式/目标函数\": _has_any(answer, FORMULA_TERMS),\n        \"算法流程\": _has_any(answer, PROCESS_TERMS),\n        \"适用场景\": _has_any(answer, SCENARIO_TERMS),\n        \"评价指标\": _has_any(answer, METRIC_TERMS),\n    }\n    if topic in [\"KNN\", \"KMeans聚类\", \"PCA降维\", \"支持向量机\"]:\n        dimensions[\"数据预处理\"] = _has_any(answer, PREPROCESS_TERMS)\n    score += sum(6 for ok in dimensions.values() if ok)\n\n    errors = []\n    combined = f\"{question}\\n{answer}\"\n    if topic == \"KMeans聚类\" and \"分类\" in answer and \"无监督\" not in answer:\n        errors.append(\"概念混淆\")\n        errors.append(\"任务类型错误\")\n    if topic == \"KNN\" and \"聚类\" in answer and \"监督\" not in answer:\n        errors.append(\"概念混淆\")\n    if topic == \"逻辑回归\" and \"连续\" in answer and \"分类\" not in answer:\n        errors.append(\"任务类型错误\")\n    if topic == \"PCA降维\" and \"标签\" in answer and \"无监督\" not in answer:\n        errors.append(\"任务类型错误\")\n   \
+          \ if topic != \"KNN\" and not dimensions[\"公式/目标函数\"]:\n        errors.append(\"公式目标缺失\")\n    if not dimensions[\"算法流程\"] and target_level_norm in [\"考试复习\", \"代码实践\", \"原理推导\"]:\n        errors.append(\"算法流程缺失\")\n    if not dimensions[\"评价指标\"] and target_level_norm in [\"考试复习\", \"代码实践\"]:\n        errors.append(\"评价指标误用\")\n    if \"测试集\" in combined and \"调参\" in combined:\n        errors.append(\"数据泄漏\")\n    if topic in [\"KNN\", \"KMeans聚类\", \"PCA降维\", \"支持向量机\"] and not dimensions.get(\"数据预处理\", True):\n        errors.append(\"数据预处理缺失\")\n\n    unique_errors = []\n    for item in errors:\n        if item not in unique_errors:\n            unique_errors.append(item)\n    score -= len(unique_errors) * 6\n    score = int(max(0, min(100, round(score))))\n\n    missing = []\n    for name, ok in dimensions.items():\n        if not ok:\n            missing.append(f\"缺少{name}说明\")\n    if coverage < 0.35:\n        missing.append(\"关键词覆盖不足\")\n    if not missing:\n        missing.append(\"\
+          可继续补充公式推导或代码实现细节\")\n\n    positives = []\n    if matched:\n        positives.append(\"已覆盖关键词：\" + \"、\".join(matched[:8]))\n    for name, ok in dimensions.items():\n        if ok:\n            positives.append(f\"已提到{name}\")\n\n    sync_suggestion = \"建议写入 conversations，并根据错因标签生成 wrongNotes。\"\n    if score >= 85:\n        sync_suggestion = \"建议更新 learningProfiles 为较高掌握度，可不加入错题本。\"\n    elif unique_errors:\n        sync_suggestion = \"建议写入 wrongNotes，并在学习画像中降低对应知识点掌握度。\"\n\n    return {\n        \"mastery_score\": score,\n        \"mastery_level\": _level(score),\n        \"error_tags\": json.dumps(unique_errors, ensure_ascii=False),\n        \"missing_points\": json.dumps(missing, ensure_ascii=False),\n        \"positive_points\": json.dumps(positives, ensure_ascii=False),\n        \"project_sync_suggestion\": sync_suggestion,\n    }"
+        code_language: python3
+        outputs:
+          mastery_score:
+            children: null
+            type: number
+          mastery_level:
+            children: null
+            type: string
+          error_tags:
+            children: null
+            type: string
+          missing_points:
+            children: null
+            type: string
+          positive_points:
+            children: null
+            type: string
+          project_sync_suggestion:
+            children: null
+            type: string
+        variables:
+        - value_selector:
+          - input_cleaning
+          - question_clean
+          variable: question_clean
+        - value_selector:
+          - input_cleaning
+          - student_answer_clean
+          variable: student_answer_clean
+        - value_selector:
+          - nb_classifier
+          - topic_label
+          variable: topic_label
+        - value_selector:
+          - evidence_merge
+          - evidence_summary
+          variable: evidence_summary
+        - value_selector:
+          - input_cleaning
+          - target_level_norm
+          variable: target_level_norm
+        - value_selector:
+          - input_cleaning
+          - diagnosis_mode
+          variable: diagnosis_mode
+        - value_selector:
+          - start
+          - project_mastery_context
+          variable: project_mastery_context
+      height: 92
+      id: mastery_scoring
+      position:
+        x: 1630
+        y: 280
+      positionAbsolute:
+        x: 1630
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 专门生成基于 RAG 的标准答案，不混入学生评价。
+        selected: false
+        title: LLM标准解释节点
+        type: llm
+        context:
+          enabled: true
+          variable_selector:
+          - evidence_merge
+          - evidence_summary
+        model:
+          completion_params:
+            temperature: 0.25
+          mode: chat
+          name: qwen2.5:7b
+          provider: langgenius/ollama/ollama
+        prompt_template:
+        - id: system-prompt
+          role: system
+          text: 你是接入智慧教育项目系统的机器学习课程 AI 助教。请只生成标准解释、教学参考或任务结果，不评价学生掌握度。必须优先依据项目课程资料、知识图谱和 RAG 证据；证据不足时说明“知识库依据不足，以下为课程通用解释”。回答要适配请求用户角色、AI 助教任务、学习目标和诊断深度：教师端侧重备课、出题、批改依据和学情建议；学生端侧重概念理解、练习、提示和复习路径。
+        - id: user-prompt
+          role: user
+          text: '【用户原始查询】
+
+            {{#start.question#}}
+
+
+            【Dify检查标识】sys.query
+
+
+            【清洗后的问题】
+
+            {{#input_cleaning.question_clean#}}
+
+
+            【学习目标】{{#input_cleaning.target_level_norm#}}
+
+            【诊断深度】{{#input_cleaning.diagnosis_depth_norm#}}
+
+            【请求用户】{{#start.request_user_role#}} / {{#start.request_user_id#}}
+
+            【AI助教任务】{{#start.assistant_task#}} / {{#start.assistant_task_label#}}
+
+            【项目角色与任务上下文】
+
+            {{#start.assistant_role_context#}}
+
+            【项目班级与教学上下文】
+
+            {{#start.project_class_context#}}
+
+            【知识点分类】{{#nb_classifier.topic_label#}}，置信度 {{#nb_classifier.topic_probability#}}
+
+
+            【RAG证据】
+
+            {{#evidence_merge.evidence_summary#}}
+
+
+            请输出：
+
+            1. 核心结论
+
+            2. 原理或流程
+
+            3. 公式/目标函数或关键机制
+
+            4. 评价指标与适用场景
+
+            5. 一句易错提醒
+
+            若 AI助教任务为 practice，请输出分层题目、答案解析和评分点；若为 plan，请输出目标、流程、资源、练习和检测方式；若为 grade，请先给可用于教师批改的标准答案和评分依据。'
+        variables: []
+        vision:
+          enabled: false
+      height: 92
+      id: llm_standard
+      position:
+        x: 1940
+        y: 280
+      positionAbsolute:
+        x: 1940
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 没有 student_answer 时按知识问答口径生成自检反馈；有 student_answer 时按学习诊断口径生成错因反馈。
+        selected: false
+        title: 条件分支_问答或诊断
+        type: if-else
+        cases:
+        - case_id: 'true'
+          conditions:
+          - comparison_operator: empty
+            id: cond_no_student_answer
+            value: ''
+            varType: string
+            variable_selector:
+            - input_cleaning
+            - student_answer_clean
+          logical_operator: and
+      height: 92
+      id: mode_branch
+      position:
+        x: 2250
+        y: 280
+      positionAbsolute:
+        x: 2250
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 专门生成已掌握部分、错因分析、个性化建议、追问题和参考答案摘要。
+        selected: false
+        title: LLM诊断反馈节点
+        type: llm
+        context:
+          enabled: true
+          variable_selector:
+          - evidence_merge
+          - evidence_summary
+        model:
+          completion_params:
+            temperature: 0.25
+          mode: chat
+          name: qwen2.5:7b
+          provider: langgenius/ollama/ollama
+        prompt_template:
+        - id: system-prompt
+          role: system
+          text: 你是接入智慧教育项目系统的机器学习学习诊断助手。你要基于学生回答、项目课程资料、知识图谱证据、班级上下文和算法评分输出诊断反馈。不要重新虚构证据，不要给与得分矛盾的评价。若未提供学生回答，只说明本轮是知识问答模式、不做扣分诊断，并给出自检追问。教师端批改要给出评分依据、可确认建议和后续练习；学生端诊断要具体指出已掌握、错因、补救建议和追问。
+        - id: user-prompt
+          role: user
+          text: '【用户原始查询】
+
+            {{#start.question#}}
+
+
+            【Dify检查标识】sys.query
+
+
+            【清洗后的问题】
+
+            {{#input_cleaning.question_clean#}}
+
+
+            【学生自我理解】
+
+            {{#input_cleaning.student_answer_clean#}}
+
+            【请求用户】{{#start.request_user_role#}} / {{#start.request_user_id#}}
+
+            【AI助教任务】{{#start.assistant_task#}} / {{#start.assistant_task_label#}}
+
+            【项目角色与任务上下文】
+
+            {{#start.assistant_role_context#}}
+
+            【项目班级与教学上下文】
+
+            {{#start.project_class_context#}}
+
+
+            【标准解释】
+
+            {{#llm_standard.text#}}
+
+
+            【算法诊断】
+
+            知识点：{{#nb_classifier.topic_label#}}
+
+            掌握度：{{#mastery_scoring.mastery_level#}}，得分 {{#mastery_scoring.mastery_score#}}
+
+            错因标签：{{#mastery_scoring.error_tags#}}
+
+            缺失点：{{#mastery_scoring.missing_points#}}
+
+
+            【RAG证据】
+
+            {{#evidence_merge.evidence_summary#}}
+
+
+            请输出：
+
+            1. 已掌握部分
+
+            2. 错因分析
+
+            3. 个性化学习建议
+
+            4. 追问题
+
+            5. 参考答案摘要
+
+            若请求用户是教师，请额外给出“教师确认建议”和“可布置的同类练习”；若请求用户是学生，请避免直接替学生完成作业，优先给修正路径和自检问题。'
+        variables: []
+        vision:
+          enabled: false
+      height: 92
+      id: llm_diagnosis
+      position:
+        x: 2560
+        y: 390
+      positionAbsolute:
+        x: 2560
+        y: 390
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 把标准答案、诊断反馈、算法结果和 RAG 证据整理成统一 JSON，同时生成项目回调 payload。
+        selected: false
+        title: 输出结构化JSON_代码节点
+        type: code
+        code: "import json\n\ndef _text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value, ensure_ascii=False)\n    except Exception:\n        return str(value)\n\ndef _json_or_list(value):\n    text = _text(value).strip()\n    if not text:\n        return []\n    try:\n        data = json.loads(text)\n        return data if isinstance(data, list) else [data]\n    except Exception:\n        return [x.strip() for x in text.replace(\"、\", \",\").split(\",\") if x.strip()]\n\ndef _next_questions(topic, missing_points):\n    topic = topic or \"该知识点\"\n    questions = [\n        f\"请用一句话说明{topic}的任务类型和输入输出。\",\n        f\"{topic}的核心目标函数或预测流程是什么？\",\n    ]\n    if any(\"评价指标\" in _text(x) for x in missing_points):\n        questions.append(f\"评价{topic}时应选择哪些指标，为什么？\")\n    else:\n        questions.append(f\"{topic}在什么场景下不适合使用？\")\n    return questions[:3]\n\ndef main(\n    question_clean: str,\n\
+          \    student_answer_clean: str = \"\",\n    diagnosis_mode: str = \"知识问答模式\",\n    topic_label: str = \"\",\n    topic_probability: float = 0,\n    top_topic_candidates: str = \"[]\",\n    mastery_score: float = 0,\n    mastery_level: str = \"未诊断\",\n    error_tags: str = \"[]\",\n    missing_points: str = \"[]\",\n    citation_items: str = \"[]\",\n    standard_answer: str = \"\",\n    diagnosis_feedback: str = \"\",\n    project_sync_suggestion: str = \"\",\n    student_id_clean: str = \"\",\n    class_id_clean: str = \"\",\n    conversation_id_clean: str = \"\",\n    request_id_clean: str = \"\",\n    sync_mode_clean: str = \"\",\n    request_user_id: str = \"\",\n    request_user_role: str = \"\",\n    assistant_task: str = \"\",\n    assistant_task_label: str = \"\",\n    subject: str = \"\",\n    chapter: str = \"\",\n    knowledge_point: str = \"\",\n) -> dict:\n    errors = _json_or_list(error_tags)\n    missing = _json_or_list(missing_points)\n    evidence = _json_or_list(citation_items)\n    candidates = _json_or_list(top_topic_candidates)\n    standard = _text(standard_answer).strip()\n    feedback = _text(diagnosis_feedback).strip()\n    if not feedback and diagnosis_mode == \"知识问答模式\":\n        feedback = \"未提供学生自我理解，当前为知识问答模式，暂不进行掌握度扣分诊断。\"\n    elif not feedback:\n        feedback = \"诊断反馈节点未返回内容，请检查\
+          \ LLM 节点配置。\"\n\n    next_questions = _next_questions(topic_label, missing)\n    result = {\n        \"topic_label\": topic_label,\n        \"topic_probability\": topic_probability,\n        \"top_topic_candidates\": candidates,\n        \"mastery_score\": int(float(mastery_score or 0)),\n        \"mastery_level\": mastery_level,\n        \"error_tags\": errors,\n        \"missing_points\": missing,\n        \"rag_evidence\": evidence,\n        \"standard_answer\": standard,\n        \"diagnosis_feedback\": feedback,\n        \"next_questions\": next_questions,\n        \"project_sync_suggestion\": project_sync_suggestion,\n        \"request_user_id\": request_user_id,\n        \"request_user_role\": request_user_role,\n        \"assistant_task\": assistant_task,\n        \"assistant_task_label\": assistant_task_label,\n        \"subject\": subject,\n        \"chapter\": chapter,\n        \"knowledge_point\": knowledge_point,\n    }\n\n    final_answer = \"\\n\\n\".join([\n        f\"## 知识点定位\\n{topic_label}（置信度 {topic_probability}）\",\n        f\"## 掌握度\\n{mastery_level}，得分 {int(float(mastery_score or 0))}\",\n        \"## 标准解释\\n\" + standard,\n        \"## 诊断反馈\\n\" + feedback,\n        \"## 追问题\\n\" + \"\\n\".join([f\"{i+1}. {q}\" for i, q in enumerate(next_questions)]),\n   \
+          \ ])\n\n    callback_payload = {\n        \"student_id\": student_id_clean,\n        \"class_id\": class_id_clean,\n        \"conversation_id\": conversation_id_clean,\n        \"request_id\": request_id_clean,\n        \"sync_mode\": sync_mode_clean,\n        \"request_user_id\": request_user_id,\n        \"request_user_role\": request_user_role,\n        \"assistant_task\": assistant_task,\n        \"assistant_task_label\": assistant_task_label,\n        \"subject\": subject,\n        \"chapter\": chapter,\n        \"knowledge_point\": knowledge_point,\n        \"question\": question_clean,\n        \"student_answer\": student_answer_clean,\n        \"topic_label\": topic_label,\n        \"mastery_score\": int(float(mastery_score or 0)),\n        \"mastery_level\": mastery_level,\n        \"error_tags\": errors,\n        \"missing_points\": missing,\n        \"rag_evidence\": evidence,\n        \"final_answer\": final_answer,\n        \"structured_result\": result,\n    }\n\n    return {\n        \"final_answer\": final_answer,\n        \"structured_json\": json.dumps(result, ensure_ascii=False),\n        \"callback_payload\": json.dumps(callback_payload, ensure_ascii=False),\n        \"rag_evidence\": json.dumps(evidence, ensure_ascii=False),\n    }"
+        code_language: python3
+        outputs:
+          final_answer:
+            children: null
+            type: string
+          structured_json:
+            children: null
+            type: string
+          callback_payload:
+            children: null
+            type: string
+          rag_evidence:
+            children: null
+            type: string
+        variables:
+        - value_selector:
+          - input_cleaning
+          - question_clean
+          variable: question_clean
+        - value_selector:
+          - input_cleaning
+          - student_answer_clean
+          variable: student_answer_clean
+        - value_selector:
+          - input_cleaning
+          - diagnosis_mode
+          variable: diagnosis_mode
+        - value_selector:
+          - nb_classifier
+          - topic_label
+          variable: topic_label
+        - value_selector:
+          - nb_classifier
+          - topic_probability
+          variable: topic_probability
+        - value_selector:
+          - nb_classifier
+          - top_topic_candidates
+          variable: top_topic_candidates
+        - value_selector:
+          - mastery_scoring
+          - mastery_score
+          variable: mastery_score
+        - value_selector:
+          - mastery_scoring
+          - mastery_level
+          variable: mastery_level
+        - value_selector:
+          - mastery_scoring
+          - error_tags
+          variable: error_tags
+        - value_selector:
+          - mastery_scoring
+          - missing_points
+          variable: missing_points
+        - value_selector:
+          - evidence_merge
+          - citation_items
+          variable: citation_items
+        - value_selector:
+          - llm_standard
+          - text
+          variable: standard_answer
+        - value_selector:
+          - llm_diagnosis
+          - text
+          variable: diagnosis_feedback
+        - value_selector:
+          - mastery_scoring
+          - project_sync_suggestion
+          variable: project_sync_suggestion
+        - value_selector:
+          - input_cleaning
+          - student_id_clean
+          variable: student_id_clean
+        - value_selector:
+          - input_cleaning
+          - class_id_clean
+          variable: class_id_clean
+        - value_selector:
+          - input_cleaning
+          - conversation_id_clean
+          variable: conversation_id_clean
+        - value_selector:
+          - input_cleaning
+          - request_id_clean
+          variable: request_id_clean
+        - value_selector:
+          - input_cleaning
+          - sync_mode_clean
+          variable: sync_mode_clean
+        - value_selector:
+          - start
+          - request_user_id
+          variable: request_user_id
+        - value_selector:
+          - start
+          - request_user_role
+          variable: request_user_role
+        - value_selector:
+          - start
+          - assistant_task
+          variable: assistant_task
+        - value_selector:
+          - start
+          - assistant_task_label
+          variable: assistant_task_label
+        - value_selector:
+          - start
+          - subject
+          variable: subject
+        - value_selector:
+          - start
+          - chapter
+          variable: chapter
+        - value_selector:
+          - start
+          - knowledge_point
+          variable: knowledge_point
+      height: 92
+      id: json_output
+      position:
+        x: 2870
+        y: 280
+      positionAbsolute:
+        x: 2870
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 把工作流结果回写项目 AI 助教接口。Docker 版 Dify 默认使用 host.docker.internal:5107 访问宿主机后端；Bearer Token 需与项目 DIFY_CALLBACK_TOKEN 一致。
+        selected: false
+        title: 项目数据库同步_HTTP节点
+        type: http-request
+        authorization:
+          config:
+            api_key: change-me
+            type: bearer
+          type: api-key
+        body:
+          data:
+          - key: ''
+            type: text
+            value: '{{#json_output.callback_payload#}}'
+          type: json
+        headers: 'Content-Type: application/json'
+        method: post
+        params: ''
+        timeout:
+          connect: 5
+          max_connect_timeout: 0
+          max_read_timeout: 0
+          max_write_timeout: 0
+          read: 30
+          write: 30
+        url: http://host.docker.internal:5107/api/integrations/dify/diagnosis-callback
+      height: 92
+      id: http_callback
+      position:
+        x: 3180
+        y: 280
+      positionAbsolute:
+        x: 3180
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 输出最终学习诊断结果。
+        selected: false
+        title: 结束
+        type: end
+        outputs:
+        - value_selector:
+          - json_output
+          - final_answer
+          variable: final_answer
+        - value_selector:
+          - nb_classifier
+          - topic_label
+          variable: topic_label
+        - value_selector:
+          - input_cleaning
+          - diagnosis_mode
+          variable: diagnosis_mode
+        - value_selector:
+          - mastery_scoring
+          - mastery_level
+          variable: mastery_level
+        - value_selector:
+          - mastery_scoring
+          - mastery_score
+          variable: mastery_score
+        - value_selector:
+          - mastery_scoring
+          - error_tags
+          variable: error_tags
+        - value_selector:
+          - json_output
+          - rag_evidence
+          variable: rag_evidence
+        - value_selector:
+          - json_output
+          - structured_json
+          variable: structured_json
+        - value_selector:
+          - json_output
+          - callback_payload
+          variable: callback_payload
+        - value_selector:
+          - http_callback
+          - status_code
+          variable: sync_status
+      height: 92
+      id: end
+      position:
+        x: 3490
+        y: 280
+      positionAbsolute:
+        x: 3490
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244

@@ -1,0 +1,132 @@
+{
+    "title": "高一数学选择性必修一知识图谱",
+    "nodes": [
+        {
+            "id": "ch1",
+            "label": "第一章 空间向量及其运算",
+            "type": "chapter"
+        },
+        {
+            "id": "ch2",
+            "label": "第二章 直线和圆的方程",
+            "type": "chapter"
+        },
+        {
+            "id": "ch3",
+            "label": "第三章 圆锥曲线的方程",
+            "type": "chapter"
+        },
+        {
+            "id": "v_add",
+            "label": "空间向量的加法",
+            "type": "concept"
+        },
+        {
+            "id": "v_sub",
+            "label": "空间向量的减法",
+            "type": "concept"
+        },
+        {
+            "id": "v_dot",
+            "label": "空间向量的数量积",
+            "type": "concept"
+        },
+        {
+            "id": "v_coord",
+            "label": "空间向量的坐标运算",
+            "type": "concept"
+        },
+        {
+            "id": "line_eq",
+            "label": "直线的点斜式方程",
+            "type": "concept"
+        },
+        {
+            "id": "circle_eq",
+            "label": "圆的标准方程",
+            "type": "concept"
+        },
+        {
+            "id": "circle_general",
+            "label": "圆的一般方程",
+            "type": "concept"
+        },
+        {
+            "id": "ellipse",
+            "label": "椭圆及其标准方程",
+            "type": "concept"
+        },
+        {
+            "id": "hyperbola",
+            "label": "双曲线及其标准方程",
+            "type": "concept"
+        },
+        {
+            "id": "parabola",
+            "label": "抛物线及其标准方程",
+            "type": "concept"
+        }
+    ],
+    "edges": [
+        {
+            "source": "ch1",
+            "target": "v_add",
+            "label": "包含"
+        },
+        {
+            "source": "ch1",
+            "target": "v_sub",
+            "label": "包含"
+        },
+        {
+            "source": "ch1",
+            "target": "v_dot",
+            "label": "包含"
+        },
+        {
+            "source": "ch1",
+            "target": "v_coord",
+            "label": "包含"
+        },
+        {
+            "source": "ch2",
+            "target": "line_eq",
+            "label": "包含"
+        },
+        {
+            "source": "ch2",
+            "target": "circle_eq",
+            "label": "包含"
+        },
+        {
+            "source": "ch2",
+            "target": "circle_general",
+            "label": "包含"
+        },
+        {
+            "source": "ch3",
+            "target": "ellipse",
+            "label": "包含"
+        },
+        {
+            "source": "ch3",
+            "target": "hyperbola",
+            "label": "包含"
+        },
+        {
+            "source": "ch3",
+            "target": "parabola",
+            "label": "包含"
+        },
+        {
+            "source": "v_dot",
+            "target": "v_coord",
+            "label": "基础"
+        },
+        {
+            "source": "circle_eq",
+            "target": "circle_general",
+            "label": "推导"
+        }
+    ]
+}

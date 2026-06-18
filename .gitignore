@@ -7,5 +7,6 @@ backups/
 !.env.example
 *.log
 *.pdf
+.edge-*/
 .DS_Store
 Thumbs.db

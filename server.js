@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -33,6 +33,7 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const RUNTIME_DIR = path.join(DATA_DIR, "runtime");
 const LOG_DIR = path.resolve(process.env.LOG_DIR || path.join(ROOT, "logs"));
+const BACKUP_DIR = path.resolve(process.env.BACKUP_DIR || path.join(ROOT, "backups"));
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const AUDIT_LOG_PATH = path.join(LOG_DIR, "audit.log");
 const GRAPH_JOBS_PATH = path.join(RUNTIME_DIR, "graph_jobs.json");
@@ -68,11 +69,27 @@ const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_
 const MODEL_CODE_TIMEOUT_MS = Math.max(1000, Math.min(30 * 1000, Number(process.env.MODEL_CODE_TIMEOUT_MS || 10 * 1000)));
 const MODEL_CODE_MAX_CHARS = Math.max(1000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_CHARS || 80000)));
 const MODEL_CODE_MAX_OUTPUT_CHARS = Math.max(2000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_OUTPUT_CHARS || 30000)));
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_BASE_URL = String(process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const OPENAI_TIMEOUT_MS = Math.max(5000, Math.min(60 * 1000, Number(process.env.OPENAI_TIMEOUT_MS || 25 * 1000)));
+const DIFY_BASE_URL = String(process.env.DIFY_BASE_URL || "http://127.0.0.1:8080/v1").replace(/\/+$/, "");
+const DIFY_WORKFLOW_API_KEY = process.env.DIFY_WORKFLOW_API_KEY || "";
+const DIFY_STUDENT_WORKFLOW_API_KEY = process.env.DIFY_STUDENT_WORKFLOW_API_KEY || DIFY_WORKFLOW_API_KEY;
+const DIFY_TEACHER_WORKFLOW_API_KEY = process.env.DIFY_TEACHER_WORKFLOW_API_KEY || "";
+const DIFY_TEACHER_WORKFLOW_NAME = process.env.DIFY_TEACHER_WORKFLOW_NAME || "teacher_teaching_assistant";
+const DIFY_WORKFLOW_USER_PREFIX = process.env.DIFY_WORKFLOW_USER_PREFIX || "education-agent";
+const DIFY_WORKFLOW_TIMEOUT_MS = Math.max(3000, Math.min(60 * 1000, Number(process.env.DIFY_WORKFLOW_TIMEOUT_MS || 60 * 1000)));
+const DIFY_CALLBACK_TOKEN = process.env.DIFY_CALLBACK_TOKEN || "change-me";
+const DIFY_PROJECT_BASE_URL = String(process.env.DIFY_PROJECT_BASE_URL || `http://host.docker.internal:${PORT}`).replace(/\/+$/, "");
+const DIFY_GRAPH_CONTEXT_URL = String(process.env.DIFY_GRAPH_CONTEXT_URL || `${DIFY_PROJECT_BASE_URL}/api/integrations/dify/graph-context`);
+const DIFY_CALLBACK_URL = String(process.env.DIFY_CALLBACK_URL || `${DIFY_PROJECT_BASE_URL}/api/integrations/dify/diagnosis-callback`);
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const TEXT_UPLOAD_EXTENSIONS = new Set([".txt", ".md", ".csv", ".json"]);
 const ZIP_OFFICE_EXTENSIONS = new Set([".docx", ".pptx", ".xlsx"]);
 const BINARY_OFFICE_EXTENSIONS = new Set([".doc", ".ppt", ".xls"]);
 const IMAGE_UPLOAD_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const BUILTIN_ADMIN_ID = "20260000";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const SECURITY_HEADERS = {
@@ -219,7 +236,15 @@ function atomicWriteJson(filePath, data) {
   ensureDataDir();
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf8");
-  fs.renameSync(tmpPath, filePath);
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    if (process.platform !== "win32" || !["EEXIST", "EPERM"].includes(error.code)) {
+      throw error;
+    }
+    fs.copyFileSync(tmpPath, filePath);
+    fs.unlinkSync(tmpPath);
+  }
 }
 
 function readJsonFile(filePath, fallback) {
@@ -267,17 +292,29 @@ function sampleGraph(ownerId, subject, title, global = false) {
 }
 
 function createInitialDb() {
+  const adminId = BUILTIN_ADMIN_ID;
   const teacherId = "20260001";
   const studentId = "20260002";
 
   return {
     users: [
       {
+        id: adminId,
+        name: "管理员",
+        role: "admin",
+        passwordHash: hashPassword("123456"),
+        subject: "",
+        className: "",
+        classIds: [],
+        avatar: "管",
+        createdAt: now()
+      },
+      {
         id: teacherId,
         name: "黄豆",
         role: "teacher",
         passwordHash: hashPassword("123456"),
-        subject: "数学",
+        subject: "机器学习",
         className: "",
         classIds: [],
         avatar: "黄",
@@ -295,7 +332,7 @@ function createInitialDb() {
         createdAt: now()
       }
     ],
-    knowledgeGraphs: [],
+    knowledgeGraphs: seedInitialKnowledgeGraphs(teacherId),
     conversations: [],
     models: [],
     friendships: [],
@@ -303,8 +340,9 @@ function createInitialDb() {
     classes: [],
     homework: [],
     submissions: [],
-    courseMaterials: [],
+    courseMaterials: seedInitialCourseMaterials(teacherId),
     learningProfiles: [
+      createLearningProfile(adminId, "admin"),
       createLearningProfile(studentId, "student"),
       createLearningProfile(teacherId, "teacher")
     ],
@@ -313,11 +351,6 @@ function createInitialDb() {
     auditLogs: [],
     friendRequests: [],
     chatInvites: [],
-    lessons: [],
-    classroomSessions: [],
-    classroomEvents: [],
-    lessonExports: [],
-    quizAttempts: [],
     agentProfiles: [],
     simulationAssets: []
   };
@@ -341,7 +374,7 @@ function createLearningProfile(userId, role = "student") {
   return {
     userId,
     role,
-    level: role === "teacher" ? "教师" : "待诊断",
+    level: role === "admin" ? "管理员" : role === "teacher" ? "教师" : "待诊断",
     goals: [],
     questionCount: 0,
     practiceCount: 0,
@@ -494,6 +527,104 @@ function seedCourseMaterials(teacherId) {
   ];
 }
 
+function machineLearningSeedText() {
+  const candidates = [
+    path.join(ROOT, "动手学机器学习-测试讲义.txt"),
+    path.join(UPLOAD_DIR, "hands_on_ml_extract.txt")
+  ];
+  for (const filePath of candidates) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const text = fs.readFileSync(filePath, "utf8");
+        if (normalizeExtractedText(text).length >= 800) return text;
+      }
+    } catch {
+      // Ignore optional seed file read failures and fall back to the built-in outline.
+    }
+  }
+  return [
+    "目录",
+    ...fallbackMachineLearningOutline().map((item) => item.label),
+    "",
+    "机器学习课程围绕数据集、监督学习、无监督学习、模型评估、优化方法、决策树、支持向量机、聚类、降维、神经网络和应用实践展开。",
+    "学习时要区分训练集、验证集和测试集，理解泛化能力、过拟合、欠拟合、交叉验证、正则化和数据泄漏防控。",
+    "典型算法包括 K 近邻、线性回归、逻辑回归、朴素贝叶斯、决策树、随机森林、支持向量机、K-means、PCA 和神经网络。",
+    "课堂应强调算法输入输出、训练目标、关键假设、参数影响、评价指标、常见误区和可复现实验流程。"
+  ].join("\n");
+}
+
+function seedInitialCourseMaterials(teacherId) {
+  return [
+    createCourseMaterial({
+      ownerId: teacherId,
+      subject: "机器学习",
+      title: "《动手学机器学习》",
+      sourceName: fs.existsSync(path.join(ROOT, "动手学机器学习 (张伟楠等) .pdf")) ? "动手学机器学习 (张伟楠等) .pdf" : "系统内置机器学习讲义",
+      global: true,
+      text: machineLearningSeedText()
+    })
+  ];
+}
+
+function seedInitialKnowledgeGraphs(teacherId) {
+  const sourceText = machineLearningSeedText();
+  const outline = extractBookOutline(sourceText, "机器学习", "动手学机器学习");
+  return [
+    buildOutlineGraphFromText({
+      ownerId: teacherId,
+      subject: "机器学习",
+      title: "《动手学机器学习》知识图谱",
+      sourceName: fs.existsSync(path.join(ROOT, "动手学机器学习 (张伟楠等) .pdf")) ? "动手学机器学习 (张伟楠等) .pdf" : "系统内置机器学习讲义",
+      sourceText,
+      extraction: {
+        name: "动手学机器学习",
+        method: "seeded-open-maic-course-agent",
+        characters: normalizeExtractedText(sourceText).length,
+        seed: true
+      },
+      outline: outline.length ? outline : fallbackMachineLearningOutline()
+    })
+  ];
+}
+
+function ensureBuiltinAdmin(db) {
+  db.users = Array.isArray(db.users) ? db.users : [];
+  const existing = db.users.find((user) => user.id === BUILTIN_ADMIN_ID);
+  if (!existing) {
+    db.users.unshift({
+      id: BUILTIN_ADMIN_ID,
+      name: "管理员",
+      role: "admin",
+      passwordHash: hashPassword("123456"),
+      subject: "",
+      className: "",
+      classIds: [],
+      avatar: "管",
+      createdAt: now()
+    });
+    return true;
+  }
+  let changed = false;
+  if (existing.role !== "admin") {
+    existing.role = "admin";
+    changed = true;
+  }
+  if (!existing.passwordHash && existing.password !== undefined) {
+    migratePasswordIfNeeded(existing, existing.password);
+    changed = true;
+  }
+  existing.classIds = Array.isArray(existing.classIds) ? existing.classIds : [];
+  if (!existing.name) {
+    existing.name = "管理员";
+    changed = true;
+  }
+  if (!existing.avatar) {
+    existing.avatar = "管";
+    changed = true;
+  }
+  return changed;
+}
+
 function ensureDbShape(db) {
   let changed = false;
   const ensureArray = (key) => {
@@ -518,15 +649,11 @@ function ensureDbShape(db) {
     "chatThreads",
     "friendRequests",
     "chatInvites",
-    "lessons",
-    "classroomSessions",
-    "classroomEvents",
-    "lessonExports",
-    "quizAttempts",
     "agentProfiles",
     "simulationAssets"
   ].forEach(ensureArray);
   db.users = Array.isArray(db.users) ? db.users : [];
+  if (ensureBuiltinAdmin(db)) changed = true;
   (db.users || []).forEach((user) => {
     if (!user.passwordHash && user.password !== undefined) {
       migratePasswordIfNeeded(user, user.password);
@@ -1491,15 +1618,174 @@ function resolvePythonCommand() {
   return "python";
 }
 
+let modelCodePythonCommandCache = null;
+
 function resolveModelCodePythonCommand() {
-  if (process.env.MODEL_CODE_PYTHON) return process.env.MODEL_CODE_PYTHON;
-  if (process.env.PDF_AGENT_PYTHON) return process.env.PDF_AGENT_PYTHON;
-  return "python";
+  const spec = resolveModelCodePythonCommands()[0];
+  return spec ? formatCommandSpec(spec) : "python";
 }
 
-function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOut = false, durationMs = 0 }) {
+function splitCommandArgs(value) {
+  return (String(value || "").match(/"[^"]*"|'[^']*'|\S+/g) || []).map((token) => {
+    if ((token.startsWith("\"") && token.endsWith("\"")) || (token.startsWith("'") && token.endsWith("'"))) {
+      return token.slice(1, -1);
+    }
+    return token;
+  });
+}
+
+function parseCommandSpec(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const quoted = raw.match(/^"([^"]+)"(?:\s+(.*))?$/);
+  if (quoted) {
+    return { command: quoted[1], args: splitCommandArgs(quoted[2] || "") };
+  }
+  const executablePath = raw.match(/^(.+?\.exe)(?:\s+(.*))?$/i);
+  if (executablePath && (/[\\/]/.test(executablePath[1]) || fs.existsSync(executablePath[1]))) {
+    return { command: executablePath[1], args: splitCommandArgs(executablePath[2] || "") };
+  }
+  const parts = splitCommandArgs(raw);
+  const command = parts.shift();
+  return command ? { command, args: parts } : null;
+}
+
+function executableExists(command) {
+  if (!command) return false;
+  if (/[\\/]/.test(command)) return fs.existsSync(command);
+  if (process.platform !== "win32") return false;
+  const extensions = String(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean);
+  const pathEntries = String(process.env.PATH || process.env.Path || "").split(path.delimiter).filter(Boolean);
+  return pathEntries.some((entry) => extensions.some((ext) => fs.existsSync(path.join(entry, command.endsWith(ext.toLowerCase()) || command.endsWith(ext.toUpperCase()) ? command : `${command}${ext}`))));
+}
+
+function whereCommandSpecs(command, args = []) {
+  if (!command || /[\\/]/.test(command) || process.platform !== "win32") return [];
+  try {
+    const output = execFileSync("where.exe", [command], {
+      windowsHide: true,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    return output.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((filePath) => fs.existsSync(filePath))
+      .map((filePath) => ({ command: filePath, args: [...args] }));
+  } catch {
+    return [];
+  }
+}
+
+function commonWindowsPythonSpecs() {
+  if (process.platform !== "win32") return [];
+  const username = process.env.USERNAME || "";
+  const pythonVersions = ["314", "313", "312", "311", "310", "39", "38"];
+  const programRoots = Array.from(new Set([
+    process.env.ProgramW6432,
+    process.env.ProgramFiles,
+    process.env["ProgramFiles(x86)"],
+    "C:\\Program Files",
+    "D:\\Program Files"
+  ].filter(Boolean)));
+  const userProfiles = Array.from(new Set([
+    process.env.USERPROFILE,
+    username ? `C:\\Users\\${username}` : "",
+    username ? `D:\\Users\\${username}` : ""
+  ].filter(Boolean)));
+  const rootDrives = ["C:\\", "D:\\"];
+  const candidates = [
+    { command: "C:\\Windows\\py.exe", args: ["-3"] },
+    { command: "C:\\Windows\\py.exe", args: [] },
+    ...programRoots.flatMap((root) => pythonVersions.map((version) => path.join(root, `Python${version}`, "python.exe"))),
+    ...rootDrives.flatMap((root) => pythonVersions.map((version) => path.join(root, `Python${version}`, "python.exe"))),
+    ...(process.env.LOCALAPPDATA ? pythonVersions.map((version) => path.join(process.env.LOCALAPPDATA, "Programs", "Python", `Python${version}`, "python.exe")) : []),
+    ...userProfiles.flatMap((profile) => [
+      path.join(profile, "anaconda3", "python.exe"),
+      path.join(profile, "miniconda3", "python.exe"),
+      ...pythonVersions.map((version) => path.join(profile, "AppData", "Local", "Programs", "Python", `Python${version}`, "python.exe"))
+    ])
+  ];
+  return candidates.map((item) => typeof item === "string" ? { command: item, args: [] } : item)
+    .filter((spec) => fs.existsSync(spec.command));
+}
+
+function expandModelCodePythonSpec(spec) {
+  if (!spec) return [];
+  const specs = [];
+  if (/[\\/]/.test(spec.command) || executableExists(spec.command)) specs.push(spec);
+  specs.push(...whereCommandSpecs(spec.command, spec.args || []));
+  if (process.platform === "win32" && /^(python|python3|py)$/i.test(spec.command)) {
+    specs.push(...commonWindowsPythonSpecs());
+  }
+  return specs.length ? specs : [spec];
+}
+
+function commandSpecKey(spec) {
+  return `${String(spec?.command || "").toLowerCase()}\u0000${(spec?.args || []).join("\u0000")}`;
+}
+
+function dedupeCommandSpecs(specs) {
+  const seen = new Set();
+  return specs.filter((spec) => {
+    const key = commandSpecKey(spec);
+    if (!spec?.command || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function cloneCommandSpecs(specs) {
+  return specs.map((spec) => ({ command: spec.command, args: [...(spec.args || [])] }));
+}
+
+function probePythonCommandSpec(spec) {
+  try {
+    execFileSync(spec.command, [...(spec.args || []), "-c", "import sys; sys.exit(0)"], {
+      windowsHide: true,
+      timeout: 3000,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PYTHONUTF8: "1",
+        PYTHONIOENCODING: "utf-8"
+      },
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveModelCodePythonCommands() {
+  if (modelCodePythonCommandCache) return cloneCommandSpecs(modelCodePythonCommandCache);
+  const defaults = process.platform === "win32" ? ["python", "py -3", "python3"] : ["python3", "python"];
+  const configured = [
+    process.env.MODEL_CODE_PYTHON,
+    process.env.PDF_AGENT_PYTHON,
+    process.env.PYTHON
+  ];
+  const rawSpecs = dedupeCommandSpecs(configured.concat(defaults)
+    .map(parseCommandSpec)
+    .filter(Boolean)
+    .flatMap(expandModelCodePythonSpec));
+  const verifiedSpecs = rawSpecs.filter(probePythonCommandSpec);
+  modelCodePythonCommandCache = verifiedSpecs.length ? cloneCommandSpecs(verifiedSpecs) : cloneCommandSpecs(rawSpecs);
+  return cloneCommandSpecs(modelCodePythonCommandCache);
+}
+
+function formatCommandSpec(spec) {
+  if (!spec) return "";
+  return [spec.command].concat(spec.args || [])
+    .map((part) => /\s/.test(part) ? `"${part}"` : part)
+    .join(" ");
+}
+
+function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOut = false, durationMs = 0, pythonCommand = "" }) {
   const sections = [];
-  sections.push(`执行状态：${timedOut ? "超时终止" : exitCode === 0 ? "运行成功" : `运行失败（退出码 ${exitCode}）`}`);
+  sections.push(`执行状态：${timedOut ? "超时终止" : exitCode === 0 ? "执行完成（退出码 0）" : `运行失败（退出码 ${exitCode}）`}`);
+  if (pythonCommand) sections.push(`Python：${pythonCommand}`);
   sections.push(`耗时：${durationMs} ms`);
   const cleanStdout = String(stdout || "").trimEnd();
   const cleanStderr = String(stderr || "").trimEnd();
@@ -1586,18 +1872,10 @@ function runModelCodeSnippet(code) {
     const tempDir = fs.mkdtempSync(path.join(RUNTIME_DIR, "model-code-"));
     const scriptPath = path.join(tempDir, "main.py");
     fs.writeFileSync(scriptPath, modelCodeExecutableSource(source), "utf8");
-    const python = resolveModelCodePythonCommand();
-    const child = spawn(python, ["-u", scriptPath], {
-      windowsHide: true,
-      cwd: tempDir,
-      env: {
-        ...process.env,
-        PYTHONUTF8: "1",
-        PYTHONIOENCODING: "utf-8",
-        MPLBACKEND: "Agg"
-      },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    const pythonCandidates = resolveModelCodePythonCommands();
+    let activeChild = null;
+    let activePythonCommand = "";
+    const spawnErrors = [];
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -1618,7 +1896,8 @@ function runModelCodeSnippet(code) {
         timedOut,
         durationMs,
         stdout: stdout.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS),
-        stderr: stderr.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS)
+        stderr: stderr.slice(0, MODEL_CODE_MAX_OUTPUT_CHARS),
+        pythonCommand: activePythonCommand
       };
       payload.output = formatModelCodeOutput(payload);
       removeRuntimeTempDir(tempDir);
@@ -1627,22 +1906,62 @@ function runModelCodeSnippet(code) {
     const timer = setTimeout(() => {
       timedOut = true;
       try {
-        child.kill();
+        activeChild?.kill();
       } catch {}
       stderr = appendLimited(stderr, `\n代码执行超过 ${MODEL_CODE_TIMEOUT_MS} ms，已自动终止。`);
       finish(124);
     }, MODEL_CODE_TIMEOUT_MS);
-    child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk);
-    });
-    child.on("error", (error) => {
-      stderr = appendLimited(stderr, `无法启动 Python：${error.message}`);
-      finish(1);
-    });
-    child.on("close", (code) => finish(Number.isFinite(Number(code)) ? Number(code) : 1));
+    const startAttempt = (candidateIndex) => {
+      if (settled) return;
+      const spec = pythonCandidates[candidateIndex];
+      if (!spec) {
+        const reason = spawnErrors.length
+          ? spawnErrors.join("\n")
+          : "未找到可用 Python 命令。";
+        stderr = appendLimited(stderr, `${reason}\n请安装 Python，或将 MODEL_CODE_PYTHON 设置为 Python 可执行文件完整路径。`);
+        finish(1);
+        return;
+      }
+      activePythonCommand = formatCommandSpec(spec);
+      let child = null;
+      let launchFailed = false;
+      try {
+        child = spawn(spec.command, [...(spec.args || []), "-u", scriptPath], {
+          windowsHide: true,
+          cwd: tempDir,
+          env: {
+            ...process.env,
+            PYTHONUTF8: "1",
+            PYTHONIOENCODING: "utf-8",
+            MPLBACKEND: "Agg"
+          },
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+      } catch (error) {
+        spawnErrors.push(`无法启动 Python（${activePythonCommand}）：${error.message}`);
+        startAttempt(candidateIndex + 1);
+        return;
+      }
+      activeChild = child;
+      child.stdout.on("data", (chunk) => {
+        stdout = appendLimited(stdout, chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr = appendLimited(stderr, chunk);
+      });
+      child.on("error", (error) => {
+        launchFailed = true;
+        spawnErrors.push(`无法启动 Python（${activePythonCommand}）：${error.message}`);
+        activeChild = null;
+        startAttempt(candidateIndex + 1);
+      });
+      child.on("close", (code) => {
+        if (launchFailed) return;
+        activeChild = null;
+        finish(Number.isFinite(Number(code)) ? Number(code) : 1);
+      });
+    };
+    startAttempt(0);
   });
 }
 
@@ -2738,15 +3057,12 @@ function inferAssessment(label, level = 2) {
 
 function inferLearnerState(label, level = 2) {
   const seed = stableNumber(label, 100);
-  const states = ["未掌握", "模糊", "基本掌握", "精通"];
-  const index = level <= 1 ? 2 : seed > 72 ? 1 : seed > 42 ? 2 : seed > 18 ? 0 : 3;
-  const mastery = [0.18, 0.42, 0.68, 0.9][index];
   return {
-    status: states[index],
-    mastery,
-    heat: Number((1 - mastery).toFixed(2)),
+    status: "待真实诊断",
+    mastery: null,
+    heat: null,
     weight: Number((1 + level * 0.18 + (100 - seed) / 180).toFixed(2)),
-    evidence: "依据节点层级、知识点关系和模拟学习行为生成，可接入真实做题/提问/停留时间实时更新。"
+    evidence: "暂无基于问答、课堂测验或教师确认批改的真实学习记录。"
   };
 }
 
@@ -3198,46 +3514,82 @@ function processGraphGenerationJob(jobId, payload) {
     try {
       const aiUnlimited = isAiUnlimitedExtractor(payload.extractor);
       assertGraphJobActive(jobId);
+      const payloadFiles = Array.isArray(payload.files) && payload.files.length
+        ? payload.files
+        : (payload.file ? [payload.file] : []);
       updateGraphJob(jobId, {
         status: "running",
         stage: aiUnlimited ? "AI 识别文件" : "解析文件",
         progress: 22,
-        message: payload.file?.filePath || payload.file?.buffer?.length
-          ? (aiUnlimited ? "AI 自动图谱智能体正在分块读取 PDF，扫描版会做有限 OCR 并融合目录线索" : "正在解析上传文件，扫描版 PDF 会自动尝试 OCR")
+        message: payloadFiles.length
+          ? (aiUnlimited ? `AI 自动图谱智能体正在汇总读取 ${payloadFiles.length} 个文件，扫描版会做有限 OCR 并融合目录线索` : `正在解析 ${payloadFiles.length} 个上传文件，扫描版 PDF 会自动尝试 OCR`)
           : "正在读取输入内容"
       });
 
-      const uploaded = payload.file?.filePath
-        ? await extractUploadedBookFile({
-          ...payload.file,
-          extractor: payload.extractor,
-          subject: payload.subject,
-          sourceText: payload.sourceText
-        }, (stats) => {
-          if (isGraphJobCanceled(jobId)) return;
-          const totalPages = Number(stats.pages || 0);
-          const currentPage = Number(stats.page || 0);
-          const isOcrStage = String(stats.stage || "").startsWith("ocr") || /OCR/i.test(String(stats.method || ""));
-          const pdfPageInfo = stats.pdfPage
-            ? `（PDF 第 ${stats.pdfPage}${stats.pdfPages ? `/${stats.pdfPages}` : ""} 页）`
-            : "";
-          updateGraphJob(jobId, {
-            progress: totalPages
-              ? Math.min(62, 24 + Math.floor((currentPage / Math.max(1, totalPages)) * 38))
-              : Math.min(58, 26 + Math.floor(Number(stats.scannedStreams || 0) / 30)),
-            message: stats.message || (totalPages
-              ? `${stats.method || "PDF 智能体"} 正在${isOcrStage ? "OCR" : "解析"}第 ${currentPage}/${totalPages} 页${pdfPageInfo}，已识别 ${stats.characters || 0} 字符`
-              : (stats.message || `已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`))
-          });
-        }, jobId)
-        : payload.file?.buffer?.length
-          ? extractUploadedBookBuffer(payload.file, (stats) => {
+      const extractedFiles = [];
+      for (let fileIndex = 0; fileIndex < payloadFiles.length; fileIndex += 1) {
+        const file = payloadFiles[fileIndex];
+        assertGraphJobActive(jobId);
+        updateGraphJob(jobId, {
+          stage: aiUnlimited ? "AI 识别文件" : "解析文件",
+          progress: Math.min(62, 22 + Math.floor((fileIndex / Math.max(1, payloadFiles.length)) * 40)),
+          message: `正在解析第 ${fileIndex + 1}/${payloadFiles.length} 个文件：${file.name || payload.sourceName || "上传文件"}`
+        });
+        const uploadedFile = file.filePath
+          ? await extractUploadedBookFile({
+            ...file,
+            extractor: payload.extractor,
+            subject: payload.subject,
+            sourceText: payload.sourceText
+          }, (stats) => {
             if (isGraphJobCanceled(jobId)) return;
+            const totalPages = Number(stats.pages || 0);
+            const currentPage = Number(stats.page || 0);
+            const isOcrStage = String(stats.stage || "").startsWith("ocr") || /OCR/i.test(String(stats.method || ""));
+            const pdfPageInfo = stats.pdfPage
+              ? `（PDF 第 ${stats.pdfPage}${stats.pdfPages ? `/${stats.pdfPages}` : ""} 页）`
+              : "";
+            const localProgress = totalPages
+              ? currentPage / Math.max(1, totalPages)
+              : Math.min(1, Number(stats.scannedStreams || 0) / 30);
             updateGraphJob(jobId, {
-              progress: Math.min(58, 26 + Math.floor(stats.scannedStreams / 30)),
-              message: `已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
+              progress: Math.min(62, 24 + Math.floor(((fileIndex + localProgress) / Math.max(1, payloadFiles.length)) * 38)),
+              message: stats.message || (totalPages
+                ? `${stats.method || "PDF 智能体"} 正在${isOcrStage ? "OCR" : "解析"}第 ${currentPage}/${totalPages} 页${pdfPageInfo}，已识别 ${stats.characters || 0} 字符`
+                : (stats.message || `第 ${fileIndex + 1}/${payloadFiles.length} 个文件已扫描 ${stats.scannedStreams || 0} 个 PDF 内容流，跳过图片流 ${stats.imageStreams || 0} 个`))
             });
-          })
+          }, jobId)
+          : file.buffer?.length
+            ? extractUploadedBookBuffer(file, (stats) => {
+              if (isGraphJobCanceled(jobId)) return;
+              updateGraphJob(jobId, {
+                progress: Math.min(62, 24 + Math.floor(((fileIndex + Math.min(1, stats.scannedStreams / 30)) / Math.max(1, payloadFiles.length)) * 38)),
+                message: `第 ${fileIndex + 1}/${payloadFiles.length} 个文件已扫描 ${stats.scannedStreams} 个 PDF 内容流，跳过图片流 ${stats.imageStreams} 个`
+              });
+            })
+            : { text: "", meta: null };
+        extractedFiles.push({ file, uploaded: uploadedFile });
+      }
+
+      const uploaded = extractedFiles.length
+        ? {
+          text: extractedFiles.map(({ file, uploaded: item }, index) => [
+            `【来源文件 ${index + 1}：${file.name || item.meta?.name || payload.sourceName || "上传文件"}】`,
+            item.text || ""
+          ].filter(Boolean).join("\n")).join("\n\n"),
+          meta: {
+            name: payload.sourceName,
+            fileCount: extractedFiles.length,
+            files: extractedFiles.map(({ file, uploaded: item }) => ({
+              name: file.name || item.meta?.name || "",
+              type: file.type || "",
+              characters: Number(item.meta?.characters || 0),
+              pages: Number(item.meta?.pages || item.meta?.pdfPages || 0),
+              agent: item.meta?.agent || item.meta?.method || ""
+            })),
+            characters: extractedFiles.reduce((sum, item) => sum + Number(item.uploaded.meta?.characters || item.uploaded.text?.length || 0), 0)
+          }
+        }
         : { text: "", meta: null };
 
       assertGraphJobActive(jobId);
@@ -3259,8 +3611,8 @@ function processGraphGenerationJob(jobId, payload) {
         aiUnlimited ? payload.title : "",
         aiUnlimited ? payload.sourceName : ""
       ].filter(Boolean).join("\n\n"));
-      const isPdf = payload.file && (String(payload.file.type || "").includes("pdf") || String(payload.file.name || "").toLowerCase().endsWith(".pdf"));
-      if (isPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim() && !aiUnlimited) {
+      const hasPdf = payloadFiles.some((file) => String(file.type || "").includes("pdf") || String(file.name || "").toLowerCase().endsWith(".pdf"));
+      if (hasPdf && !uploaded.text.trim() && !String(payload.sourceText || "").trim() && !aiUnlimited) {
         throw new Error("PDF 文本层和 OCR 都未识别到可用于生成图谱的内容。请确认本机 PaddleOCR 可用，或在补充目录/知识点中粘贴章节信息后再生成。");
       }
 
@@ -3308,11 +3660,16 @@ function processGraphGenerationJob(jobId, payload) {
         error: error.message || "生成失败"
       });
     } finally {
-      if (payload.uploadId) cleanupUploadSession(payload.uploadId, true);
-      else if (payload.file?.filePath) {
-        try {
-          fs.unlinkSync(payload.file.filePath);
-        } catch {}
+      const uploadIds = Array.isArray(payload.uploadIds) ? payload.uploadIds : (payload.uploadId ? [payload.uploadId] : []);
+      uploadIds.forEach((uploadId) => cleanupUploadSession(uploadId, true));
+      if (!uploadIds.length) {
+        const payloadFiles = Array.isArray(payload.files) && payload.files.length ? payload.files : (payload.file ? [payload.file] : []);
+        payloadFiles.forEach((file) => {
+          if (!file?.filePath) return;
+          try {
+            fs.unlinkSync(file.filePath);
+          } catch {}
+        });
       }
     }
   });
@@ -3434,11 +3791,9 @@ function evaluateCriterion(criterion, submissionText) {
 function visibleCourseMaterials(db, userId) {
   const user = ensureUser(db, userId);
   if (user.role === "admin") return db.courseMaterials || [];
-  const teacherIds = classTeacherIdsForUser(db, user);
   return (db.courseMaterials || []).filter((material) => (
     material.ownerId === userId
-    || (user.role === "student" && material.global && teacherIds.includes(material.ownerId))
-    || (material.classId && (user.classIds || []).includes(material.classId))
+    || (user.role === "student" && material.global)
   ));
 }
 
@@ -3468,7 +3823,9 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
   const queryVector = embeddingFromTokens(queryTokens);
   const queryText = String(query || "");
   const queryHead = queryText.replace(/\s+/g, "").slice(0, 16);
+  const materialId = String(options.materialId || "").trim();
   const materials = visibleCourseMaterials(db, userId)
+    .filter((material) => !materialId || material.id === materialId)
     .filter((material) => !subject || subject === "通用" || material.subject === subject || String(query).includes(material.subject));
   const materialHits = [];
   materials.forEach((material) => {
@@ -3491,6 +3848,9 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
           exact: exactBoost > 0
         },
         materialId: material.id,
+        ownerId: material.ownerId,
+        global: Boolean(material.global),
+        classId: material.classId || "",
         chunkId: chunk.id,
         title: material.title,
         sourceName: material.sourceName,
@@ -3504,38 +3864,40 @@ function searchCourseKnowledge(db, userId, query, options = {}) {
   });
 
   const graphHits = [];
-  visibleKnowledgeGraphs(db, userId)
-    .filter((graph) => !subject || subject === "通用" || graph.subject === subject || String(query).includes(graph.subject))
-    .forEach((graph) => {
-      (graph.nodes || []).forEach((node) => {
-        const nodeText = [node.label, node.details, ...(node.knowledgePoints || [])].join(" ");
-        const tokens = tokenizeForSearch(nodeText);
-        const overlap = tokens.filter((token) => queryTokenSet.has(token));
-        const vectorScore = cosineSimilarity(queryVector, embeddingFromTokens(tokens));
-        const exactBoost = String(query).includes(node.label) ? 5 : 0;
-        const score = Number((overlap.length * 1.8 + Math.max(0, vectorScore) * 8 + exactBoost).toFixed(3));
-        if (score <= 0.5) return;
-        graphHits.push({
-          type: "graph",
-          score,
-          scoreDetail: {
-            lexical: overlap.length,
-            vector: Number(vectorScore.toFixed(3)),
-            exact: exactBoost > 0
-          },
-          graphId: graph.id,
-          nodeId: node.id,
-          title: graph.title,
-          sourceName: graph.sourceName || graph.title,
-          subject: graph.subject,
-          chapter: node.ontology?.parent || node.ontology?.layer || "知识图谱",
-          page: null,
-          quote: nodeText.slice(0, 220),
-          text: nodeText,
-          nodeLabel: node.label
+  if (options.includeGraphs !== false) {
+    visibleKnowledgeGraphs(db, userId)
+      .filter((graph) => !subject || subject === "通用" || graph.subject === subject || String(query).includes(graph.subject))
+      .forEach((graph) => {
+        (graph.nodes || []).forEach((node) => {
+          const nodeText = [node.label, node.details, ...(node.knowledgePoints || [])].join(" ");
+          const tokens = tokenizeForSearch(nodeText);
+          const overlap = tokens.filter((token) => queryTokenSet.has(token));
+          const vectorScore = cosineSimilarity(queryVector, embeddingFromTokens(tokens));
+          const exactBoost = String(query).includes(node.label) ? 5 : 0;
+          const score = Number((overlap.length * 1.8 + Math.max(0, vectorScore) * 8 + exactBoost).toFixed(3));
+          if (score <= 0.5) return;
+          graphHits.push({
+            type: "graph",
+            score,
+            scoreDetail: {
+              lexical: overlap.length,
+              vector: Number(vectorScore.toFixed(3)),
+              exact: exactBoost > 0
+            },
+            graphId: graph.id,
+            nodeId: node.id,
+            title: graph.title,
+            sourceName: graph.sourceName || graph.title,
+            subject: graph.subject,
+            chapter: node.ontology?.parent || node.ontology?.layer || "知识图谱",
+            page: null,
+            quote: nodeText.slice(0, 220),
+            text: nodeText,
+            nodeLabel: node.label
+          });
         });
       });
-    });
+  }
 
   const ranked = materialHits.concat(graphHits)
     .sort((a, b) => b.score - a.score)
@@ -3561,9 +3923,1142 @@ function citationsFromHits(hits) {
     page: hit.page,
     quote: hit.quote,
     materialId: hit.materialId,
+    ownerId: hit.ownerId,
+    global: Boolean(hit.global),
+    classId: hit.classId || "",
+    ragChannel: hit.ragChannel || "",
     graphId: hit.graphId,
     nodeId: hit.nodeId
   }));
+}
+
+function knowledgeTestKeywords(text, limit = 16) {
+  return Array.from(new Set(tokenizeForSearch(text)
+    .map((token) => String(token || "").trim())
+    .filter((token) => token.length >= 2 && !/^\d+$/.test(token))))
+    .slice(0, limit);
+}
+
+const KNOWLEDGE_TEST_STOPWORDS = new Set([
+  "课程", "资料", "老师", "学生", "章节", "学习", "本节", "掌握", "理解", "说明", "根据", "上传", "知识", "问题", "教材", "课本", "高中", "必修",
+  "用途", "来源说明", "导入建议", "课程总览", "标准答案", "评分点", "常见错误",
+  "the", "and", "for", "with", "this", "that", "from", "test", "quiz", "chapter", "section", "rag", "pdf", "md", "top_k", "score_threshold"
+]);
+
+function isMeaningfulKnowledgeTestText(text) {
+  const clean = normalizeExtractedText(text || "");
+  if (clean.replace(/\s+/g, "").length < 30) return false;
+  return knowledgeTestKeywords(clean, 8).filter((token) => !KNOWLEDGE_TEST_STOPWORDS.has(token)).length >= 3;
+}
+
+function knowledgeTestKeywordList(text, limit = 16, subject = "") {
+  const subjectText = normalizeSubject(subject || "");
+  return knowledgeTestKeywords(text, limit * 2)
+    .filter((token) => {
+      const clean = String(token || "").trim();
+      if (!clean || KNOWLEDGE_TEST_STOPWORDS.has(clean)) return false;
+      if (/^[\d.．、_\-–—/]+$/.test(clean) || /^\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)+$/.test(clean) || /^[a-z]$/i.test(clean)) return false;
+      if (/^[qQ]?\d+[.．、]?$/.test(clean) || /\.(md|pdf|docx?|pptx?)$/i.test(clean)) return false;
+      if (subjectText && clean === subjectText) return false;
+      return true;
+    })
+    .slice(0, limit);
+}
+
+function cleanKnowledgeTestTopicCandidate(value, subject = "") {
+  let clean = String(value || "")
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/^[qQ]?\d+(?:[.．、]\s*|\s+)/, "")
+    .replace(/^\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)+\s*/, "")
+    .replace(/\s*典型题\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  clean = clean.replace(/[：:]\s*$/, "").trim();
+  if (!clean || KNOWLEDGE_TEST_STOPWORDS.has(clean)) return "";
+  if (/^[\d.．、_\-–—/]+$/.test(clean) || /^\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)+$/.test(clean)) return "";
+  if (subject && clean === normalizeSubject(subject)) return "";
+  if (!/[\u4e00-\u9fa5]{2,}|[A-Za-z]{2,}/.test(clean)) return "";
+  return clean.slice(0, 36);
+}
+
+function knowledgeTestMaterialChunks(material, perMaterialLimit = 6) {
+  const chunks = Array.isArray(material.chunks) && material.chunks.length
+    ? material.chunks
+    : [{ id: `${material.id}_preview`, text: material.text || material.preview || "", chapter: material.title, page: 1, index: 0 }];
+  return chunks
+    .map((chunk, index) => ({
+      id: chunk.id || `${material.id}_chunk_${index + 1}`,
+      index: Number.isFinite(Number(chunk.index)) ? Number(chunk.index) : index,
+      chapter: chunk.chapter || material.title,
+      page: chunk.page || Math.max(1, index + 1),
+      text: String(chunk.text || "").trim()
+    }))
+    .filter((chunk) => isMeaningfulKnowledgeTestText(chunk.text))
+    .slice(0, perMaterialLimit);
+}
+
+function knowledgeTestMaterialHits(materials, limit = 18) {
+  const hits = [];
+  materials.forEach((material, materialIndex) => {
+    knowledgeTestMaterialChunks(material).forEach((chunk, index) => {
+      const keywordCount = knowledgeTestKeywordList(`${material.subject} ${material.title} ${chunk.chapter}\n${chunk.text}`, 18, material.subject).length;
+      const teachingBoost = /题库|练习|测验|quiz|keypoint|重点|误区|错因|misconception|讲义|教材|课本/i.test(`${material.title} ${material.sourceName} ${chunk.chapter}`) ? 3 : 0;
+      hits.push({
+        type: "material",
+        score: Number((keywordCount * 1.6 + teachingBoost + Math.max(0, 5 - materialIndex * 0.4) + Math.max(0, 3 - index * 0.3)).toFixed(3)),
+        materialId: material.id,
+        ownerId: material.ownerId,
+        global: Boolean(material.global),
+        classId: material.classId || "",
+        chunkId: chunk.id,
+        title: material.title,
+        sourceName: material.sourceName,
+        subject: material.subject,
+        chapter: chunk.chapter || material.title,
+        page: chunk.page,
+        quote: compactWorkflowText(chunk.text, 260),
+        text: chunk.text
+      });
+    });
+  });
+  const byKey = new Map();
+  hits
+    .sort((a, b) => b.score - a.score)
+    .forEach((hit) => {
+      const key = `${hit.materialId}:${hit.chunkId || hit.page || hit.chapter}`;
+      if (!byKey.has(key)) byKey.set(key, hit);
+    });
+  return Array.from(byKey.values()).slice(0, limit);
+}
+
+function knowledgeTestTopicFromHit(hit, subject = "") {
+  const chapterTopic = cleanKnowledgeTestTopicCandidate(hit.chapter, subject);
+  if (chapterTopic) return chapterTopic;
+  const headings = Array.from(String(hit.text || "").matchAll(/^#{1,4}\s*(.+)$/gm))
+    .map((match) => cleanKnowledgeTestTopicCandidate(match[1], subject))
+    .filter(Boolean)
+    .filter((item) => !/题库|用途|来源说明|导入建议|课程总览|目录/.test(item));
+  if (headings[0]) return headings[0];
+  const candidates = knowledgeTestKeywordList([hit.chapter, hit.title, hit.quote, hit.text].filter(Boolean).join("\n"), 12, subject);
+  return candidates[0] || normalizeSubject(subject || hit.subject || "") || "课程知识点";
+}
+
+function selectedKnowledgeTestHits(hits, count, subject = "") {
+  const total = Math.max(1, Math.min(6, Number(count || 4)));
+  const selected = [];
+  const usedTopics = new Set();
+  hits.forEach((hit) => {
+    if (selected.length >= total) return;
+    const topic = knowledgeTestTopicFromHit(hit, subject);
+    if (usedTopics.has(topic) && selected.length < Math.min(total, hits.length)) return;
+    usedTopics.add(topic);
+    selected.push({ ...hit, topic });
+  });
+  for (let index = 0; selected.length < total && hits.length; index += 1) {
+    const hit = hits[index % hits.length];
+    selected.push({ ...hit, topic: knowledgeTestTopicFromHit(hit, subject) });
+  }
+  return selected;
+}
+
+function knowledgeTestMasteryLevel(accuracy) {
+  const score = Number(accuracy || 0);
+  if (score < 40) return "未掌握";
+  if (score < 60) return "薄弱";
+  if (score < 75) return "基本掌握";
+  if (score < 90) return "熟练掌握";
+  return "精通";
+}
+
+function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = "", count = 4 } = {}) {
+  const user = ensureUser(db, userId);
+  const requestedSubject = normalizeSubject(subject || user.subject || "");
+  const requestedMaterialId = String(materialId || "").trim();
+  const visibleMaterials = visibleCourseMaterials(db, userId)
+    .filter((material) => !requestedSubject || requestedSubject === "通用" || material.subject === requestedSubject)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+  const selectedMaterial = requestedMaterialId ? visibleMaterials.find((material) => material.id === requestedMaterialId) : null;
+  if (requestedMaterialId && !selectedMaterial) {
+    throw Object.assign(new Error("课程资料不存在或当前账号不可见"), { status: 404 });
+  }
+  let materials = selectedMaterial ? [selectedMaterial] : visibleMaterials;
+  if (!materials.length) {
+    throw Object.assign(new Error(`当前「${requestedSubject || "该学科"}」暂无可用于出题的课程资料，请老师先上传并开放给学生检索。`), { status: 404 });
+  }
+  const cleanSubject = requestedSubject || materials[0]?.subject || "通用";
+  let sourceNotice = "";
+  let fallbackUsed = false;
+  if (selectedMaterial && !knowledgeTestMaterialHits([selectedMaterial], 1).length) {
+    const peerMaterials = visibleMaterials
+      .filter((material) => material.id !== selectedMaterial.id)
+      .filter((material) => !cleanSubject || cleanSubject === "通用" || material.subject === cleanSubject)
+      .filter((material) => material.ownerId === selectedMaterial.ownerId || material.global || material.classId === selectedMaterial.classId)
+      .filter((material) => knowledgeTestMaterialHits([material], 1).length);
+    materials = [selectedMaterial, ...peerMaterials];
+    fallbackUsed = peerMaterials.length > 0;
+    sourceNotice = fallbackUsed
+      ? `所选资料「${selectedMaterial.title}」可识别文本较少，已合并同学科可见资料出题。`
+      : `所选资料「${selectedMaterial.title}」可识别文本较少。`;
+  }
+  const query = [
+    cleanSubject,
+    ...materials.slice(0, 5).map((material) => `${material.title} ${material.sourceName}`),
+    ...materials.slice(0, 3).flatMap((material) => (material.chunks || []).slice(0, 2).map((chunk) => chunk.text || ""))
+  ].filter(Boolean).join("\n");
+  const searchedHits = searchCourseKnowledge(db, userId, query, {
+    subject: cleanSubject,
+    materialId: fallbackUsed ? "" : requestedMaterialId,
+    limit: 16,
+    includeGraphs: false
+  }).filter((hit) => hit.type === "material" && isMeaningfulKnowledgeTestText(hit.text || hit.quote));
+  const fallbackHits = knowledgeTestMaterialHits(materials, 18);
+  const hitMap = new Map();
+  searchedHits.concat(fallbackHits).forEach((hit) => {
+    const key = `${hit.materialId}:${hit.chunkId || hit.page || hit.chapter}`;
+    const existing = hitMap.get(key);
+    if (!existing || Number(hit.score || 0) > Number(existing.score || 0)) hitMap.set(key, hit);
+  });
+  let hits = Array.from(hitMap.values())
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, 12);
+  if (!hits.length) {
+    throw Object.assign(new Error("当前资料没有识别到足够文本，暂时无法生成知识测试。请老师上传可复制文本的 PDF/Word/PPT/TXT，或补充粘贴资料内容。"), { status: 422 });
+  }
+  const evidenceText = hits.length
+    ? hits.map((hit) => `${hit.chapter || hit.title}：${hit.quote || hit.text || ""}`).join("\n")
+    : materials.map((material) => `${material.title}：${String(material.text || "").slice(0, 260)}`).join("\n");
+  const topicCandidates = knowledgeTestKeywordList([cleanSubject, evidenceText].join("\n"), 12, cleanSubject);
+  const topic = String(topicCandidates[0] || cleanSubject || materials[0]?.title || "课程知识点").trim();
+  const questionHits = selectedKnowledgeTestHits(hits, count, cleanSubject);
+  const templates = [
+    {
+      type: "explain",
+      prompt: (itemTopic) => `请根据老师上传的「${cleanSubject}」课程资料，用自己的话解释「${itemTopic}」，并说明它在本节内容中的作用。`,
+      rubric: "覆盖定义、目标问题、关键条件和一个例子。"
+    },
+    {
+      type: "condition",
+      prompt: (itemTopic) => `结合课程资料说明「${itemTopic}」的关键条件、限制或易错点，并写出判断依据。`,
+      rubric: "说明适用条件、限制、易错点和判断依据。"
+    },
+    {
+      type: "process",
+      prompt: (itemTopic) => `请按步骤描述课程资料中「${itemTopic}」对应的处理流程、解题流程或推理流程。`,
+      rubric: "步骤顺序清晰，能说明输入、处理、输出或结论。"
+    },
+    {
+      type: "transfer",
+      prompt: (itemTopic) => `请基于该学科老师上传的资料，举一个与「${itemTopic}」相关的应用或题目场景，并说明如何分析。`,
+      rubric: "给出具体场景，并把知识点迁移到分析过程。"
+    }
+  ];
+  const sourceMaterials = materials
+    .filter((material) => hits.some((hit) => hit.materialId === material.id))
+    .map(publicCourseMaterial)
+    .slice(0, 6);
+  return {
+    id: uid("quiz"),
+    graphId: "",
+    nodeId: "",
+    materialId: requestedMaterialId || hits[0]?.materialId || "",
+    subject: cleanSubject,
+    topic,
+    sourceNotice,
+    sourceMaterials,
+    questions: questionHits.map((hit, index) => {
+      const template = templates[index % templates.length];
+      const itemTopic = hit.topic || knowledgeTestTopicFromHit(hit, cleanSubject);
+      const sourceText = compactWorkflowText(hit.text || hit.quote || "", 760);
+      const expectedKeywords = knowledgeTestKeywordList([itemTopic, hit.chapter, sourceText].join("\n"), 14, cleanSubject);
+      const companionHits = [hit, ...hits.filter((item) => item.materialId !== hit.materialId || item.chunkId !== hit.chunkId)].slice(0, 3);
+      return {
+        id: uid("question"),
+        order: index + 1,
+        topic: itemTopic,
+        graphId: "",
+        nodeId: "",
+        materialId: hit.materialId || requestedMaterialId || "",
+        subject: cleanSubject,
+        prompt: template.prompt(itemTopic),
+        type: template.type,
+        rubric: template.rubric,
+        referenceAnswer: sourceText || `围绕「${itemTopic}」说明定义、适用条件、关键步骤和常见误区。`,
+        expectedKeywords,
+        sourceTitle: hit.title || hit.sourceName || "课程资料",
+        sourceChapter: hit.chapter || "",
+        sourceQuote: compactWorkflowText(hit.quote || hit.text || "", 180),
+        citations: citationsFromHits(companionHits).slice(0, 3)
+      };
+    }),
+    citations: citationsFromHits(hits).slice(0, 4),
+    masteryRule: "系统按每题关键词覆盖、资料依据覆盖、表达完整度和结构化程度计算准确率，再用整套题平均正确率判断掌握程度。",
+    createdAt: now()
+  };
+}
+
+function graphNodeLevelServer(node) {
+  if (Number.isFinite(Number(node?.level))) return Number(node.level);
+  if (node?.group === "root") return 0;
+  if (node?.group === "chapter") return 1;
+  if (node?.group === "concept" || node?.group === "topic") return 2;
+  return 3;
+}
+
+function normalizeKnowledgeTestAttempts(attempts = []) {
+  const items = Array.isArray(attempts) ? attempts : [];
+  const byQuestion = new Map();
+  items.forEach((item) => {
+    const questionId = String(item?.questionId || item?.id || item?.question?.id || "").trim();
+    if (!questionId) return;
+    const accuracy = Math.max(0, Math.min(100, Math.round(Number(item.accuracy || 0))));
+    const normalized = {
+      questionId,
+      order: Number(item.order || 0),
+      topic: String(item.topic || "").trim(),
+      accuracy,
+      masteryLevel: item.masteryLevel || knowledgeTestMasteryLevel(accuracy),
+      at: item.at || now()
+    };
+    const existing = byQuestion.get(questionId);
+    if (!existing || String(normalized.at) >= String(existing.at || "")) byQuestion.set(questionId, normalized);
+  });
+  return Array.from(byQuestion.values());
+}
+
+function evaluateKnowledgeTestAnswer(db, userId, question, answer, options = {}) {
+  const cleanAnswer = String(answer || "").trim();
+  if (!cleanAnswer) throw Object.assign(new Error("请先输入答案"), { status: 400 });
+  const topic = String(question?.topic || "课程知识点").trim();
+  const expectedKeywords = Array.isArray(question?.expectedKeywords) && question.expectedKeywords.length
+    ? question.expectedKeywords.map(String).filter(Boolean)
+    : knowledgeTestKeywordList([question?.prompt, question?.referenceAnswer].filter(Boolean).join("\n"), 14, question?.subject || options.subject || "");
+  const referenceKeywords = knowledgeTestKeywordList([question?.referenceAnswer, question?.sourceQuote, question?.rubric].filter(Boolean).join("\n"), 22, question?.subject || options.subject || "");
+  const answerTokens = new Set(knowledgeTestKeywords(cleanAnswer, 80));
+  const matched = expectedKeywords.filter((token) => answerTokens.has(token) || cleanAnswer.includes(token));
+  const referenceMatched = referenceKeywords.filter((token) => answerTokens.has(token) || cleanAnswer.includes(token));
+  const missing = expectedKeywords.filter((token) => !matched.includes(token)).slice(0, 8);
+  const keywordCoverage = expectedKeywords.length ? matched.length / expectedKeywords.length : 0.42;
+  const referenceCoverage = referenceKeywords.length ? referenceMatched.length / Math.min(16, Math.max(6, referenceKeywords.length)) : keywordCoverage;
+  const lengthScore = Math.min(1, cleanAnswer.length / 140);
+  const structureScore = /(因为|所以|首先|其次|然后|最后|条件|步骤|例如|例子|适用|输入|输出|结论|定义|作用|误区|依据|推理)/.test(cleanAnswer) ? 1 : 0.35;
+  const emptyPenalty = /(不知道|不会|没学|不清楚|随便|无答案)/.test(cleanAnswer) ? 22 : 0;
+  let accuracy = Math.round(keywordCoverage * 58 + Math.min(1, referenceCoverage) * 22 + lengthScore * 10 + structureScore * 10 - emptyPenalty);
+  if (cleanAnswer.length < 12) accuracy = Math.min(accuracy, 42);
+  accuracy = Math.max(5, Math.min(100, accuracy));
+  const previousAttempts = normalizeKnowledgeTestAttempts(options.attempts || []);
+  const questionId = String(question?.id || options.questionId || uid("question"));
+  const currentAttempt = {
+    questionId,
+    order: Number(question?.order || 0),
+    topic,
+    accuracy,
+    masteryLevel: knowledgeTestMasteryLevel(accuracy),
+    at: now()
+  };
+  const attemptsByQuestion = new Map(previousAttempts.map((item) => [item.questionId, item]));
+  attemptsByQuestion.set(questionId, currentAttempt);
+  const answeredAttempts = Array.from(attemptsByQuestion.values());
+  const totalQuestions = Math.max(1, Math.max(Number(options.questionCount || options.totalQuestions || 0), answeredAttempts.length));
+  const overallAccuracy = Math.round(answeredAttempts.reduce((sum, item) => sum + Number(item.accuracy || 0), 0) / answeredAttempts.length);
+  const completionRate = Number((answeredAttempts.length / totalQuestions).toFixed(2));
+  const masteryLevel = knowledgeTestMasteryLevel(overallAccuracy);
+  const masteryScore = Number((overallAccuracy / 100).toFixed(2));
+  const profile = setTopicMasteryScore(
+    db,
+    userId,
+    topic,
+    masteryScore,
+    `知识测试累计：${answeredAttempts.length}/${totalQuestions} 题，平均正确率 ${overallAccuracy}%；本题 ${accuracy}%：${String(question?.prompt || topic).slice(0, 80)}`,
+    masteryLevel
+  );
+  recordLearningActivity(db, userId, {
+    kind: "practice",
+    mode: "knowledge-test",
+    prompt: String(question?.prompt || topic).slice(0, 120),
+    topics: [topic],
+    score: overallAccuracy,
+    confidence: accuracy >= 70 ? "high" : "medium",
+    minutes: 4
+  });
+  if (accuracy < 60) {
+    addWrongNote(db, userId, {
+      source: "知识测试",
+      topic,
+      question: String(question?.prompt || ""),
+      answer: cleanAnswer,
+      analysis: missing.length ? `缺少关键点：${missing.join("、")}` : "回答过短或结构不完整。",
+      recommendation: "重新阅读课程资料后再次回答，并补充定义、条件、步骤和例子。"
+    });
+  }
+  const mastery = profile.mastery?.[topic] || null;
+  const overall = {
+    answered: answeredAttempts.length,
+    total: totalQuestions,
+    completionRate,
+    accuracy: overallAccuracy,
+    masteryScore,
+    masteryLevel,
+    completed: answeredAttempts.length >= totalQuestions,
+    attempts: answeredAttempts
+      .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
+      .map((item) => ({
+        questionId: item.questionId,
+        order: item.order,
+        topic: item.topic,
+        accuracy: item.accuracy,
+        masteryLevel: item.masteryLevel,
+        at: item.at
+      }))
+  };
+  return {
+    topic,
+    accuracy,
+    masteryLevel: currentAttempt.masteryLevel,
+    matched: matched.slice(0, 10),
+    referenceMatched: referenceMatched.slice(0, 10),
+    missing,
+    overall,
+    mastery,
+    feedback: accuracy >= 85
+      ? `本题回答覆盖充分，表达清晰。累计正确率 ${overallAccuracy}%，当前判断为「${masteryLevel}」。`
+      : accuracy >= 70
+        ? `本题基本掌握，建议补充：${missing.slice(0, 4).join("、") || "更完整的例子和条件"}。累计正确率 ${overallAccuracy}%，当前判断为「${masteryLevel}」。`
+        : `本题掌握还不稳定，需要补齐：${missing.slice(0, 5).join("、") || "定义、条件、步骤和例子"}。累计正确率 ${overallAccuracy}%，当前判断为「${masteryLevel}」。`
+  };
+}
+
+function inferAlgorithmKindFromText(value) {
+  const text = String(value || "").toLowerCase();
+  if (/random\s*forest|bagging|\u968f\u673a\u68ee\u6797|\u96c6\u6210/.test(text)) return "randomForest";
+  if (/decision\s*tree|cart|\bgini\b|\u51b3\u7b56\u6811|\u4fe1\u606f\u589e\u76ca|\u57fa\u5c3c/.test(text)) return "decisionTree";
+  if (/\bsvm\b|support\s*vector|\u652f\u6301\u5411\u91cf\u673a|\u95f4\u9694\u6700\u5927\u5316|hinge|\u6838\u51fd\u6570/.test(text)) return "svm";
+  if (/\bpca\b|principal\s*component|\u4e3b\u6210\u5206|\u964d\u7ef4/.test(text)) return "pca";
+  if (/\bgmm\b|gaussian\s*mixture|\bem\s*\u7b97\u6cd5|\u9ad8\u65af\u6df7\u5408|\u671f\u671b\u6700\u5927\u5316/.test(text)) return "gmm";
+  if (/\bmlp\b|neural\s*network|\u795e\u7ecf\u7f51\u7edc|\u591a\u5c42\u611f\u77e5\u673a|\u53cd\u5411\u4f20\u64ad|xor/.test(text)) return "mlp";
+  if (/k\s*-?\s*means|\u805a\u7c7b|k\s*\u5747\u503c/.test(text)) return "kmeans";
+  if (/logistic|\u903b\u8f91\u56de\u5f52|\u4e8c\u5206\u7c7b|sigmoid/.test(text)) return "logistic";
+  if (/linear\s*regression|least\s*squares|\u7ebf\u6027\u56de\u5f52|\u6700\u5c0f\u4e8c\u4e58/.test(text)) return "linear";
+  if (/naive\s*bayes|\u6734\u7d20\u8d1d\u53f6\u65af|\u8d1d\u53f6\u65af/.test(text)) return "bayes";
+  if (/gradient|\u68af\u5ea6\u4e0b\u964d|\u4f18\u5316/.test(text)) return "gradient";
+  if (/\bknn\b|k\s*nearest|nearest\s*neighbor|k\s*\u8fd1\u90bb|\u8fd1\u90bb/.test(text)) return "knn";
+  return "";
+}
+
+function inferAlgorithmKind(prompt, hits = []) {
+  const promptKind = inferAlgorithmKindFromText(prompt);
+  if (promptKind) return promptKind;
+  const hitText = hits.map((hit) => `${hit.title || ""} ${hit.chapter || ""} ${hit.quote || ""}`).join("\n");
+  return inferAlgorithmKindFromText(hitText) || "knn";
+}
+
+function stdlibAlgorithmCode(kind, prompt, hits = []) {
+  const sourceTitle = hits[0]?.title || "课程资料";
+  const sourceChapter = hits[0]?.chapter || "检索片段";
+  const sourceQuote = String(hits[0]?.quote || prompt || "").replace(/\s+/g, " ").slice(0, 180);
+  const header = `# AI 生成算法：${prompt.replace(/\r?\n/g, " ").slice(0, 80)}
+# 课程依据：${sourceTitle} / ${sourceChapter}
+# 检索片段：${sourceQuote}
+`;
+  const snippets = {
+    knn: `${header}
+import math
+from collections import Counter
+
+train = [
+    ([5.1, 3.5, 1.4, 0.2], "setosa"),
+    ([4.9, 3.0, 1.4, 0.2], "setosa"),
+    ([6.2, 3.4, 5.4, 2.3], "virginica"),
+    ([5.9, 3.0, 5.1, 1.8], "virginica"),
+    ([6.0, 2.2, 4.0, 1.0], "versicolor"),
+    ([5.6, 2.9, 3.6, 1.3], "versicolor"),
+]
+test = [
+    ([5.0, 3.4, 1.5, 0.2], "setosa"),
+    ([6.1, 2.8, 4.7, 1.2], "versicolor"),
+    ([6.5, 3.0, 5.5, 1.8], "virginica"),
+]
+
+def euclidean(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+def predict(sample, k=3):
+    neighbors = sorted((euclidean(sample, x), label) for x, label in train)[:k]
+    return Counter(label for _, label in neighbors).most_common(1)[0][0]
+
+k = 3
+correct = sum(1 for x, y in test if predict(x, k) == y)
+query = [5.7, 2.8, 4.1, 1.3]
+print("算法: K近邻分类")
+print("训练样本数:", len(train), "测试样本数:", len(test), "k:", k)
+print("测试准确率:", round(correct / len(test), 3))
+print("预测样本:", query, "=>", predict(query, k))
+`,
+    linear: `${header}
+import random
+
+random.seed(7)
+data = []
+for i in range(60):
+    x1 = random.uniform(-3, 3)
+    x2 = random.uniform(-2, 2)
+    y = 2.8 * x1 - 1.7 * x2 + 4.2 + random.uniform(-0.18, 0.18)
+    data.append((x1, x2, y))
+
+w1 = w2 = b = 0.0
+lr = 0.025
+for epoch in range(700):
+    g1 = g2 = gb = loss = 0.0
+    for x1, x2, y in data:
+        pred = w1 * x1 + w2 * x2 + b
+        err = pred - y
+        loss += err * err
+        g1 += 2 * err * x1
+        g2 += 2 * err * x2
+        gb += 2 * err
+    n = len(data)
+    w1 -= lr * g1 / n
+    w2 -= lr * g2 / n
+    b -= lr * gb / n
+    if epoch in (0, 100, 300, 699):
+        print(f"epoch={epoch} mse={loss/n:.5f}")
+
+mean_y = sum(y for _, _, y in data) / len(data)
+ss_tot = sum((y - mean_y) ** 2 for _, _, y in data)
+ss_res = sum((w1 * x1 + w2 * x2 + b - y) ** 2 for x1, x2, y in data)
+print("算法: 线性回归（梯度下降）")
+print("参数:", {"w1": round(w1, 3), "w2": round(w2, 3), "b": round(b, 3)})
+print("R2:", round(1 - ss_res / ss_tot, 4))
+print("预测 x=(1.5,-0.8):", round(w1 * 1.5 + w2 * -0.8 + b, 3))
+`,
+    logistic: `${header}
+import math
+
+data = [
+    (0.2, 1.1, 0), (0.7, 1.4, 0), (1.0, 0.8, 0), (1.3, 1.2, 0),
+    (2.1, 2.0, 1), (2.4, 2.5, 1), (2.8, 2.2, 1), (3.0, 2.9, 1),
+]
+
+def sigmoid(z):
+    return 1 / (1 + math.exp(-z))
+
+w1 = w2 = b = 0.0
+lr = 0.35
+for epoch in range(500):
+    g1 = g2 = gb = loss = 0.0
+    for x1, x2, y in data:
+        p = sigmoid(w1 * x1 + w2 * x2 + b)
+        err = p - y
+        g1 += err * x1
+        g2 += err * x2
+        gb += err
+        loss += -(y * math.log(p + 1e-9) + (1 - y) * math.log(1 - p + 1e-9))
+    n = len(data)
+    w1 -= lr * g1 / n
+    w2 -= lr * g2 / n
+    b -= lr * gb / n
+
+predictions = []
+for x1, x2, y in data:
+    prob = sigmoid(w1 * x1 + w2 * x2 + b)
+    predictions.append((prob >= 0.5) == bool(y))
+print("算法: 逻辑回归二分类")
+print("参数:", {"w1": round(w1, 3), "w2": round(w2, 3), "b": round(b, 3)})
+print("训练准确率:", round(sum(predictions) / len(predictions), 3))
+sample = (1.8, 1.7)
+print("样本概率:", round(sigmoid(w1 * sample[0] + w2 * sample[1] + b), 4))
+`,
+    kmeans: `${header}
+import math
+
+points = [
+    (1.0, 1.2), (1.2, 0.9), (0.8, 1.1),
+    (4.0, 4.1), (4.2, 3.8), (3.8, 4.0),
+    (7.0, 1.0), (7.3, 1.3), (6.8, 0.7),
+]
+centers = [(1.0, 1.0), (4.0, 4.0), (7.0, 1.0)]
+
+def distance(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+for epoch in range(8):
+    groups = [[] for _ in centers]
+    for p in points:
+        idx = min(range(len(centers)), key=lambda i: distance(p, centers[i]))
+        groups[idx].append(p)
+    centers = [
+        (sum(x for x, _ in group) / len(group), sum(y for _, y in group) / len(group))
+        for group in groups
+    ]
+
+sse = sum(min(distance(p, c) ** 2 for c in centers) for p in points)
+print("算法: K-Means 聚类")
+print("簇中心:", [(round(x, 3), round(y, 3)) for x, y in centers])
+print("簇大小:", [len(group) for group in groups])
+print("SSE:", round(sse, 4))
+`,
+    bayes: `${header}
+import math
+from collections import defaultdict
+
+data = [
+    (("sunny", "hot"), "no"), (("sunny", "mild"), "no"), (("overcast", "hot"), "yes"),
+    (("rain", "mild"), "yes"), (("rain", "cool"), "yes"), (("sunny", "cool"), "no"),
+    (("overcast", "cool"), "yes"), (("rain", "hot"), "yes"),
+]
+classes = sorted(set(label for _, label in data))
+feature_values = [sorted(set(x[i] for x, _ in data)) for i in range(2)]
+
+def predict(sample):
+    scores = {}
+    for label in classes:
+        subset = [x for x, y in data if y == label]
+        prior = (len(subset) + 1) / (len(data) + len(classes))
+        logp = math.log(prior)
+        for i, value in enumerate(sample):
+            count = sum(1 for x in subset if x[i] == value)
+            prob = (count + 1) / (len(subset) + len(feature_values[i]))
+            logp += math.log(prob)
+        scores[label] = logp
+    return max(scores, key=scores.get), scores
+
+sample = ("rain", "cool")
+label, scores = predict(sample)
+print("算法: 朴素贝叶斯分类")
+print("样本:", sample, "预测:", label)
+print("类别对数概率:", {k: round(v, 4) for k, v in scores.items()})
+`,
+    gradient: `${header}
+def f(x):
+    return (x - 3) ** 2 + 2
+
+def grad(x):
+    return 2 * (x - 3)
+
+x = -4.0
+lr = 0.18
+for step in range(35):
+    x -= lr * grad(x)
+    if step in (0, 1, 2, 9, 34):
+        print(f"step={step + 1} x={x:.5f} f(x)={f(x):.5f}")
+
+print("算法: 梯度下降")
+print("最优点近似:", round(x, 5))
+print("最小函数值:", round(f(x), 5))
+`,
+    decisionTree: `${header}
+from collections import Counter
+
+train = [
+    ([5.1, 3.5, 1.4, 0.2], "setosa"), ([4.9, 3.0, 1.4, 0.2], "setosa"),
+    ([5.0, 3.4, 1.5, 0.2], "setosa"), ([6.0, 2.2, 4.0, 1.0], "versicolor"),
+    ([5.6, 2.9, 3.6, 1.3], "versicolor"), ([6.1, 2.8, 4.7, 1.2], "versicolor"),
+    ([6.2, 3.4, 5.4, 2.3], "virginica"), ([5.9, 3.0, 5.1, 1.8], "virginica"),
+    ([6.5, 3.0, 5.5, 1.8], "virginica"),
+]
+test = [
+    ([5.4, 3.4, 1.7, 0.2], "setosa"),
+    ([6.3, 2.5, 4.9, 1.5], "versicolor"),
+    ([6.7, 3.1, 5.6, 2.4], "virginica"),
+]
+feature_names = ["sepal_len", "sepal_width", "petal_len", "petal_width"]
+
+def majority(rows):
+    return Counter(label for _, label in rows).most_common(1)[0][0]
+
+def gini(rows):
+    total = len(rows)
+    counts = Counter(label for _, label in rows)
+    return 1 - sum((count / total) ** 2 for count in counts.values())
+
+def best_split(rows):
+    base = gini(rows)
+    best = None
+    for feature in range(len(rows[0][0])):
+        values = sorted(set(x[feature] for x, _ in rows))
+        thresholds = [(a + b) / 2 for a, b in zip(values, values[1:])]
+        for threshold in thresholds:
+            left = [row for row in rows if row[0][feature] <= threshold]
+            right = [row for row in rows if row[0][feature] > threshold]
+            if not left or not right:
+                continue
+            score = (len(left) * gini(left) + len(right) * gini(right)) / len(rows)
+            gain = base - score
+            if best is None or gain > best["gain"]:
+                best = {"feature": feature, "threshold": threshold, "gain": gain, "left": left, "right": right}
+    return best
+
+def build_tree(rows, depth=0, max_depth=3):
+    labels = {label for _, label in rows}
+    if len(labels) == 1 or depth >= max_depth:
+        return {"label": majority(rows), "samples": len(rows)}
+    split = best_split(rows)
+    if not split or split["gain"] <= 0:
+        return {"label": majority(rows), "samples": len(rows)}
+    return {
+        "feature": split["feature"],
+        "threshold": split["threshold"],
+        "gain": split["gain"],
+        "left": build_tree(split["left"], depth + 1, max_depth),
+        "right": build_tree(split["right"], depth + 1, max_depth),
+    }
+
+def predict(tree, sample):
+    if "label" in tree:
+        return tree["label"]
+    branch = "left" if sample[tree["feature"]] <= tree["threshold"] else "right"
+    return predict(tree[branch], sample)
+
+tree = build_tree(train)
+correct = sum(1 for x, y in test if predict(tree, x) == y)
+root = f'{feature_names[tree["feature"]]} <= {tree["threshold"]:.2f}'
+print("算法: 决策树分类")
+print("根节点:", root, "gini_gain:", round(tree["gain"], 4))
+print("测试准确率:", round(correct / len(test), 3))
+print("预测样本:", test[1][0], "=>", predict(tree, test[1][0]))
+`,
+    randomForest: `${header}
+import random
+from collections import Counter
+
+random.seed(12)
+train = []
+for _ in range(18):
+    x1 = random.gauss(0.8, 0.35)
+    x2 = random.gauss(1.0, 0.35)
+    train.append(((x1, x2), "low_risk"))
+for _ in range(18):
+    x1 = random.gauss(2.5, 0.45)
+    x2 = random.gauss(2.7, 0.45)
+    train.append(((x1, x2), "high_risk"))
+test = [((0.7, 1.2), "low_risk"), ((2.7, 2.4), "high_risk"), ((1.0, 0.6), "low_risk"), ((2.2, 3.0), "high_risk")]
+
+def majority(rows):
+    return Counter(label for _, label in rows).most_common(1)[0][0]
+
+def gini(rows):
+    total = len(rows)
+    counts = Counter(label for _, label in rows)
+    return 1 - sum((count / total) ** 2 for count in counts.values())
+
+def best_stump(rows, feature):
+    values = sorted(set(x[feature] for x, _ in rows))
+    best = None
+    for threshold in [(a + b) / 2 for a, b in zip(values, values[1:])]:
+        left = [row for row in rows if row[0][feature] <= threshold]
+        right = [row for row in rows if row[0][feature] > threshold]
+        if not left or not right:
+            continue
+        score = (len(left) * gini(left) + len(right) * gini(right)) / len(rows)
+        if best is None or score < best["score"]:
+            best = {
+                "feature": feature,
+                "threshold": threshold,
+                "left": majority(left),
+                "right": majority(right),
+                "score": score,
+            }
+    return best
+
+forest = []
+for _ in range(9):
+    sample = [random.choice(train) for _ in train]
+    feature = random.randrange(2)
+    forest.append(best_stump(sample, feature))
+
+def predict(sample):
+    votes = []
+    for tree in forest:
+        votes.append(tree["left"] if sample[tree["feature"]] <= tree["threshold"] else tree["right"])
+    return Counter(votes).most_common(1)[0][0], Counter(votes)
+
+correct = 0
+for x, y in test:
+    label, _ = predict(x)
+    correct += int(label == y)
+print("算法: 随机森林分类（Bagging + 随机特征桩）")
+print("树数量:", len(forest), "特征使用次数:", dict(Counter(tree["feature"] for tree in forest)))
+print("测试准确率:", round(correct / len(test), 3))
+sample = (2.4, 2.8)
+label, votes = predict(sample)
+print("预测样本:", sample, "=>", label, "votes:", dict(votes))
+`,
+    svm: `${header}
+data = [
+    ((-2.0, -1.2), -1), ((-1.5, -1.0), -1), ((-1.2, -2.0), -1), ((-2.2, -1.7), -1),
+    ((1.4, 1.2), 1), ((2.0, 1.5), 1), ((1.7, 2.2), 1), ((2.4, 1.8), 1),
+]
+w1 = w2 = b = 0.0
+lr = 0.03
+c = 1.0
+for epoch in range(700):
+    errors = 0
+    for (x1, x2), y in data:
+        margin = y * (w1 * x1 + w2 * x2 + b)
+        if margin < 1:
+            w1 = w1 * (1 - lr) + lr * c * y * x1
+            w2 = w2 * (1 - lr) + lr * c * y * x2
+            b += lr * c * y
+            errors += 1
+        else:
+            w1 *= 1 - lr
+            w2 *= 1 - lr
+    if epoch in (0, 50, 200, 699):
+        print(f"epoch={epoch} hinge_violations={errors}")
+
+def predict(sample):
+    score = w1 * sample[0] + w2 * sample[1] + b
+    return 1 if score >= 0 else -1, score
+
+correct = sum(1 for x, y in data if predict(x)[0] == y)
+sample = (1.2, 1.4)
+label, score = predict(sample)
+print("算法: 线性支持向量机")
+print("参数:", {"w1": round(w1, 3), "w2": round(w2, 3), "b": round(b, 3)})
+print("训练准确率:", round(correct / len(data), 3))
+print("预测样本:", sample, "=>", label, "decision_score:", round(score, 3))
+`,
+    pca: `${header}
+import math
+
+points = [
+    (2.5, 2.4), (0.5, 0.7), (2.2, 2.9), (1.9, 2.2), (3.1, 3.0),
+    (2.3, 2.7), (2.0, 1.6), (1.0, 1.1), (1.5, 1.6), (1.1, 0.9),
+]
+mean_x = sum(x for x, _ in points) / len(points)
+mean_y = sum(y for _, y in points) / len(points)
+centered = [(x - mean_x, y - mean_y) for x, y in points]
+cov_xx = sum(x * x for x, _ in centered) / (len(points) - 1)
+cov_xy = sum(x * y for x, y in centered) / (len(points) - 1)
+cov_yy = sum(y * y for _, y in centered) / (len(points) - 1)
+
+v = (1.0, 0.0)
+for _ in range(30):
+    nx = cov_xx * v[0] + cov_xy * v[1]
+    ny = cov_xy * v[0] + cov_yy * v[1]
+    norm = math.sqrt(nx * nx + ny * ny)
+    v = (nx / norm, ny / norm)
+
+eigenvalue = v[0] * (cov_xx * v[0] + cov_xy * v[1]) + v[1] * (cov_xy * v[0] + cov_yy * v[1])
+total_variance = cov_xx + cov_yy
+projections = [x * v[0] + y * v[1] for x, y in centered]
+print("算法: PCA 主成分分析")
+print("均值:", (round(mean_x, 3), round(mean_y, 3)))
+print("第一主成分:", (round(v[0], 4), round(v[1], 4)))
+print("解释方差比:", round(eigenvalue / total_variance, 4))
+print("前3个投影:", [round(value, 4) for value in projections[:3]])
+`,
+    gmm: `${header}
+import math
+
+data = [-2.4, -2.1, -1.8, -1.5, -1.2, 1.2, 1.5, 1.8, 2.0, 2.4, 2.7]
+weights = [0.5, 0.5]
+means = [-1.8, 1.8]
+variances = [0.7, 0.7]
+
+def normal_pdf(x, mean, var):
+    return math.exp(-((x - mean) ** 2) / (2 * var)) / math.sqrt(2 * math.pi * var)
+
+for epoch in range(25):
+    responsibilities = []
+    for x in data:
+        probs = [weights[k] * normal_pdf(x, means[k], variances[k]) for k in range(2)]
+        total = sum(probs)
+        responsibilities.append([p / total for p in probs])
+    for k in range(2):
+        nk = sum(r[k] for r in responsibilities)
+        means[k] = sum(r[k] * x for r, x in zip(responsibilities, data)) / nk
+        variances[k] = sum(r[k] * (x - means[k]) ** 2 for r, x in zip(responsibilities, data)) / nk
+        weights[k] = nk / len(data)
+    if epoch in (0, 4, 24):
+        log_likelihood = sum(math.log(sum(weights[k] * normal_pdf(x, means[k], variances[k]) for k in range(2))) for x in data)
+        print(f"epoch={epoch + 1} log_likelihood={log_likelihood:.4f}")
+
+sample = 1.6
+probs = [weights[k] * normal_pdf(sample, means[k], variances[k]) for k in range(2)]
+total = sum(probs)
+print("算法: 一维高斯混合模型 EM")
+print("权重:", [round(v, 3) for v in weights])
+print("均值:", [round(v, 3) for v in means])
+print("方差:", [round(v, 3) for v in variances])
+print("样本责任度:", [round(p / total, 4) for p in probs])
+`,
+    mlp: `${header}
+import math
+
+data = [((0, 0), 0), ((0, 1), 1), ((1, 0), 1), ((1, 1), 0)]
+weights = {
+    "h1": [0.6, -0.4, 0.1],
+    "h2": [-0.3, 0.7, -0.2],
+    "out": [0.5, 0.5, -0.3],
+}
+
+def sigmoid(x):
+    return 1 / (1 + math.exp(-x))
+
+def forward(x):
+    x1, x2 = x
+    h1 = sigmoid(weights["h1"][0] * x1 + weights["h1"][1] * x2 + weights["h1"][2])
+    h2 = sigmoid(weights["h2"][0] * x1 + weights["h2"][1] * x2 + weights["h2"][2])
+    out = sigmoid(weights["out"][0] * h1 + weights["out"][1] * h2 + weights["out"][2])
+    return h1, h2, out
+
+lr = 0.8
+for epoch in range(5000):
+    loss = 0
+    for x, y in data:
+        h1, h2, out = forward(x)
+        error = out - y
+        loss += error * error
+        delta_out = error * out * (1 - out)
+        old_out = weights["out"][:]
+        weights["out"][0] -= lr * delta_out * h1
+        weights["out"][1] -= lr * delta_out * h2
+        weights["out"][2] -= lr * delta_out
+        delta_h1 = delta_out * old_out[0] * h1 * (1 - h1)
+        delta_h2 = delta_out * old_out[1] * h2 * (1 - h2)
+        weights["h1"][0] -= lr * delta_h1 * x[0]
+        weights["h1"][1] -= lr * delta_h1 * x[1]
+        weights["h1"][2] -= lr * delta_h1
+        weights["h2"][0] -= lr * delta_h2 * x[0]
+        weights["h2"][1] -= lr * delta_h2 * x[1]
+        weights["h2"][2] -= lr * delta_h2
+    if epoch in (0, 999, 4999):
+        print(f"epoch={epoch + 1} mse={loss / len(data):.5f}")
+
+predictions = []
+for x, y in data:
+    _, _, prob = forward(x)
+    predictions.append((x, y, round(prob, 4), int(prob >= 0.5)))
+correct = sum(1 for _, y, _, pred in predictions if pred == y)
+print("算法: 多层感知机 XOR 分类")
+print("训练准确率:", round(correct / len(data), 3))
+print("预测:", predictions)
+`
+  };
+  return snippets[kind] || snippets.knn;
+}
+
+function courseAlgorithmGeneration(prompt, hits) {
+  const kind = inferAlgorithmKind(prompt, hits);
+  return {
+    title: {
+      knn: "AI生成 K近邻分类算法",
+      linear: "AI生成 线性回归算法",
+      logistic: "AI生成 逻辑回归算法",
+      kmeans: "AI生成 K-Means聚类算法",
+      bayes: "AI生成 朴素贝叶斯算法",
+      gradient: "AI生成 梯度下降算法",
+      decisionTree: "AI生成 决策树算法",
+      randomForest: "AI生成 随机森林算法",
+      svm: "AI生成 支持向量机算法",
+      pca: "AI生成 PCA主成分分析算法",
+      gmm: "AI生成 高斯混合模型算法",
+      mlp: "AI生成 多层感知机算法"
+    }[kind] || "AI生成机器学习算法",
+    chapter: hits[0]?.chapter || "课程资料检索生成",
+    code: stdlibAlgorithmCode(kind, prompt, hits),
+    sourceType: "course",
+    summary: `命中 ${hits.length} 条课程资料/图谱内容，已按“${hits[0]?.title || "课程资料"}”生成可运行标准库 Python 示例。`,
+    citations: citationsFromHits(hits)
+  };
+}
+
+function localAlgorithmGeneration(prompt, subject, reason = "") {
+  const fallbackHit = {
+    type: "local",
+    title: `${subject || "机器学习"}算法实验室`,
+    sourceName: "系统内置标准库算法模板",
+    subject: subject || "机器学习",
+    chapter: "本地可运行算法模板",
+    page: null,
+    quote: String(prompt || "").slice(0, 180)
+  };
+  const generated = courseAlgorithmGeneration(prompt, [fallbackHit]);
+  const reasonText = reason ? `；${reason}` : "";
+  return {
+    ...generated,
+    chapter: generated.chapter || fallbackHit.chapter,
+    sourceType: "local",
+    summary: `课程资料未达到可引用命中阈值${reasonText}，已使用系统内置标准库算法模板生成，并将在返回前真实执行验证。`,
+    citations: []
+  };
+}
+
+function publicGenerationFallbackReason(error) {
+  const message = String(error?.message || "");
+  if (!message) return "OpenAI 生成不可用";
+  if (/api key|Incorrect API key|401|authorization|unauthorized/i.test(message)) return "OpenAI 配置不可用";
+  if (/abort|timeout|超时/i.test(message)) return "OpenAI 生成超时";
+  return "OpenAI 生成不可用";
+}
+
+function extractJsonObject(text) {
+  const raw = String(text || "").trim();
+  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
+  const source = fenced ? fenced[1].trim() : raw;
+  const start = source.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) {
+      try {
+        return JSON.parse(source.slice(start, i + 1));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function extractPythonCode(text) {
+  const raw = String(text || "").trim();
+  const fenced = raw.match(/```(?:python|py)?\s*([\s\S]*?)```/i);
+  return (fenced ? fenced[1] : raw).trim();
+}
+
+function isPythonRuntimeUnavailable(runResult) {
+  const text = `${runResult?.stderr || ""}\n${runResult?.output || ""}`;
+  return /无法启动 Python|未找到可用 Python|spawn .*ENOENT|ENOENT/i.test(text);
+}
+
+async function generateAlgorithmWithOpenAI(prompt, subject, repairContext = null, contextHits = []) {
+  if (!isConfiguredSecret(OPENAI_API_KEY)) {
+    throw new Error("未配置 OpenAI API Key，无法在课程资料未命中时生成算法。");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+  try {
+    const contextText = (Array.isArray(contextHits) ? contextHits : [])
+      .slice(0, 5)
+      .map((hit, index) => `[S${index + 1}] ${hit.title || hit.sourceName || "课程资料"} / ${hit.chapter || ""}\n${String(hit.text || hit.quote || "").slice(0, 700)}`)
+      .join("\n\n");
+    const messages = [
+      {
+        role: "system",
+        content: [
+          "你是机器学习课程的算法代码生成器。",
+          "必须精准理解用户要的算法类型、输入输出和评估指标。",
+          "只输出 JSON，不要输出 Markdown。",
+          "JSON 字段为 title、chapter、code、summary。",
+          "code 必须是可直接运行的 Python 代码，只使用 Python 标准库，不依赖 numpy、sklearn、pandas、matplotlib。",
+          "代码必须包含小型内置数据、训练或计算过程，并使用 print 输出真实指标、预测结果、误差或中间过程。",
+          "不要只打印“运行成功”，不要伪造结果，不要省略可复现实验数据。"
+        ].join("\n")
+      },
+      {
+        role: "user",
+        content: [
+          `学科：${subject || "机器学习"}`,
+          `算法需求：${prompt}`,
+          contextText ? `可参考的课程资料片段：\n${contextText}` : ""
+        ].filter(Boolean).join("\n\n")
+      }
+    ];
+    if (repairContext) {
+      messages.push({
+        role: "user",
+        content: [
+          "上一次生成的代码在真实执行时失败，请根据报错修复后重新输出同样 JSON 结构。",
+          `退出码：${repairContext.exitCode}`,
+          `stdout：${String(repairContext.stdout || "").slice(0, 1200)}`,
+          `stderr：${String(repairContext.stderr || "").slice(0, 1800)}`,
+          "只返回修复后的 JSON。"
+        ].join("\n")
+      });
+    }
+    const response = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages,
+        temperature: 0.15,
+        max_tokens: 2500
+      }),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`OpenAI 接口返回 ${response.status}：${text.slice(0, 240)}`);
+    }
+    const data = JSON.parse(text);
+    const content = data.choices?.[0]?.message?.content || data.output?.text || "";
+    const parsed = extractJsonObject(content);
+    const code = extractPythonCode(parsed?.code || content);
+    if (!code) throw new Error("OpenAI 没有返回可执行 Python 代码。");
+    return {
+      title: parsed?.title || "OpenAI 生成机器学习算法",
+      chapter: parsed?.chapter || "OpenAI 大模型生成",
+      code,
+      sourceType: "openai",
+      summary: parsed?.summary || (contextHits?.length ? "已结合课程资料上下文调用 OpenAI 生成标准库 Python 算法代码。" : "已调用 OpenAI 生成标准库 Python 算法代码。"),
+      citations: citationsFromHits(contextHits || []).slice(0, 5)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyGeneratedAlgorithm(generated, prompt, subject) {
+  const firstRun = await runModelCodeSnippet(generated.code);
+  if (firstRun.success && String(firstRun.stdout || "").trim()) {
+    return {
+      ...generated,
+      summary: `${generated.summary || "已生成算法代码"}（已在服务器真实执行验证，退出码 ${firstRun.exitCode}。）`,
+      verifiedRun: {
+        success: true,
+        exitCode: firstRun.exitCode,
+        durationMs: firstRun.durationMs,
+        pythonCommand: firstRun.pythonCommand || "",
+        stdout: firstRun.stdout.slice(0, 2000),
+        stderr: firstRun.stderr.slice(0, 1000),
+        output: firstRun.output
+      }
+    };
+  }
+  if (isPythonRuntimeUnavailable(firstRun)) {
+    return {
+      ...generated,
+      summary: `${generated.summary || "已生成算法代码"}（服务器暂未找到可用 Python，已返回代码；配置 MODEL_CODE_PYTHON 后可真实运行验证。）`,
+      verifiedRun: {
+        success: false,
+        exitCode: firstRun.exitCode,
+        durationMs: firstRun.durationMs,
+        pythonCommand: firstRun.pythonCommand || "",
+        stdout: firstRun.stdout?.slice(0, 2000) || "",
+        stderr: firstRun.stderr?.slice(0, 1000) || "",
+        output: firstRun.output
+      }
+    };
+  }
+  if (generated.sourceType !== "openai") {
+    throw new Error(`生成的课程算法未通过真实执行验证：${firstRun.stderr || firstRun.output || "没有输出"}`);
+  }
+  const repaired = await generateAlgorithmWithOpenAI(prompt, subject, firstRun);
+  const secondRun = await runModelCodeSnippet(repaired.code);
+  if (!secondRun.success || !String(secondRun.stdout || "").trim()) {
+    throw new Error(`OpenAI 生成的算法未通过真实执行验证：${secondRun.stderr || secondRun.output || "没有输出"}`);
+  }
+  return {
+    ...repaired,
+    summary: `${repaired.summary || "已生成算法代码"}（已在服务器真实执行验证，退出码 ${secondRun.exitCode}。）`,
+    verifiedRun: {
+      success: true,
+      exitCode: secondRun.exitCode,
+      durationMs: secondRun.durationMs,
+      pythonCommand: secondRun.pythonCommand || "",
+      stdout: secondRun.stdout.slice(0, 2000),
+      stderr: secondRun.stderr.slice(0, 1000),
+      output: secondRun.output
+    }
+  };
 }
 
 function isAcademicMisuse(prompt) {
@@ -3603,6 +5098,102 @@ const AI_MODE_META = {
   }
 };
 
+const ML_DIAGNOSIS_WORKFLOW_INFO = {
+  name: "机器学习知识点问答与学习诊断助手_升级版_多RAG_朴素贝叶斯诊断_0_6_0",
+  version: "0.6.0",
+  source: "dify/ml_learning_diagnosis/ml_learning_diagnosis_assistant_upgraded_0_6_0.yml"
+};
+
+const ML_DIAGNOSIS_WORKFLOW_STEP_TITLES = [
+  "开始",
+  "输入清洗与任务识别_代码节点",
+  "课程知识库检索_RAG",
+  "错因知识库检索_RAG",
+  "RAG片段去重与证据整理_代码节点",
+  "朴素贝叶斯知识点分类_代码节点",
+  "掌握度评分_代码节点",
+  "LLM标准解释节点",
+  "条件分支_问答或诊断",
+  "LLM诊断反馈节点",
+  "输出结构化JSON_代码节点",
+  "项目数据库同步_HTTP节点",
+  "结束"
+];
+
+const TEACHER_WORKFLOW_INFO = {
+  name: DIFY_TEACHER_WORKFLOW_NAME,
+  version: "1.0.0",
+  source: "DIFY_TEACHER_WORKFLOW_API_KEY"
+};
+
+const TEACHER_WORKFLOW_STEP_TITLES = [
+  "开始",
+  "输入清洗与教师任务识别",
+  "项目资料/图谱/班级/作业上下文整理",
+  "条件分支_备课/出题/批改/学情",
+  "备课分支",
+  "出题分支",
+  "批改分支",
+  "学情分析分支",
+  "引用与可靠性检查",
+  "输出结构化JSON",
+  "结束"
+];
+
+const TEACHER_WORKFLOW_TASK_META = {
+  lesson_plan: {
+    label: "备课",
+    mode: "plan",
+    strategy: "教师教学工作流：备课",
+    structure: "教学目标、重难点、课堂流程、板书/讲义、检测方式"
+  },
+  quiz_generation: {
+    label: "出题",
+    mode: "practice",
+    strategy: "教师教学工作流：出题",
+    structure: "分层题目、标准答案、评分点、错因标签、讲评建议"
+  },
+  grading: {
+    label: "批改",
+    mode: "grade",
+    strategy: "教师教学工作流：批改建议",
+    structure: "rubric分项、建议分、错因、修改建议、后续练习"
+  },
+  class_analysis: {
+    label: "学情分析",
+    mode: "plan",
+    strategy: "教师教学工作流：学情分析",
+    structure: "班级薄弱点、学生分层、补救路径、检测安排"
+  },
+  remedial_plan: {
+    label: "补救方案",
+    mode: "plan",
+    strategy: "教师教学工作流：分层补救",
+    structure: "薄弱点归因、分组任务、补救练习、复测标准"
+  }
+};
+
+const ML_DIAGNOSIS_TOPIC_KEYWORDS = {
+  "机器学习基础": ["机器学习", "监督学习", "无监督学习", "强化学习", "泛化", "归纳偏置", "训练集", "测试集"],
+  "数学基础": ["向量", "矩阵", "梯度", "凸函数", "范数", "内积", "协方差", "优化"],
+  KNN: ["KNN", "K近邻", "最近邻", "距离", "投票", "回归平均", "标准化", "K值"],
+  "线性回归": ["线性回归", "平方损失", "均方误差", "MSE", "正规方程", "梯度下降", "学习率"],
+  "过拟合与泛化": ["过拟合", "欠拟合", "泛化", "正则化", "L1", "L2", "验证集", "交叉验证", "数据泄漏"],
+  "逻辑回归": ["逻辑回归", "逻辑斯谛", "Sigmoid", "二分类", "交叉熵", "最大似然", "精确率", "召回率", "F1"],
+  "矩阵分解与推荐": ["矩阵分解", "推荐", "隐因子", "用户向量", "物品向量", "评分预测", "冷启动"],
+  "神经网络": ["神经网络", "感知机", "多层感知机", "隐藏层", "激活函数", "反向传播", "ReLU", "Dropout"],
+  "卷积神经网络": ["CNN", "卷积", "卷积核", "特征图", "池化", "padding", "stride", "权值共享"],
+  "循环神经网络": ["RNN", "GRU", "LSTM", "序列", "隐藏状态", "时间步", "门控", "梯度消失"],
+  "支持向量机": ["SVM", "支持向量机", "支持向量", "最大间隔", "软间隔", "核函数", "C", "gamma"],
+  "决策树": ["决策树", "ID3", "C4.5", "CART", "信息增益", "增益率", "基尼", "剪枝"],
+  "集成学习": ["集成学习", "Bagging", "随机森林", "Boosting", "AdaBoost", "GBDT", "残差", "负梯度"],
+  "KMeans聚类": ["KMeans", "K均值", "聚类", "簇", "簇中心", "SSE", "肘部法", "轮廓系数", "KMeans++"],
+  "PCA降维": ["PCA", "主成分", "降维", "方差", "协方差", "特征值", "特征向量", "解释方差率"],
+  "朴素贝叶斯": ["朴素贝叶斯", "贝叶斯", "先验", "似然", "后验", "条件独立", "拉普拉斯平滑", "文本分类"],
+  "EM与GMM": ["EM", "GMM", "高斯混合", "隐变量", "E步", "M步", "似然", "软聚类"],
+  "自编码器": ["自编码器", "编码器", "解码器", "隐表示", "重构误差", "异常检测"]
+};
+
 function aiModeAlias(mode) {
   const raw = String(mode || "").trim().toLowerCase();
   const aliases = {
@@ -3617,6 +5208,14 @@ function aiModeAlias(mode) {
     guided_tutoring: "guided",
     "study-plan": "plan",
     "teacher-plan": "plan",
+    lesson_plan: "plan",
+    "lesson-plan": "plan",
+    class_analysis: "plan",
+    "class-analysis": "plan",
+    remedial_plan: "plan",
+    "remedial-plan": "plan",
+    quiz_generation: "practice",
+    "quiz-generation": "practice",
     correction: "grade",
     grading: "grade",
     qa: "qa",
@@ -3765,7 +5364,8 @@ function findGraphContext(db, userId, subject, prompt, topics = [], hits = []) {
 
 function profileMasterySummary(profile) {
   const entries = Object.entries(profile.mastery || {})
-    .map(([topic, item]) => ({ topic, score: Number(item.score || 0), status: item.status || "待诊断" }))
+    .filter(([, item]) => Array.isArray(item?.evidence) && item.evidence.length > 0)
+    .map(([topic, item]) => ({ topic, score: Number(item.score || 0), status: item.status || "待诊断", evidenceCount: item.evidence.length }))
     .sort((a, b) => a.score - b.score);
   return {
     weak: entries.filter((item) => item.score < 0.58).slice(0, 6),
@@ -3964,7 +5564,588 @@ function buildLearningPanel({ citations, topics, graphContext, profile, mode, st
   };
 }
 
-function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint }) {
+function mistakeKnowledgeBoost(hit) {
+  const text = `${hit.title || ""} ${hit.sourceName || ""} ${hit.chapter || ""} ${hit.quote || ""}`;
+  return /错因|误区|易混淆|评分|标准答案|题库|rubric|quiz|misconception|mistake/i.test(text) ? 1.2 : 0;
+}
+
+function ragHitKey(hit) {
+  if (hit.materialId || hit.chunkId) return `material:${hit.materialId || ""}:${hit.chunkId || hit.page || hit.chapter || ""}`;
+  if (hit.graphId || hit.nodeId) return `graph:${hit.graphId || ""}:${hit.nodeId || hit.chapter || ""}`;
+  return `${hit.type || "hit"}:${hit.sourceName || hit.title || ""}:${hit.chapter || ""}:${String(hit.quote || "").slice(0, 80)}`;
+}
+
+function graphWorkflowHitsFromSelection(db, userId, options = {}) {
+  const graphId = String(options.graphId || options.graph_id || "").trim();
+  const nodeId = String(options.nodeId || options.node_id || "").trim();
+  const knowledgePoint = String(options.knowledgePoint || options.knowledge_point || "").trim();
+  if (!graphId && !nodeId && !knowledgePoint) return [];
+  const subject = normalizeSubject(options.subject || "");
+  const graph = visibleKnowledgeGraphs(db, userId)
+    .filter((item) => !subject || subject === "通用" || item.subject === subject)
+    .find((item) => (graphId ? item.id === graphId : true));
+  if (!graph) return [];
+  const node = (graph.nodes || []).find((item) => (nodeId ? item.id === nodeId : false))
+    || (graph.nodes || []).find((item) => knowledgePoint && String(item.label || "") === knowledgePoint)
+    || (graph.nodes || []).find((item) => knowledgePoint && graphNodeText(item).includes(knowledgePoint));
+  if (!node) return [];
+  const nodeMap = new Map((graph.nodes || []).map((item) => [String(item.id), item]));
+  const relations = (graph.links || [])
+    .filter((link) => linkEndpointId(link.source) === String(node.id) || linkEndpointId(link.target) === String(node.id))
+    .slice(0, 12)
+    .map((link) => {
+      const sourceId = linkEndpointId(link.source);
+      const targetId = linkEndpointId(link.target);
+      const source = nodeMap.get(sourceId)?.label || sourceId;
+      const target = nodeMap.get(targetId)?.label || targetId;
+      return `${source} -> ${target}: ${link.label || link.type || "related"}`;
+    });
+  const neighbors = relations
+    .flatMap((line) => line.split(/->|:/).map((part) => part.trim()))
+    .filter(Boolean)
+    .filter((label) => label !== String(node.label || ""))
+    .slice(0, 12);
+  const path = [graph.subject, node.ontology?.parent, node.ontology?.layer, node.label].filter(Boolean);
+  const text = [
+    `Graph: ${graph.title || ""}`,
+    `Subject: ${graph.subject || ""}`,
+    `Path: ${path.join(" / ")}`,
+    `Focus: ${node.label || ""}`,
+    node.details || node.summary || node.description || "",
+    ...(node.knowledgePoints || []),
+    node.misconception ? `Misconception: ${node.misconception}` : "",
+    node.graphRag?.promptHint ? `GraphRAG: ${node.graphRag.promptHint}` : "",
+    relations.length ? `Relations:\n${relations.join("\n")}` : "",
+    neighbors.length ? `Neighbor nodes: ${Array.from(new Set(neighbors)).join(", ")}` : ""
+  ].filter(Boolean).join("\n");
+  return [{
+    type: "graph",
+    score: 999,
+    scoreDetail: { explicitGraphSelection: true },
+    graphId: graph.id,
+    nodeId: node.id,
+    title: graph.title,
+    sourceName: graph.sourceName || graph.title,
+    subject: graph.subject,
+    chapter: path.join(" / ") || "GraphRAG",
+    page: null,
+    quote: text.replace(/\s+/g, " ").slice(0, 220),
+    text,
+    nodeLabel: node.label,
+    ragChannel: "graph-focus"
+  }];
+}
+
+function graphDatabaseHitsForWorkflow(db, userId, options = {}) {
+  const subject = normalizeSubject(options.subject || "");
+  const query = [
+    options.question || options.query || options.prompt || "",
+    options.knowledgePoint || options.knowledge_point || "",
+    options.chapter || ""
+  ].filter(Boolean).join("\n");
+  const graphId = String(options.graphId || options.graph_id || "").trim();
+  const nodeId = String(options.nodeId || options.node_id || "").trim();
+  const knowledgePoint = String(options.knowledgePoint || options.knowledge_point || "").trim();
+  const explicitHits = userId ? graphWorkflowHitsFromSelection(db, userId, { ...options, subject, graphId, nodeId, knowledgePoint }) : [];
+  const queryTokens = tokenizeForSearch(query || knowledgePoint || subject);
+  const queryTokenSet = new Set(queryTokens);
+  const queryVector = embeddingFromTokens(queryTokens);
+  const graphs = userId
+    ? visibleKnowledgeGraphs(db, userId)
+    : (db.knowledgeGraphs || []).filter((graph) => graph.global);
+  const hits = [];
+  graphs
+    .filter((graph) => (!subject || subject === "通用" || graph.subject === subject || String(query).includes(graph.subject)))
+    .filter((graph) => (graphId ? graph.id === graphId : true))
+    .forEach((graph) => {
+      const nodeMap = new Map((graph.nodes || []).map((node) => [String(node.id), node]));
+      (graph.nodes || []).forEach((node) => {
+        if (nodeId && node.id !== nodeId) return;
+        const nodeText = graphNodeText(node);
+        const tokens = tokenizeForSearch(nodeText);
+        const overlap = tokens.filter((token) => queryTokenSet.has(token));
+        const vectorScore = cosineSimilarity(queryVector, embeddingFromTokens(tokens));
+        const exactBoost = knowledgePoint && String(node.label || "").includes(knowledgePoint) ? 6 : 0;
+        const score = Number((overlap.length * 1.8 + Math.max(0, vectorScore) * 8 + exactBoost).toFixed(3));
+        if (!nodeId && !knowledgePoint && score <= 0.5) return;
+        const relations = (graph.links || [])
+          .filter((link) => linkEndpointId(link.source) === String(node.id) || linkEndpointId(link.target) === String(node.id))
+          .slice(0, 10)
+          .map((link) => {
+            const sourceId = linkEndpointId(link.source);
+            const targetId = linkEndpointId(link.target);
+            const source = nodeMap.get(sourceId)?.label || sourceId;
+            const target = nodeMap.get(targetId)?.label || targetId;
+            return `${source} -> ${target}: ${link.label || link.type || "related"}`;
+          });
+        const text = [
+          `Graph: ${graph.title || ""}`,
+          `Subject: ${graph.subject || ""}`,
+          `Focus: ${node.label || ""}`,
+          nodeText,
+          relations.length ? `Relations:\n${relations.join("\n")}` : ""
+        ].filter(Boolean).join("\n");
+        hits.push({
+          type: "graph",
+          score: nodeId || exactBoost ? score + 100 : score,
+          graphId: graph.id,
+          nodeId: node.id,
+          title: graph.title,
+          sourceName: graph.sourceName || graph.title,
+          subject: graph.subject,
+          chapter: node.ontology?.parent || node.ontology?.layer || "知识图谱",
+          quote: text.replace(/\s+/g, " ").slice(0, 220),
+          text,
+          nodeLabel: node.label,
+          relations,
+          ragChannel: nodeId || exactBoost ? "graph-db-focus" : "graph-db"
+        });
+      });
+    });
+  return mergeWorkflowRagHits(explicitHits.concat(hits), [], Number(options.limit || 8));
+}
+
+function mergeWorkflowRagHits(courseHits = [], mistakeHits = [], limit = RAG_MAX_CONTEXT_CHUNKS) {
+  const byKey = new Map();
+  const addHit = (hit, channel, boost = 0) => {
+    if (!hit) return;
+    const key = ragHitKey(hit);
+    const candidate = {
+      ...hit,
+      ragChannel: hit.ragChannel || channel,
+      workflowBoost: Number(boost.toFixed(3)),
+      score: Number((Number(hit.score || 0) + boost).toFixed(3))
+    };
+    const existing = byKey.get(key);
+    if (!existing || candidate.score > existing.score) {
+      byKey.set(key, candidate);
+    } else if (existing.ragChannel && existing.ragChannel !== channel) {
+      existing.ragChannel = "multi";
+    }
+  };
+  courseHits.forEach((hit) => addHit(hit, "course", 0));
+  mistakeHits.forEach((hit) => addHit(hit, "mistake", mistakeKnowledgeBoost(hit)));
+  return Array.from(byKey.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+function buildMlDiagnosisQueries({ prompt, chapter = "", knowledgePoint = "", mode = "qa" }) {
+  const cleanPrompt = String(prompt || "").trim();
+  const target = [chapter, knowledgePoint].filter(Boolean).join(" ");
+  const courseQuery = [cleanPrompt, target].filter(Boolean).join("\n");
+  const mistakeQuery = [
+    "常见误区 易混淆 评分标准 错因标签 标准答案 题库",
+    mode === "grade" ? "学生答案 批改 诊断 缺漏点" : "知识问答 追问 练习 掌握度",
+    cleanPrompt,
+    target
+  ].filter(Boolean).join("\n");
+  return { courseQuery, mistakeQuery };
+}
+
+function searchMlDiagnosisWorkflowKnowledge(db, userId, options = {}) {
+  const limit = options.limit || RAG_MAX_CONTEXT_CHUNKS;
+  const { courseQuery, mistakeQuery } = buildMlDiagnosisQueries(options);
+  const searchLimit = Math.max(limit, 8);
+  const selectedGraphHits = graphWorkflowHitsFromSelection(db, userId, options);
+  const courseHits = selectedGraphHits.concat(searchCourseKnowledge(db, userId, courseQuery, {
+    subject: options.subject,
+    limit: searchLimit
+  }).map((hit) => ({ ...hit, ragChannel: "course" })));
+  const mistakeHits = searchCourseKnowledge(db, userId, mistakeQuery, {
+    subject: options.subject,
+    limit: searchLimit
+  }).map((hit) => ({ ...hit, ragChannel: "mistake" }));
+  return {
+    courseQuery,
+    mistakeQuery,
+    selectedGraphHits,
+    courseHits,
+    mistakeHits,
+    hits: mergeWorkflowRagHits(courseHits, mistakeHits, limit)
+  };
+}
+
+function buildMlDiagnosisWorkflowTrace({ retrieval = {}, citations = [], mode = "qa", topics = [], hasStudentAnswer = false }) {
+  const hits = Array.isArray(retrieval.hits) ? retrieval.hits : [];
+  const materialHits = hits.filter((hit) => hit.type === "material");
+  const graphHits = hits.filter((hit) => hit.type === "graph");
+  const publicMaterialHits = materialHits.filter((hit) => hit.global);
+  const topicText = topics.length ? topics.slice(0, 3).join("、") : "待定位";
+  const modeText = hasStudentAnswer || mode === "grade" ? "学习诊断模式" : "知识问答模式";
+  const courseCount = retrieval.courseHits?.length || 0;
+  const mistakeCount = retrieval.mistakeHits?.length || 0;
+  return {
+    ...ML_DIAGNOSIS_WORKFLOW_INFO,
+    mode: modeText,
+    retrievedCount: hits.length,
+    citationCount: citations.length,
+    steps: [
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[0]}：接收问题、上下文、学习目标和可选学生答案`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[1]}：识别为${modeText}，抽取候选关键词`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[2]}：检索教师端课程资料，命中 ${courseCount} 条候选`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[3]}：检索错因/题库/评分标准，命中 ${mistakeCount} 条候选`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[4]}：合并去重后保留 ${hits.length} 条证据，其中教师公开资料 ${publicMaterialHits.length} 条、图谱节点 ${graphHits.length} 条`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[5]}：定位知识点 ${topicText}`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[6]}：根据本轮证据更新学习画像和掌握度`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[7]}：生成标准解释、练习、批改或学习路径`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[8]}：${hasStudentAnswer || mode === "grade" ? "进入诊断反馈分支" : "进入知识问答分支"}`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[9]}：${hasStudentAnswer || mode === "grade" ? "输出错因、缺漏点和改进建议" : "问答模式下保留追问建议"}`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[10]}：返回答案、引用、知识点、掌握度和后续问题`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[11]}：同步会话、错题本和学习画像到项目数据库`,
+      `${ML_DIAGNOSIS_WORKFLOW_STEP_TITLES[12]}：完成本轮 AI 助教响应`
+    ]
+  };
+}
+
+const ML_DIAGNOSIS_FORMULA_TERMS = ["目标", "损失", "函数", "最小化", "最大化", "MSE", "SSE", "交叉熵", "似然", "间隔", "方差", "概率"];
+const ML_DIAGNOSIS_PROCESS_TERMS = ["步骤", "流程", "初始化", "训练", "预测", "更新", "迭代", "分配", "反向传播", "梯度下降", "投票", "平均", "近邻"];
+const ML_DIAGNOSIS_SCENARIO_TERMS = ["适合", "场景", "优点", "缺点", "局限", "用于", "当", "如果", "不适合"];
+const ML_DIAGNOSIS_METRIC_TERMS = ["准确率", "精确率", "召回率", "F1", "AUC", "MSE", "RMSE", "MAE", "轮廓系数", "SSE"];
+const ML_DIAGNOSIS_PREPROCESS_TERMS = ["标准化", "归一化", "缺失值", "类别不平衡", "数据泄漏", "尺度", "量纲"];
+
+function compactWorkflowText(value, limit = 240) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function textContainsKeyword(text, keyword) {
+  const source = String(text || "").toLowerCase();
+  const sourceCompact = source.replace(/\s+/g, "");
+  const target = String(keyword || "").toLowerCase();
+  const targetCompact = target.replace(/\s+/g, "");
+  if (!targetCompact) return false;
+  return source.includes(target) || sourceCompact.includes(targetCompact);
+}
+
+function keywordHitCount(text, keyword) {
+  const source = String(text || "").toLowerCase();
+  const target = String(keyword || "").toLowerCase();
+  if (!target) return 0;
+  let count = 0;
+  let index = source.indexOf(target);
+  while (index >= 0) {
+    count += 1;
+    index = source.indexOf(target, index + target.length);
+  }
+  if (!count && textContainsKeyword(source, target)) return 1;
+  return count;
+}
+
+function mlDiagnosisSoftmax(scores) {
+  const values = Object.values(scores);
+  const top = Math.max(...values);
+  const expScores = Object.fromEntries(Object.entries(scores).map(([topic, score]) => [topic, Math.exp(score - top)]));
+  const total = Object.values(expScores).reduce((sum, value) => sum + value, 0) || 1;
+  return Object.fromEntries(Object.entries(expScores).map(([topic, value]) => [topic, value / total]));
+}
+
+function classifyMlDiagnosisTopic({ question = "", studentAnswer = "", evidenceSummary = "", knowledgePoint = "" }) {
+  const queryText = [question, knowledgePoint].filter(Boolean).join("\n");
+  const answerText = String(studentAnswer || "");
+  const evidenceText = String(evidenceSummary || "").slice(0, 1800);
+  const scores = {};
+  const primaryScores = {};
+  const evidenceScores = {};
+  Object.entries(ML_DIAGNOSIS_TOPIC_KEYWORDS).forEach(([topic, keywords]) => {
+    let primaryScore = 0;
+    let evidenceScore = 0;
+    keywords.forEach((keyword) => {
+      primaryScore += keywordHitCount(queryText, keyword) * 6;
+      primaryScore += keywordHitCount(answerText, keyword) * 4;
+      evidenceScore += Math.min(keywordHitCount(evidenceText, keyword), 3) * 0.25;
+    });
+    if (textContainsKeyword(queryText, topic)) primaryScore += 18;
+    if (textContainsKeyword(answerText, topic)) primaryScore += 10;
+    if (textContainsKeyword(evidenceText, topic)) evidenceScore += 0.5;
+    primaryScores[topic] = primaryScore;
+    evidenceScores[topic] = evidenceScore;
+  });
+  if (knowledgePoint && Object.prototype.hasOwnProperty.call(primaryScores, knowledgePoint)) {
+    primaryScores[knowledgePoint] += 7;
+  } else if (knowledgePoint) {
+    primaryScores[knowledgePoint] = 7;
+    evidenceScores[knowledgePoint] = 0;
+  }
+  const maxPrimaryScore = Math.max(...Object.values(primaryScores));
+  Object.keys(primaryScores).forEach((topic) => {
+    scores[topic] = maxPrimaryScore > 0
+      ? primaryScores[topic] + Math.min(evidenceScores[topic] || 0, 1)
+      : evidenceScores[topic] || 0;
+  });
+  const bestScore = Math.max(...Object.values(scores));
+  if (!Number.isFinite(bestScore) || bestScore <= 0) {
+    return {
+      topic_label: knowledgePoint || "机器学习基础",
+      topic_probability: 0.35,
+      top_topic_candidates: [
+        { topic: knowledgePoint || "机器学习基础", probability: 0.35 }
+      ]
+    };
+  }
+  const probabilities = mlDiagnosisSoftmax(scores);
+  const ranked = Object.entries(probabilities)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([topic, probability]) => ({ topic, probability: Number(probability.toFixed(4)) }));
+  return {
+    topic_label: ranked[0]?.topic || knowledgePoint || "机器学习基础",
+    topic_probability: ranked[0]?.probability || 0.35,
+    top_topic_candidates: ranked
+  };
+}
+
+function mlDiagnosisHasAny(text, terms) {
+  return terms.some((term) => textContainsKeyword(text, term));
+}
+
+function mlDiagnosisCoverage(answer, topic) {
+  const keywords = ML_DIAGNOSIS_TOPIC_KEYWORDS[topic] || [];
+  const matched = keywords.filter((keyword) => textContainsKeyword(answer, keyword));
+  return { matched, coverage: matched.length / Math.max(keywords.length, 1) };
+}
+
+function mlDiagnosisMasteryLevel(score) {
+  if (score <= 0) return "未诊断";
+  if (score < 45) return "薄弱";
+  if (score < 65) return "基本理解";
+  if (score < 85) return "较好掌握";
+  return "熟练掌握";
+}
+
+function assessMlDiagnosisMastery({ question = "", studentAnswer = "", topicLabel = "机器学习基础", targetLevel = "考试复习" }) {
+  const answer = String(studentAnswer || "").trim();
+  if (!answer) {
+    return {
+      mastery_score: 0,
+      mastery_level: "未诊断",
+      error_tags: [],
+      missing_points: ["未提供学生自我理解，当前仅生成标准解释。"],
+      positive_points: [],
+      project_sync_suggestion: "未提供 student_answer，建议不写入错题本，仅保存问答记录。"
+    };
+  }
+  const { matched, coverage } = mlDiagnosisCoverage(answer, topicLabel);
+  const dimensions = {
+    "公式/目标函数": mlDiagnosisHasAny(answer, ML_DIAGNOSIS_FORMULA_TERMS),
+    "算法流程": mlDiagnosisHasAny(answer, ML_DIAGNOSIS_PROCESS_TERMS),
+    "适用场景": mlDiagnosisHasAny(answer, ML_DIAGNOSIS_SCENARIO_TERMS),
+    "评价指标": mlDiagnosisHasAny(answer, ML_DIAGNOSIS_METRIC_TERMS)
+  };
+  if (["KNN", "KMeans聚类", "PCA降维", "支持向量机"].includes(topicLabel)) {
+    dimensions["数据预处理"] = mlDiagnosisHasAny(answer, ML_DIAGNOSIS_PREPROCESS_TERMS);
+  }
+
+  let score = 28 + Math.min(answer.length / 10, 22) + coverage * 26;
+  score += Object.values(dimensions).filter(Boolean).length * 6;
+
+  const errors = [];
+  const combined = `${question}\n${answer}`;
+  if (topicLabel === "KMeans聚类" && textContainsKeyword(answer, "分类") && !textContainsKeyword(answer, "无监督")) {
+    errors.push("概念混淆", "任务类型错误");
+  }
+  if (topicLabel === "KNN" && textContainsKeyword(answer, "聚类") && !textContainsKeyword(answer, "监督")) errors.push("概念混淆");
+  if (topicLabel === "逻辑回归" && textContainsKeyword(answer, "连续") && !textContainsKeyword(answer, "分类")) errors.push("任务类型错误");
+  if (topicLabel === "PCA降维" && textContainsKeyword(answer, "标签") && !textContainsKeyword(answer, "无监督")) errors.push("任务类型错误");
+  if (topicLabel !== "KNN" && !dimensions["公式/目标函数"]) errors.push("公式目标缺失");
+  if (!dimensions["算法流程"] && ["考试复习", "代码实践", "原理推导"].includes(targetLevel)) errors.push("算法流程缺失");
+  if (!dimensions["评价指标"] && ["考试复习", "代码实践"].includes(targetLevel)) errors.push("评价指标误用");
+  if (textContainsKeyword(combined, "测试集") && textContainsKeyword(combined, "调参")) errors.push("数据泄漏");
+  if (["KNN", "KMeans聚类", "PCA降维", "支持向量机"].includes(topicLabel) && !dimensions["数据预处理"]) errors.push("数据预处理缺失");
+
+  const error_tags = Array.from(new Set(errors));
+  score -= error_tags.length * 6;
+  const mastery_score = Math.max(0, Math.min(100, Math.round(score)));
+  const missing_points = Object.entries(dimensions)
+    .filter(([, ok]) => !ok)
+    .map(([name]) => `缺少${name}说明`);
+  if (coverage < 0.35) missing_points.push("关键词覆盖不足");
+  if (!missing_points.length) missing_points.push("可继续补充公式推导或代码实现细节");
+
+  const positive_points = [];
+  if (matched.length) positive_points.push(`已覆盖关键词：${matched.slice(0, 8).join("、")}`);
+  Object.entries(dimensions).forEach(([name, ok]) => {
+    if (ok) positive_points.push(`已提到${name}`);
+  });
+
+  let project_sync_suggestion = "建议写入 conversations，并根据错因标签生成 wrongNotes。";
+  if (mastery_score >= 85) project_sync_suggestion = "建议更新 learningProfiles 为较高掌握度，可不加入错题本。";
+  else if (error_tags.length) project_sync_suggestion = "建议写入 wrongNotes，并在学习画像中降低对应知识点掌握度。";
+
+  return {
+    mastery_score,
+    mastery_level: mlDiagnosisMasteryLevel(mastery_score),
+    error_tags,
+    missing_points,
+    positive_points,
+    project_sync_suggestion
+  };
+}
+
+function mlDiagnosisNextQuestions(topic, missingPoints = []) {
+  const label = topic || "该知识点";
+  const questions = [
+    `请用一句话说明${label}的任务类型和输入输出。`,
+    `${label}的核心目标函数或预测流程是什么？`
+  ];
+  if (missingPoints.some((item) => textContainsKeyword(item, "评价指标"))) {
+    questions.push(`评价${label}时应选择哪些指标，为什么？`);
+  } else {
+    questions.push(`${label}在什么场景下不适合使用？`);
+  }
+  return questions.slice(0, 3);
+}
+
+function mlDiagnosisEvidenceItems(hits = [], citations = []) {
+  return hits.slice(0, 6).map((hit, index) => {
+    const citation = citations[index] || {};
+    return {
+      id: citation.id || `S${index + 1}`,
+      type: hit.type || citation.type || "material",
+      title: hit.title || citation.title || citation.sourceName || "课程资料",
+      sourceName: hit.sourceName || citation.sourceName || "",
+      chapter: hit.chapter || citation.chapter || "",
+      page: hit.page || citation.page || "",
+      quote: compactWorkflowText(hit.quote || hit.text || citation.quote || "", 260),
+      score: hit.score,
+      global: Boolean(hit.global || citation.global),
+      ragChannel: hit.ragChannel || citation.ragChannel || ""
+    };
+  });
+}
+
+function buildMlDiagnosisStandardAnswer({ prompt = "", topicLabel = "", hits = [], citations = [], hasEvidence = false }) {
+  const sourceRefs = citations.length ? citations.slice(0, 3).map((citation) => `[${citation.id}]`).join("、") : "";
+  const evidencePrefix = hasEvidence
+    ? `以下解释优先依据课程知识库证据 ${sourceRefs}。`
+    : "知识库依据不足，以下为课程通用解释。";
+  if (topicLabel === "KNN") {
+    return [
+      `1. 核心结论：KNN（K 近邻）是一种基于实例的监督学习方法，可用于分类和回归。它不显式训练参数模型，而是把训练样本保存下来，在预测时根据“相似样本给出相似结果”的思想做判断。${evidencePrefix}`,
+      "2. 原理或流程：对一个待预测样本，先计算它与训练集中样本的距离；再选出距离最近的 K 个邻居；分类任务通常用多数投票得到类别，回归任务通常对邻居标签取平均或加权平均。",
+      "3. 公式/目标函数或关键机制：核心机制包括距离度量、K 值选择、邻居投票/平均以及特征尺度处理。常用欧氏距离、曼哈顿距离等；不同特征量纲差异较大时，需要标准化或归一化，否则距离会被大尺度特征主导。",
+      "4. 评价指标与适用场景：分类可看准确率、精确率、召回率、F1 等；回归可看 MSE、MAE 等。KNN 适合样本规模不大、局部相似性明显、决策边界较复杂的问题，但预测阶段计算开销较大，对噪声、无关特征和特征尺度较敏感。",
+      "5. 一句易错提醒：KNN 不是 KMeans 聚类；K 不是越小越好，也不是越大越好，需要结合验证集、距离度量和数据预处理一起选择。"
+    ].join("\n");
+  }
+  const evidenceLines = mlDiagnosisEvidenceItems(hits, citations)
+    .slice(0, 3)
+    .map((item) => `${item.id}：${item.quote}`)
+    .filter((line) => line.replace(/^[^：]+：/, "").trim());
+  const evidenceText = evidenceLines.length ? `可参考证据：${evidenceLines.join("；")}` : `问题原文：${compactWorkflowText(prompt, 120)}`;
+  return [
+    `1. 核心结论：本题定位到「${topicLabel || "机器学习基础"}」。${evidencePrefix}`,
+    `2. 原理或流程：先明确该知识点的输入、处理步骤和输出，再把定义、关键条件和例题对应起来。${evidenceText}`,
+    "3. 公式/目标函数或关键机制：复习时应写清楚核心机制、优化目标或预测流程，避免只背名称。",
+    "4. 评价指标与适用场景：结合任务类型选择指标；分类关注准确率、精确率、召回率、F1，回归关注 MSE、MAE，聚类关注轮廓系数、SSE 等。",
+    "5. 一句易错提醒：不要把相邻算法的任务类型、训练目标、预测流程和评价指标混用。"
+  ].join("\n");
+}
+
+function buildMlDiagnosisFeedback({ diagnosisMode = "知识问答模式", studentAnswer = "", topicLabel = "", mastery = {} }) {
+  if (!String(studentAnswer || "").trim() && diagnosisMode === "知识问答模式") {
+    return "未提供学生自我理解，当前为知识问答模式，暂不进行掌握度扣分诊断。";
+  }
+  const positives = mastery.positive_points?.length ? `已掌握：${mastery.positive_points.join("；")}。` : "";
+  const missing = mastery.missing_points?.length ? `需要补齐：${mastery.missing_points.join("；")}。` : "";
+  const errors = mastery.error_tags?.length ? `错因标签：${mastery.error_tags.join("、")}。` : "";
+  return [
+    `本轮对「${topicLabel || "该知识点"}」的诊断结果为${mastery.mastery_level || "未诊断"}，得分 ${mastery.mastery_score ?? 0}。`,
+    positives,
+    errors,
+    missing,
+    "建议按“任务类型 -> 预测流程/目标函数 -> 评价指标 -> 适用场景与局限”的顺序重写一次答案。"
+  ].filter(Boolean).join("\n");
+}
+
+function buildMlDiagnosisFinalAnswer({ topic, mastery, standardAnswer, diagnosisFeedback, ragEvidence = [] }) {
+  const nextQuestions = mlDiagnosisNextQuestions(topic.topic_label, mastery.missing_points);
+  const structuredResult = {
+    topic_label: topic.topic_label,
+    topic_probability: topic.topic_probability,
+    top_topic_candidates: topic.top_topic_candidates,
+    mastery_score: mastery.mastery_score,
+    mastery_level: mastery.mastery_level,
+    error_tags: mastery.error_tags,
+    missing_points: mastery.missing_points,
+    rag_evidence: ragEvidence,
+    standard_answer: standardAnswer,
+    diagnosis_feedback: diagnosisFeedback,
+    next_questions: nextQuestions,
+    project_sync_suggestion: mastery.project_sync_suggestion
+  };
+  const finalAnswer = [
+    `## 知识点定位\n${topic.topic_label}（置信度 ${topic.topic_probability}）`,
+    `## 掌握度\n${mastery.mastery_level}，得分 ${mastery.mastery_score}`,
+    `## 标准解释\n${standardAnswer}`,
+    `## 诊断反馈\n${diagnosisFeedback}`,
+    `## 追问题\n${nextQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`
+  ].join("\n\n");
+  return { finalAnswer, structuredResult };
+}
+
+function buildMlDiagnosisWorkflowAnswer({ user, mode, prompt, hits = [], citations = [], chapter = "", knowledgePoint = "", studentAnswer = "" }) {
+  const hasEvidence = hits.length > 0 && hits[0].score > 0;
+  const evidenceSummary = [chapter, knowledgePoint, ...hits.slice(0, 6).map((hit) => hit.text || hit.quote || "")].join("\n");
+  const hasStudentAnswer = Boolean(String(studentAnswer || "").trim());
+  const diagnosisMode = hasStudentAnswer ? "学习诊断模式" : "知识问答模式";
+  const topic = classifyMlDiagnosisTopic({
+    question: prompt,
+    studentAnswer,
+    evidenceSummary,
+    knowledgePoint
+  });
+  const mastery = assessMlDiagnosisMastery({
+    question: prompt,
+    studentAnswer,
+    topicLabel: topic.topic_label,
+    targetLevel: "考试复习"
+  });
+  const ragEvidence = mlDiagnosisEvidenceItems(hits, citations);
+  const standardAnswer = buildMlDiagnosisStandardAnswer({
+    prompt,
+    topicLabel: topic.topic_label,
+    hits,
+    citations,
+    hasEvidence
+  });
+  const diagnosisFeedback = buildMlDiagnosisFeedback({
+    diagnosisMode,
+    studentAnswer,
+    topicLabel: topic.topic_label,
+    mastery
+  });
+  const { finalAnswer, structuredResult } = buildMlDiagnosisFinalAnswer({
+    topic,
+    mastery,
+    standardAnswer,
+    diagnosisFeedback,
+    ragEvidence
+  });
+  const relatedTopics = Array.from(new Set([
+    topic.topic_label,
+    ...topic.top_topic_candidates.map((item) => item.topic),
+    knowledgePoint
+  ].filter(Boolean))).slice(0, 8);
+  return {
+    content: finalAnswer,
+    confidence: hasEvidence ? "high" : "low",
+    topics: relatedTopics,
+    workflowResult: {
+      ...structuredResult,
+      diagnosis_mode: diagnosisMode,
+      final_answer: finalAnswer,
+      workflow: ML_DIAGNOSIS_WORKFLOW_INFO,
+      student_id: user?.id || "",
+      question: prompt,
+      student_answer: studentAnswer
+    }
+  };
+}
+
+function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint, studentAnswer = "" }) {
+  if (user.role === "student") {
+    return buildMlDiagnosisWorkflowAnswer({ user, mode, prompt, hits, citations, chapter, knowledgePoint, studentAnswer });
+  }
   const hasEvidence = hits.length > 0 && hits[0].score > 0;
   const topics = Array.from(new Set([
     knowledgePoint,
@@ -4246,7 +6427,769 @@ function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teac
   };
 }
 
-function buildEducationalAgentAnswer(db, user, body) {
+function isConfiguredSecret(value, placeholders = []) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const blocked = new Set([
+    "app-xxx",
+    "replace-with-your-openai-api-key",
+    "replace-me",
+    "change-me",
+    "replace-me-with-long-random-token",
+    "replace-with-dify-callback-token",
+    ...placeholders
+  ]);
+  return !blocked.has(text);
+}
+
+function isDifyStudentWorkflowConfigured() {
+  return Boolean(DIFY_BASE_URL && isConfiguredSecret(DIFY_STUDENT_WORKFLOW_API_KEY));
+}
+
+function isDifyTeacherWorkflowConfigured() {
+  return Boolean(DIFY_BASE_URL && isConfiguredSecret(DIFY_TEACHER_WORKFLOW_API_KEY));
+}
+
+function isDifyWorkflowConfigured(role = "student") {
+  if (role === "teacher") return isDifyTeacherWorkflowConfigured();
+  if (role === "student") return isDifyStudentWorkflowConfigured();
+  return isDifyStudentWorkflowConfigured() || isDifyTeacherWorkflowConfigured();
+}
+
+function isDifyCallbackTokenConfigured() {
+  return isConfiguredSecret(DIFY_CALLBACK_TOKEN);
+}
+
+function difyTargetLevel(answerDepth = "") {
+  return {
+    brief: "入门理解",
+    layered: "考试复习",
+    full: "原理推导",
+    exam: "考试复习"
+  }[String(answerDepth || "layered")] || "考试复习";
+}
+
+function difyDiagnosisDepth(answerDepth = "") {
+  return {
+    brief: "简洁",
+    layered: "标准",
+    full: "深度",
+    exam: "深度"
+  }[String(answerDepth || "layered")] || "标准";
+}
+
+function difyWorkflowUrl() {
+  return `${DIFY_BASE_URL}/workflows/run`;
+}
+
+async function postDifyWorkflow({ apiKey, inputs, user, authHintName = "DIFY_WORKFLOW_API_KEY" }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DIFY_WORKFLOW_TIMEOUT_MS);
+  try {
+    const response = await fetch(difyWorkflowUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        inputs,
+        response_mode: "blocking",
+        user: `${DIFY_WORKFLOW_USER_PREFIX}-${user.id}`
+      }),
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(async () => ({ error: await response.text().catch(() => "") }));
+    if (!response.ok) {
+      const authHint = response.status === 401 ? `，请检查 ${authHintName} 是否属于已发布的 Dify 工作流 App` : "";
+      throw Object.assign(new Error(`Dify 工作流调用失败：HTTP ${response.status}${authHint}`), {
+        status: response.status,
+        details: payload
+      });
+    }
+    return payload;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function difyProjectDocsFromHits(hits = [], sourceType = "项目教师端课程资料", limit = 8) {
+  return hits.slice(0, limit).map((hit, index) => ({
+    id: `P${index + 1}`,
+    content: compactWorkflowText(hit.text || hit.quote || "", 700),
+    title: hit.title || hit.sourceName || sourceType,
+    source_type: hit.source_type || hit.sourceType || (hit.type === "graph" ? "project_knowledge_graph" : sourceType),
+    type: hit.type || "",
+    score: Number((Number(hit.score || 0) + (hit.global ? 2 : 0)).toFixed(4)),
+    subject: hit.subject || "",
+    chapter: hit.chapter || "",
+    page: hit.page || "",
+    materialId: hit.materialId || "",
+    graphId: hit.graphId || "",
+    nodeId: hit.nodeId || "",
+    nodeLabel: hit.nodeLabel || "",
+    sourceName: hit.sourceName || "",
+    global: Boolean(hit.global),
+    ragChannel: hit.ragChannel || ""
+  })).filter((item) => item.content);
+}
+
+function buildDifyProjectMasteryContext(db, userId, profile, subject = "机器学习") {
+  const summary = profileMasterySummary(profile);
+  const wrongNotes = (db.wrongNotes || [])
+    .filter((item) => item.userId === userId)
+    .slice(0, 12)
+    .map((item) => ({
+      topic: item.topic,
+      question: compactWorkflowText(item.question, 180),
+      analysis: compactWorkflowText(item.analysis, 180),
+      recommendation: compactWorkflowText(item.recommendation, 180),
+      createdAt: item.createdAt
+    }));
+  return {
+    student_id: userId,
+    subject,
+    level: profile.level || "",
+    weak_points: profile.weakPoints || [],
+    question_count: Number(profile.questionCount || 0),
+    practice_count: Number(profile.practiceCount || 0),
+    summary,
+    mastery: profile.mastery || {},
+    wrong_notes: wrongNotes,
+    recent_activity: (profile.recentActivity || []).slice(0, 10)
+  };
+}
+
+function roleLabel(role = "") {
+  return {
+    admin: "管理员",
+    teacher: "教师",
+    student: "学生"
+  }[String(role || "").trim()] || "用户";
+}
+
+function buildDifyAssistantContext({ user, mode, teaching, subject, chapter, knowledgePoint, answerDepth, hasStudentAnswer }) {
+  const meta = AI_MODE_META[mode] || AI_MODE_META.qa;
+  const teacherInstructions = {
+    qa: "面向教师答疑，优先给出课程资料依据、课堂可讲法、可追问点和可引用来源。",
+    explain: "面向教师讲解设计，输出可用于课堂的概念切入、板书结构、例题和易错提醒。",
+    guided: "面向教师课堂互动，设计逐步追问、学生可能回答和教师追问策略。",
+    practice: "面向教师出题，生成分层题目、标准答案、评分点、错因标签和讲评建议。",
+    grade: "面向教师批改，基于粘贴的学生答案给出评分建议、错因、修改建议和后续练习。",
+    plan: "面向教师备课或学情分析，输出教学目标、重难点、课堂流程、分层补救和检测方式。"
+  };
+  const studentInstructions = {
+    qa: "面向学生答疑，先给核心结论，再给资料依据、例子、易错点和下一步练习。",
+    explain: "面向学生讲解，按定义、直觉、步骤、例子、误区组织，不直接代做作业。",
+    guided: "面向学生提示，只给下一步线索和追问，保留思考空间。",
+    practice: "面向学生练习，按基础、提高、迁移分层出题，并附答案解析。",
+    grade: "面向学生诊断，基于学生自我理解指出已掌握、错因、缺漏点和修正路径。",
+    plan: "面向学生规划，结合学习画像给出复习优先级、每日任务和检查方式。"
+  };
+  const roleInstructions = user.role === "teacher" ? teacherInstructions : studentInstructions;
+  return {
+    request_user_id: user.id,
+    request_user_role: user.role,
+    request_user_name: user.name || "",
+    role_label: roleLabel(user.role),
+    assistant_task: mode,
+    assistant_task_label: meta.label,
+    assistant_strategy: teaching?.strategy || meta.strategy,
+    answer_structure: meta.structure,
+    task_instruction: roleInstructions[mode] || roleInstructions.qa,
+    subject,
+    chapter,
+    knowledge_point: knowledgePoint,
+    answer_depth: answerDepth,
+    target_level: difyTargetLevel(answerDepth),
+    diagnosis_depth: difyDiagnosisDepth(answerDepth),
+    has_student_answer: Boolean(hasStudentAnswer)
+  };
+}
+
+function buildDifyClassContext(db, user, body = {}, subject = "通用") {
+  const requestedClassId = String(body.classId || body.class_id || "").trim();
+  const subjectText = normalizeSubject(subject || "");
+  if (user.role === "teacher" || user.role === "admin") {
+    const ownedClasses = (db.classes || [])
+      .filter((klass) => user.role === "admin" || klass.teacherId === user.id)
+      .filter((klass) => !requestedClassId || klass.id === requestedClassId || klass.inviteCode === requestedClassId)
+      .filter((klass) => !subjectText || subjectText === "通用" || !klass.subject || klass.subject === subjectText)
+      .slice(0, 6);
+    return {
+      role: user.role,
+      request_user_id: user.id,
+      requested_class_id: requestedClassId,
+      class_count: ownedClasses.length,
+      classes: ownedClasses.map((klass) => {
+        const studentIds = Array.isArray(klass.studentIds) ? klass.studentIds : [];
+        const studentProfiles = studentIds
+          .map((studentId) => {
+            const student = getUser(db, studentId);
+            const profile = ensureLearningProfile(db, studentId);
+            const summary = profileMasterySummary(profile);
+            return {
+              id: studentId,
+              name: student?.name || "",
+              level: profile.level || "",
+              weak_points: (summary.weak || []).slice(0, 3).map((item) => ({ topic: item.topic, score: item.score })),
+              average_mastery: summary.average
+            };
+          })
+          .slice(0, 12);
+        const classHomework = (db.homework || [])
+          .filter((item) => item.classId === klass.id)
+          .slice(0, 8)
+          .map((item) => {
+            const submissions = (db.submissions || []).filter((submission) => submission.homeworkId === item.id);
+            const reviewed = submissions.filter((submission) => ["graded", "review_pending"].includes(submission.status)).length;
+            return {
+              id: item.id,
+              title: item.title,
+              subject: item.subject || klass.subject || "",
+              submission_count: submissions.length,
+              reviewed_count: reviewed,
+              created_at: item.createdAt
+            };
+          });
+        return {
+          id: klass.id,
+          name: klass.name,
+          subject: klass.subject || "",
+          student_count: studentIds.length,
+          students: studentProfiles,
+          recent_homework: classHomework
+        };
+      })
+    };
+  }
+  const joinedClasses = (db.classes || [])
+    .filter((klass) => (klass.studentIds || []).includes(user.id))
+    .filter((klass) => !requestedClassId || klass.id === requestedClassId || klass.inviteCode === requestedClassId)
+    .filter((klass) => !subjectText || subjectText === "通用" || !klass.subject || klass.subject === subjectText)
+    .slice(0, 6);
+  const ownSubmissions = (db.submissions || [])
+    .filter((submission) => submission.studentId === user.id)
+    .slice(0, 10);
+  return {
+    role: "student",
+    student_id: user.id,
+    requested_class_id: requestedClassId,
+    classes: joinedClasses.map((klass) => ({
+      id: klass.id,
+      name: klass.name,
+      subject: klass.subject || "",
+      teacher_id: klass.teacherId,
+      teacher_name: getUser(db, klass.teacherId)?.name || "",
+      homework: (db.homework || [])
+        .filter((item) => item.classId === klass.id)
+        .slice(0, 8)
+        .map((item) => ({
+          id: item.id,
+          title: item.title,
+          submitted: ownSubmissions.some((submission) => submission.homeworkId === item.id),
+          created_at: item.createdAt
+        }))
+    }))
+  };
+}
+
+function teacherWorkflowTaskAlias(value = "", prompt = "", requestedMode = "") {
+  const raw = String(value || "").trim().toLowerCase();
+  const aliases = {
+    "teacher-plan": "lesson_plan",
+    lesson: "lesson_plan",
+    lesson_plan: "lesson_plan",
+    "lesson-plan": "lesson_plan",
+    plan: "lesson_plan",
+    quiz: "quiz_generation",
+    questions: "quiz_generation",
+    practice: "quiz_generation",
+    quiz_generation: "quiz_generation",
+    "quiz-generation": "quiz_generation",
+    grade: "grading",
+    grading: "grading",
+    correction: "grading",
+    "class-analysis": "class_analysis",
+    class_analysis: "class_analysis",
+    analysis: "class_analysis",
+    remedy: "remedial_plan",
+    remedial: "remedial_plan",
+    remedial_plan: "remedial_plan",
+    "remedial-plan": "remedial_plan"
+  };
+  if (aliases[raw]) return aliases[raw];
+  const mode = String(requestedMode || "").trim().toLowerCase();
+  if (aliases[mode]) return aliases[mode];
+  const text = String(prompt || "");
+  if (/学情|班级|薄弱|掌握度|分层补救|补救|补差/.test(text)) return "class_analysis";
+  if (/批改|评分|rubric|错因|提交|答案/.test(text)) return "grading";
+  if (/出题|生成.*题|测验|练习|作业|题库|选择题|填空题|简答题|计算题|编程题/.test(text)) return "quiz_generation";
+  if (/补救|补差|复测|分层任务/.test(text)) return "remedial_plan";
+  return "lesson_plan";
+}
+
+function teacherWorkflowMeta(taskType) {
+  return TEACHER_WORKFLOW_TASK_META[taskType] || TEACHER_WORKFLOW_TASK_META.lesson_plan;
+}
+
+function normalizeIdList(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+  const parsed = arrayFromJsonish(value);
+  if (parsed.length) return parsed.map((item) => String(item || "").trim()).filter(Boolean);
+  return String(value || "")
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function arrayItemsFromJsonish(value) {
+  const parsed = parseJsonish(value, value);
+  if (Array.isArray(parsed)) return parsed.filter((item) => item !== null && item !== undefined && item !== "");
+  if (parsed && typeof parsed === "object") return [parsed];
+  return arrayFromJsonish(parsed);
+}
+
+function selectedMaterialHitsForWorkflow(db, userId, materialIds = [], subject = "", limit = 8) {
+  const idSet = new Set(normalizeIdList(materialIds));
+  if (!idSet.size) return [];
+  const subjectText = normalizeSubject(subject || "");
+  const hits = [];
+  visibleCourseMaterials(db, userId)
+    .filter((material) => idSet.has(String(material.id)))
+    .filter((material) => !subjectText || subjectText === "通用" || !material.subject || material.subject === subjectText)
+    .forEach((material) => {
+      const chunks = Array.isArray(material.chunks) && material.chunks.length
+        ? material.chunks.slice(0, 4)
+        : [{ id: `${material.id}_preview`, text: material.text || material.preview || "", chapter: material.title, page: 1, index: 0 }];
+      chunks.forEach((chunk, index) => {
+        hits.push({
+          type: "material",
+          score: Number((30 - hits.length * 0.4).toFixed(3)),
+          materialId: material.id,
+          ownerId: material.ownerId,
+          global: Boolean(material.global),
+          classId: material.classId || "",
+          chunkId: chunk.id,
+          title: material.title,
+          sourceName: material.sourceName,
+          subject: material.subject,
+          chapter: chunk.chapter || material.title,
+          page: chunk.page || Math.max(1, Number(chunk.index ?? index) + 1),
+          quote: String(chunk.text || "").slice(0, 220),
+          text: chunk.text || material.text || "",
+          ragChannel: "selected_material"
+        });
+      });
+    });
+  return hits.filter((hit) => hit.text || hit.quote).slice(0, limit);
+}
+
+function buildTeacherSubmissionContext(db, teacher, body = {}) {
+  const submissionId = String(body.studentSubmissionId || body.student_submission_id || body.submissionId || "").trim();
+  const requestedHomeworkId = String(body.homeworkId || body.homework_id || "").trim();
+  const requestedStudentId = String(body.studentId || body.student_id || "").trim();
+  let submission = submissionId ? (db.submissions || []).find((item) => item.id === submissionId) : null;
+  let homework = null;
+  if (submission) {
+    homework = (db.homework || []).find((item) => item.id === submission.homeworkId);
+    if (!homework || (teacher.role !== "admin" && homework.teacherId !== teacher.id)) {
+      submission = null;
+      homework = null;
+    }
+  }
+  if (!homework && requestedHomeworkId) {
+    homework = (db.homework || []).find((item) => item.id === requestedHomeworkId && (teacher.role === "admin" || item.teacherId === teacher.id)) || null;
+  }
+  const studentId = submission?.studentId || requestedStudentId;
+  const student = studentId ? getUser(db, studentId) : null;
+  const rubric = normalizeRubricCriteria(body.rubric || homework?.rubric || [], homework?.answer || homework?.description || "");
+  return {
+    homework_id: homework?.id || requestedHomeworkId,
+    homework_title: homework?.title || "",
+    homework_description: compactWorkflowText(homework?.description || "", 500),
+    homework_answer: compactWorkflowText(homework?.answer || "", 500),
+    student_submission_id: submission?.id || submissionId,
+    student_id: student?.id || "",
+    student_name: student?.name || "",
+    submission_text: compactWorkflowText(submission?.text || body.studentAnswer || body.student_answer || "", 900),
+    submission_status: submission?.status || "",
+    rubric,
+    teacher_review_required: true
+  };
+}
+
+function buildTeacherWorkflowTrace({ retrieval = {}, citations = [], taskType = "lesson_plan", topics = [] }) {
+  const hits = Array.isArray(retrieval.hits) ? retrieval.hits : [];
+  const taskMeta = teacherWorkflowMeta(taskType);
+  return {
+    ...TEACHER_WORKFLOW_INFO,
+    mode: taskMeta.label,
+    task_type: taskType,
+    retrievedCount: hits.length,
+    citationCount: citations.length,
+    steps: [
+      `${TEACHER_WORKFLOW_STEP_TITLES[0]}：接收教师任务、课程范围、班级/资料/图谱选择`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[1]}：识别为${taskMeta.label}任务`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[2]}：检索项目资料 ${retrieval.courseHits?.length || 0} 条、错因/题库 ${retrieval.mistakeHits?.length || 0} 条`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[3]}：进入${taskMeta.label}分支`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[9]}：检查引用、可靠性和教师复核要求`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[10]}：返回 final_answer、结构化产物、引用和后续动作`,
+      `${TEACHER_WORKFLOW_STEP_TITLES[11]}：完成教师教学工作流响应`
+    ],
+    focusTopics: topics.slice(0, 6)
+  };
+}
+
+function normalizeTeacherWorkflowOutputs(raw = {}, fallbackTaskType = "lesson_plan") {
+  const normalized = normalizeDifyOutputs(raw);
+  const structured = normalized.structuredResult || {};
+  const nested = parseJsonish(structured.structured_result, structured.structured_result || {});
+  const structuredResult = nested && typeof nested === "object" && !Array.isArray(nested) ? nested : {};
+  const taskType = String(
+    structured.task_type
+    || structured.task
+    || structuredResult.task_type
+    || fallbackTaskType
+  ).trim() || fallbackTaskType;
+  const citations = arrayItemsFromJsonish(structured.citations || structuredResult.citations);
+  const warnings = arrayItemsFromJsonish(structured.warnings || structuredResult.warnings);
+  const followUpActions = arrayItemsFromJsonish(
+    structured.follow_up_actions
+    || structured.next_actions
+    || structuredResult.follow_up_actions
+    || structuredResult.next_actions
+  );
+  const finalAnswer = String(
+    normalized.finalAnswer
+    || structured.final_answer
+    || structuredResult.final_answer
+    || ""
+  ).trim();
+  return {
+    ...normalized,
+    finalAnswer,
+    structuredResult: {
+      ...structured,
+      final_answer: finalAnswer,
+      task_type: taskType,
+      structured_result: structuredResult,
+      teaching_objectives: arrayItemsFromJsonish(structured.teaching_objectives || structuredResult.teaching_objectives),
+      key_difficult_points: arrayItemsFromJsonish(structured.key_difficult_points || structuredResult.key_difficult_points),
+      lesson_steps: arrayItemsFromJsonish(structured.lesson_steps || structuredResult.lesson_steps),
+      questions: arrayItemsFromJsonish(structured.questions || structuredResult.questions),
+      rubric: arrayItemsFromJsonish(structured.rubric || structuredResult.rubric),
+      citations,
+      warnings,
+      follow_up_actions: followUpActions,
+      teacher_review_required: structured.teacher_review_required !== undefined
+        ? Boolean(structured.teacher_review_required)
+        : structuredResult.teacher_review_required !== undefined
+          ? Boolean(structuredResult.teacher_review_required)
+          : true
+    }
+  };
+}
+
+function normalizeDifyOutputs(raw = {}) {
+  const data = raw.data && typeof raw.data === "object" ? raw.data : raw;
+  const outputs = data.outputs && typeof data.outputs === "object" ? data.outputs : {};
+  const callbackPayload = parseJsonish(outputs.callback_payload, {});
+  const callbackStructured = callbackPayload && typeof callbackPayload === "object"
+    ? parseJsonish(callbackPayload.structured_result, callbackPayload.structured_result || {})
+    : {};
+  const structured = {
+    ...(parseJsonish(outputs.structured_json, {}) || {}),
+    ...(parseJsonish(outputs.structured_result, {}) || {}),
+    ...(callbackStructured && typeof callbackStructured === "object" ? callbackStructured : {})
+  };
+  const ragEvidence = parseJsonish(outputs.rag_evidence, structured.rag_evidence || []);
+  const topicLabel = String(outputs.topic_label || structured.topic_label || "").trim();
+  const masteryScore = Number(outputs.mastery_score ?? structured.mastery_score ?? 0);
+  const masteryLevel = String(outputs.mastery_level || structured.mastery_level || "未诊断");
+  const errorTags = arrayFromJsonish(outputs.error_tags || structured.error_tags);
+  const finalAnswer = String(
+    outputs.final_answer
+    || callbackPayload.final_answer
+    || structured.final_answer
+    || outputs.answer
+    || data.answer
+    || raw.answer
+    || ""
+  ).trim();
+  return {
+    finalAnswer,
+    structuredResult: {
+      ...structured,
+      topic_label: topicLabel || structured.topic_label || "",
+      diagnosis_mode: outputs.diagnosis_mode || structured.diagnosis_mode || "",
+      mastery_level: masteryLevel,
+      mastery_score: Number.isFinite(masteryScore) ? masteryScore : 0,
+      error_tags: errorTags,
+      rag_evidence: Array.isArray(ragEvidence) ? ragEvidence : arrayFromJsonish(ragEvidence),
+      final_answer: finalAnswer
+    },
+    rawStatus: data.status || raw.status || "",
+    workflowRunId: raw.workflow_run_id || data.workflow_run_id || data.id || "",
+    taskId: raw.task_id || data.task_id || ""
+  };
+}
+
+async function callStudentWorkflow({ db, user, body, mode, subject, chapter, knowledgePoint, answerDepth, studentAnswer, retrieval, profile }) {
+  const requestId = uid("dify_req");
+  const workflowStudentId = user.role === "student" ? user.id : "";
+  const projectCourseDocs = difyProjectDocsFromHits(retrieval?.courseHits?.length ? retrieval.courseHits : retrieval?.hits || [], "项目教师端课程资料", 10);
+  const projectMistakeDocs = difyProjectDocsFromHits(retrieval?.mistakeHits || [], "项目错因/题库/评分标准", 8);
+  const projectGraphDocs = difyProjectDocsFromHits(graphDatabaseHitsForWorkflow(db, user.id, {
+    question: String(body.prompt || "").trim(),
+    subject,
+    chapter,
+    knowledgePoint,
+    graphId: String(body.graphId || body.graph_id || ""),
+    nodeId: String(body.nodeId || body.node_id || ""),
+    limit: 8
+  }), "project_knowledge_graph", 8);
+  const projectMasteryContext = {
+    ...buildDifyProjectMasteryContext(db, user.id, profile, subject),
+    student_id: workflowStudentId,
+    request_user_id: user.id,
+    request_user_role: user.role
+  };
+  const assistantRoleContext = buildDifyAssistantContext({
+    user,
+    mode,
+    teaching: detectTeachingIntent(String(body.prompt || ""), body.mode || mode, user.role),
+    subject,
+    chapter,
+    knowledgePoint,
+    answerDepth,
+    hasStudentAnswer: Boolean(studentAnswer)
+  });
+  const projectClassContext = buildDifyClassContext(db, user, body, subject);
+  const inputs = {
+    question: String(body.prompt || "").trim(),
+    student_answer: studentAnswer,
+    target_level: difyTargetLevel(answerDepth),
+    diagnosis_depth: difyDiagnosisDepth(answerDepth),
+    assistant_task: mode,
+    assistant_task_label: AI_MODE_META[mode]?.label || AI_MODE_META.qa.label,
+    assistant_role_context: JSON.stringify(assistantRoleContext),
+    student_id: workflowStudentId,
+    class_id: workflowStudentId ? String(body.classId || body.class_id || user.classIds?.[0] || "") : String(body.classId || body.class_id || ""),
+    conversation_id: String(body.conversationId || body.conversation_id || ""),
+    request_id: requestId,
+    sync_mode: "api-return",
+    request_user_id: user.id,
+    request_user_role: user.role,
+    subject,
+    chapter,
+    knowledge_point: knowledgePoint,
+    graph_id: String(body.graphId || body.graph_id || ""),
+    node_id: String(body.nodeId || body.node_id || ""),
+    graph_context_url: DIFY_GRAPH_CONTEXT_URL,
+    graph_context_token: DIFY_CALLBACK_TOKEN,
+    callback_url: DIFY_CALLBACK_URL,
+    project_graph_context: JSON.stringify(projectGraphDocs),
+    project_rag_context: JSON.stringify(projectCourseDocs),
+    project_misconception_context: JSON.stringify(projectMistakeDocs),
+    project_mastery_context: JSON.stringify(projectMasteryContext),
+    project_class_context: JSON.stringify(projectClassContext)
+  };
+  const payload = await postDifyWorkflow({
+    apiKey: DIFY_STUDENT_WORKFLOW_API_KEY,
+    inputs,
+    user,
+    authHintName: "DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY"
+  });
+  const normalized = normalizeDifyOutputs(payload);
+  if (normalized.rawStatus && !["succeeded", "success"].includes(String(normalized.rawStatus).toLowerCase())) {
+    throw Object.assign(new Error(`Dify 工作流状态异常：${normalized.rawStatus}`), { details: payload });
+  }
+  if (!normalized.finalAnswer) {
+    throw Object.assign(new Error("Dify 工作流未返回 final_answer"), { details: payload });
+  }
+  const topicLabel = normalized.structuredResult.topic_label || knowledgePoint || "机器学习诊断";
+  return {
+    content: normalized.finalAnswer,
+    confidence: "dify",
+    topics: Array.from(new Set([
+      topicLabel,
+      ...(Array.isArray(normalized.structuredResult.top_topic_candidates)
+        ? normalized.structuredResult.top_topic_candidates.map((item) => item.topic || item)
+        : []),
+      knowledgePoint
+    ].filter(Boolean))).slice(0, 8),
+    workflowResult: {
+      ...normalized.structuredResult,
+      workflow: ML_DIAGNOSIS_WORKFLOW_INFO,
+      workflow_run_id: normalized.workflowRunId,
+      task_id: normalized.taskId,
+      request_id: requestId,
+      student_id: workflowStudentId,
+      request_user_id: user.id,
+      request_user_role: user.role,
+      question: inputs.question,
+      student_answer: studentAnswer,
+      source: "dify-api",
+      assistant_task: inputs.assistant_task,
+      assistant_task_label: inputs.assistant_task_label,
+      assistant_role_context: assistantRoleContext
+    },
+    workflowSource: "dify-api"
+  };
+}
+
+function callDifyDiagnosisWorkflow(options) {
+  return callStudentWorkflow(options);
+}
+
+function buildTeacherWorkflowInputs({ db, user, body, taskType, mode, subject, chapter, knowledgePoint, answerDepth, retrieval, profile }) {
+  const requestId = uid("dify_teacher_req");
+  const taskMeta = teacherWorkflowMeta(taskType);
+  const selectedMaterialIds = normalizeIdList(body.selectedMaterialIds || body.selected_material_ids || body.materialIds || body.materialId || body.material_id);
+  const selectedGraphId = String(body.selectedGraphId || body.selected_graph_id || body.graphId || body.graph_id || "").trim();
+  const selectedNodeId = String(body.selectedNodeId || body.selected_node_id || body.nodeId || body.node_id || "").trim();
+  const projectCourseDocs = difyProjectDocsFromHits(retrieval?.courseHits?.length ? retrieval.courseHits : retrieval?.hits || [], "项目教师端课程资料", 12);
+  const projectMistakeDocs = difyProjectDocsFromHits(retrieval?.mistakeHits || [], "项目错因/题库/评分标准", 10);
+  const projectGraphDocs = difyProjectDocsFromHits(graphDatabaseHitsForWorkflow(db, user.id, {
+    question: String(body.prompt || "").trim(),
+    subject,
+    chapter,
+    knowledgePoint,
+    graphId: selectedGraphId,
+    nodeId: selectedNodeId,
+    limit: 8
+  }), "project_knowledge_graph", 8);
+  const projectClassContext = buildDifyClassContext(db, user, body, subject);
+  const profileContext = {
+    ...buildDifyProjectMasteryContext(db, user.id, profile, subject),
+    student_id: "",
+    profile_owner_id: user.id,
+    teacher_id: user.id,
+    request_user_id: user.id,
+    request_user_role: user.role,
+    note: "教师端画像仅用于教师任务上下文，不自动写入学生学习画像。"
+  };
+  const submissionContext = buildTeacherSubmissionContext(db, user, body);
+  const explicitStudentId = taskType === "grading" ? submissionContext.student_id : "";
+  const assistantRoleContext = {
+    request_user_id: user.id,
+    request_user_role: user.role,
+    request_user_name: user.name || "",
+    role_label: roleLabel(user.role),
+    assistant_task: taskType,
+    assistant_task_label: taskMeta.label,
+    assistant_strategy: taskMeta.strategy,
+    answer_structure: taskMeta.structure,
+    task_instruction: "面向教师输出可复用教学产物，必须保留资料引用、可靠性说明和教师复核要求。",
+    subject,
+    chapter,
+    knowledge_point: knowledgePoint,
+    answer_depth: answerDepth,
+    teacher_review_required: true
+  };
+  const inputs = {
+    question: String(body.prompt || "").trim(),
+    task: taskType,
+    task_type: taskType,
+    teacher_id: user.id,
+    request_user_id: user.id,
+    request_user_role: user.role,
+    subject,
+    chapter,
+    knowledge_point: knowledgePoint,
+    class_id: String(body.classId || body.class_id || "").trim(),
+    selected_material_ids: selectedMaterialIds,
+    selected_material_ids_json: JSON.stringify(selectedMaterialIds),
+    selected_graph_id: selectedGraphId,
+    selected_node_id: selectedNodeId,
+    graph_id: selectedGraphId,
+    node_id: selectedNodeId,
+    homework_id: submissionContext.homework_id || String(body.homeworkId || body.homework_id || "").trim(),
+    student_submission_id: submissionContext.student_submission_id,
+    student_id: explicitStudentId,
+    rubric: submissionContext.rubric,
+    rubric_json: JSON.stringify(submissionContext.rubric || []),
+    output_format: String(body.outputFormat || body.output_format || "json"),
+    answer_depth: answerDepth,
+    assistant_task: taskType,
+    assistant_task_label: taskMeta.label,
+    assistant_role_context: JSON.stringify(assistantRoleContext),
+    teacher_review_required: true,
+    conversation_id: String(body.conversationId || body.conversation_id || ""),
+    request_id: requestId,
+    sync_mode: "teacher-api-return",
+    graph_context_url: DIFY_GRAPH_CONTEXT_URL,
+    graph_context_token: DIFY_CALLBACK_TOKEN,
+    callback_url: "",
+    diagnosis_callback_url: DIFY_CALLBACK_URL,
+    project_graph_context: JSON.stringify(projectGraphDocs),
+    project_rag_context: JSON.stringify(projectCourseDocs),
+    project_misconception_context: JSON.stringify(projectMistakeDocs),
+    project_mastery_context: JSON.stringify(profileContext),
+    project_class_context: JSON.stringify(projectClassContext),
+    grading_context: JSON.stringify(submissionContext)
+  };
+  return {
+    requestId,
+    inputs,
+    assistantRoleContext,
+    projectCourseDocs,
+    projectMistakeDocs,
+    projectClassContext,
+    submissionContext
+  };
+}
+
+async function callTeacherWorkflow({ db, user, body, taskType, mode, subject, chapter, knowledgePoint, answerDepth, retrieval, profile }) {
+  const built = buildTeacherWorkflowInputs({ db, user, body, taskType, mode, subject, chapter, knowledgePoint, answerDepth, retrieval, profile });
+  const payload = await postDifyWorkflow({
+    apiKey: DIFY_TEACHER_WORKFLOW_API_KEY,
+    inputs: built.inputs,
+    user,
+    authHintName: "DIFY_TEACHER_WORKFLOW_API_KEY"
+  });
+  const normalized = normalizeTeacherWorkflowOutputs(payload, taskType);
+  if (normalized.rawStatus && !["succeeded", "success"].includes(String(normalized.rawStatus).toLowerCase())) {
+    throw Object.assign(new Error(`教师 Dify 工作流状态异常：${normalized.rawStatus}`), { details: payload });
+  }
+  if (!normalized.finalAnswer) {
+    throw Object.assign(new Error("教师 Dify 工作流未返回 final_answer"), { details: payload });
+  }
+  const topics = Array.from(new Set([
+    knowledgePoint,
+    normalized.structuredResult.topic_label,
+    normalized.structuredResult.task_type,
+    ...(Array.isArray(normalized.structuredResult.top_topic_candidates)
+      ? normalized.structuredResult.top_topic_candidates.map((item) => item.topic || item)
+      : [])
+  ].filter(Boolean))).slice(0, 8);
+  return {
+    content: normalized.finalAnswer,
+    confidence: "dify",
+    topics,
+    outputCitations: normalized.structuredResult.citations || [],
+    workflowResult: {
+      ...normalized.structuredResult,
+      workflow: TEACHER_WORKFLOW_INFO,
+      workflow_run_id: normalized.workflowRunId,
+      task_id: normalized.taskId,
+      request_id: built.requestId,
+      request_user_id: user.id,
+      request_user_role: user.role,
+      question: built.inputs.question,
+      source: "teacher-dify-api",
+      assistant_task: taskType,
+      assistant_task_label: teacherWorkflowMeta(taskType).label,
+      assistant_role_context: built.assistantRoleContext,
+      project_class_context: built.projectClassContext,
+      grading_context: built.submissionContext
+    },
+    workflowSource: "teacher-dify-api"
+  };
+}
+
+async function buildStudentDiagnosisAnswer(db, user, body) {
   const prompt = String(body.prompt || "").trim();
   const teaching = detectTeachingIntent(prompt, body.mode || "auto", user.role);
   const mode = teaching.mode;
@@ -4254,47 +7197,40 @@ function buildEducationalAgentAnswer(db, user, body) {
   const chapter = String(body.chapter || "").trim();
   const knowledgePoint = String(body.knowledgePoint || "").trim();
   const answerDepth = String(body.answerDepth || "layered");
+  const studentAnswer = String(body.studentAnswer || body.student_answer || "").trim();
+  const hasStudentAnswer = Boolean(studentAnswer);
   const profile = ensureLearningProfile(db, user.id);
-  if (isAcademicMisuse(prompt)) {
-    const topics = inferQuestionTopics(prompt, subject);
-    const graphContext = findGraphContext(db, user.id, subject, prompt, topics, []);
-    const learningPanel = buildLearningPanel({
-      citations: [],
-      topics,
-      graphContext,
-      profile,
-      mode: "guided",
-      strategy: "学习诚信保护",
-      answerDepth
-    });
-    return {
-      content: "我不能直接代写作业、论文、实验报告或考试答案。可以改为帮你梳理结构、解释知识点、检查你的草稿、给出修改建议，或按提示模式一步步引导你完成。",
-      citations: [],
-      confidence: "safety",
-      topics,
-      mode: "guided",
-      label: AI_MODE_META.guided.label,
-      intent: "academic-integrity",
-      strategy: "学习诚信保护",
-      knowledgePoints: topics,
-      graphContext,
-      actions: buildAgentActions("guided", topics),
-      learningPanel,
-      retrieved: []
-    };
-  }
-  const retrievalQuery = [prompt, chapter, knowledgePoint].filter(Boolean).join("\n");
-  const hits = searchCourseKnowledge(db, user.id, retrievalQuery, { subject, limit: RAG_MAX_CONTEXT_CHUNKS });
+  const retrieval = searchMlDiagnosisWorkflowKnowledge(db, user.id, {
+    prompt,
+    chapter,
+    knowledgePoint,
+    subject,
+    mode,
+    graphId: body.graphId || body.graph_id,
+    nodeId: body.nodeId || body.node_id,
+    limit: RAG_MAX_CONTEXT_CHUNKS
+  });
+  const retrievalQuery = retrieval.courseQuery;
+  const hits = retrieval.hits;
   const citations = citationsFromHits(hits);
-  const agent = answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint });
+  if (!isDifyStudentWorkflowConfigured()) {
+    throw Object.assign(new Error("学生 Dify 工作流未配置：请先导入 dify/ml_learning_diagnosis/ml_learning_diagnosis_assistant_upgraded_0_6_0.yml，并在 .env 设置有效的 DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY。"), { status: 503 });
+  }
+  let agent;
+  try {
+    agent = await callStudentWorkflow({ db, user, body, mode, subject, chapter, knowledgePoint, answerDepth, studentAnswer, retrieval, profile });
+  } catch (error) {
+    throw Object.assign(new Error(`学生 Dify 工作流调用失败：${error.message || error}`), { status: 502 });
+  }
   const graphContext = findGraphContext(db, user.id, subject, retrievalQuery, agent.topics, hits);
   const topics = Array.from(new Set([
     knowledgePoint,
     graphContext.focusNode?.label,
     ...(agent.topics || [])
   ].filter(Boolean))).slice(0, 8);
-  const evidenceDelta = agent.confidence === "high" ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
-  const updatedProfile = updateTopicMastery(db, user.id, topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  const evidenceDelta = ["high", "dify"].includes(agent.confidence) ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
+  let updatedProfile = profile;
+  updatedProfile = updateTopicMastery(db, user.id, topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
   recordLearningActivity(db, user.id, {
     kind: mode === "practice" ? "practice" : "question",
     mode,
@@ -4321,29 +7257,141 @@ function buildEducationalAgentAnswer(db, user, body) {
     strategy: teaching.strategy,
     answerDepth
   });
+  const workflow = buildMlDiagnosisWorkflowTrace({ retrieval, citations, mode, topics, hasStudentAnswer });
   return {
     ...agent,
     citations,
     mode,
     label: teaching.label,
     intent: teaching.intent,
-    strategy: teaching.strategy,
+    strategy: "Dify 多 RAG 学习诊断工作流",
     answerDepth,
     knowledgePoints: topics,
     graphContext,
     actions: buildAgentActions(mode, topics),
     learningPanel,
-    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter })),
+    workflow,
+    workflowResult: agent.workflowResult,
+    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter, ragChannel: hit.ragChannel || "" })),
     tools: [
       "intent_router",
-      "retrieve_course_material",
-      "query_knowledge_graph",
+      "student_dify_workflow_api",
+      "dify_input_cleaning",
+      "course_rag_retrieval",
+      "mistake_rag_retrieval",
+      "evidence_merge",
+      "naive_bayes_topic_classifier",
       mode === "practice" ? "generate_quiz" : "",
       mode === "grade" ? "grade_answer" : "",
       mode === "plan" ? "create_study_plan" : "",
+      "structured_json_output",
       "update_mastery"
     ].filter(Boolean)
   };
+}
+
+async function buildTeacherWorkflowAnswer(db, user, body) {
+  const prompt = String(body.prompt || "").trim();
+  const taskType = teacherWorkflowTaskAlias(body.teacherTask || body.task || body.task_type || body.workflowTask, prompt, body.mode);
+  const taskMeta = teacherWorkflowMeta(taskType);
+  const mode = taskMeta.mode;
+  const subject = normalizeSubject(body.subject || user.subject || "");
+  const chapter = String(body.chapter || "").trim();
+  const knowledgePoint = String(body.knowledgePoint || "").trim();
+  const answerDepth = String(body.answerDepth || "layered");
+  const profile = ensureLearningProfile(db, user.id);
+  const selectedMaterialHits = selectedMaterialHitsForWorkflow(db, user.id, body.selectedMaterialIds || body.selected_material_ids || body.materialIds || body.materialId || body.material_id, subject, 8);
+  const retrieval = searchMlDiagnosisWorkflowKnowledge(db, user.id, {
+    prompt,
+    chapter,
+    knowledgePoint,
+    subject,
+    mode,
+    graphId: body.selectedGraphId || body.selected_graph_id || body.graphId || body.graph_id,
+    nodeId: body.selectedNodeId || body.selected_node_id || body.nodeId || body.node_id,
+    limit: RAG_MAX_CONTEXT_CHUNKS
+  });
+  retrieval.courseHits = selectedMaterialHits.concat(retrieval.courseHits || []);
+  retrieval.hits = mergeWorkflowRagHits(retrieval.courseHits, retrieval.mistakeHits || [], RAG_MAX_CONTEXT_CHUNKS);
+  const retrievalQuery = retrieval.courseQuery;
+  const hits = retrieval.hits;
+  const citations = citationsFromHits(hits);
+  if (!isDifyTeacherWorkflowConfigured()) {
+    throw Object.assign(new Error("教师 Dify 工作流未配置：请先在 .env 设置有效的 DIFY_TEACHER_WORKFLOW_API_KEY，并在 Dify 中发布教师教学工作流。"), { status: 503 });
+  }
+  let agent;
+  try {
+    agent = await callTeacherWorkflow({ db, user, body, taskType, mode, subject, chapter, knowledgePoint, answerDepth, retrieval, profile });
+  } catch (error) {
+    throw Object.assign(new Error(`教师 Dify 工作流调用失败：${error.message || error}`), { status: 502 });
+  }
+  const graphContext = findGraphContext(db, user.id, subject, retrievalQuery, agent.topics, hits);
+  const topics = Array.from(new Set([
+    knowledgePoint,
+    graphContext.focusNode?.label,
+    ...(agent.topics || [])
+  ].filter(Boolean))).slice(0, 8);
+  const learningPanel = buildLearningPanel({
+    citations,
+    topics,
+    graphContext,
+    profile,
+    mode,
+    strategy: taskMeta.strategy,
+    answerDepth
+  });
+  const workflow = buildTeacherWorkflowTrace({ retrieval, citations, taskType, topics });
+  const outputCitations = Array.isArray(agent.outputCitations) && agent.outputCitations.length
+    ? agent.outputCitations.map((citation, index) => ({
+      id: citation.id || `T${index + 1}`,
+      type: citation.type || "teacher-workflow",
+      title: citation.title || citation.sourceName || "教师工作流引用",
+      sourceName: citation.sourceName || citation.title || "教师工作流引用",
+      subject: citation.subject || subject,
+      chapter: citation.chapter || "",
+      page: citation.page || "",
+      quote: citation.quote || citation.content || citation.text || ""
+    }))
+    : [];
+  return {
+    ...agent,
+    citations: outputCitations.length ? outputCitations : citations,
+    mode,
+    label: taskMeta.label,
+    intent: taskType,
+    strategy: taskMeta.strategy,
+    answerDepth,
+    knowledgePoints: topics,
+    graphContext,
+    actions: buildAgentActions(mode, topics),
+    learningPanel,
+    workflow,
+    workflowResult: {
+      ...agent.workflowResult,
+      workflow,
+      task_type: taskType,
+      teacher_review_required: agent.workflowResult?.teacher_review_required !== false
+    },
+    retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter, ragChannel: hit.ragChannel || "" })),
+    tools: [
+      "teacher_task_router",
+      "teacher_dify_workflow_api",
+      "teacher_input_schema",
+      "course_rag_retrieval",
+      "graph_context_retrieval",
+      "class_context_builder",
+      taskType === "quiz_generation" ? "generate_quiz" : "",
+      taskType === "grading" ? "grading_rubric" : "",
+      taskType === "class_analysis" ? "class_learning_analysis" : "",
+      "structured_json_output",
+      "teacher_review_required"
+    ].filter(Boolean)
+  };
+}
+
+async function buildEducationalAgentAnswer(db, user, body) {
+  if (user.role === "teacher" || user.role === "admin") return buildTeacherWorkflowAnswer(db, user, body);
+  return buildStudentDiagnosisAnswer(db, user, body);
 }
 
 function learningAnalytics(db, userId) {
@@ -4365,776 +7413,289 @@ function learningAnalytics(db, userId) {
   };
 }
 
-function defaultLessonAgents() {
-  return [
-    { id: uid("agent"), role: "director", name: "课堂导演", style: "控制节奏、切换环节、安排测验" },
-    { id: uid("agent"), role: "teacher", name: "AI教师", style: "主讲概念、公式、步骤和例题" },
-    { id: uid("agent"), role: "assistant", name: "AI助教", style: "补充解释、引用资料、提示前置知识" },
-    { id: uid("agent"), role: "student-basic", name: "基础同学", style: "提出基础问题和易忽略条件" },
-    { id: uid("agent"), role: "student-misconception", name: "易错同学", style: "暴露常见误区并等待纠正" },
-    { id: uid("agent"), role: "student-advanced", name: "进阶同学", style: "提出迁移应用和开放问题" },
-    { id: uid("agent"), role: "grader", name: "评分Agent", style: "批改课堂小测并回流学习画像" },
-    { id: uid("agent"), role: "graph", name: "图谱Agent", style: "查询前置知识、相关节点和学习路径" },
-    { id: uid("agent"), role: "material", name: "资料Agent", style: "检索课程资料引用和页码线索" },
-    { id: uid("agent"), role: "whiteboard", name: "白板Agent", style: "生成画图、公式和流程图动作" },
-    { id: uid("agent"), role: "simulation", name: "仿真Agent", style: "生成交互式实验或算法可视化" }
-  ];
+function requestBearerToken(req) {
+  const header = String(req.headers.authorization || "");
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
 }
 
-function compactServerText(text, limit = 120) {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
-  return value.length > limit ? `${value.slice(0, limit)}...` : value;
+function isDifyCallbackAuthorized(req) {
+  const expected = String(DIFY_CALLBACK_TOKEN || "").trim();
+  if (!isDifyCallbackTokenConfigured()) return false;
+  return timingSafeEqualText(requestBearerToken(req), expected);
 }
 
-function lessonSourceLabel(source = {}) {
-  const typeLabels = {
-    material: "课程资料",
-    graph_node: "知识图谱节点",
-    graph: "知识图谱",
-    homework: "作业错因",
-    weakness: "班级薄弱点",
-    topic: "教师输入主题"
+function parseJsonish(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function arrayFromJsonish(value) {
+  const parsed = parseJsonish(value, value);
+  if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+  return String(parsed || "")
+    .split(/[、,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function masteryStatusFromScore(score) {
+  if (score < 0.35) return "未掌握";
+  if (score < 0.58) return "模糊";
+  if (score < 0.78) return "基本掌握";
+  return "精通";
+}
+
+function setTopicMasteryScore(db, userId, topic, score, evidence, status = "") {
+  const profile = ensureLearningProfile(db, userId);
+  const normalized = Math.max(0.08, Math.min(0.98, Number(score || 0)));
+  const current = profile.mastery[topic] || { score: 0.52, status: "待诊断", evidence: [] };
+  current.score = Number(normalized.toFixed(2));
+  current.status = status || masteryStatusFromScore(normalized);
+  current.evidence = Array.isArray(current.evidence) ? current.evidence.slice(-8) : [];
+  current.evidence.push({ text: evidence, at: now() });
+  current.updatedAt = now();
+  profile.mastery[topic] = current;
+  const weakSet = new Set(profile.weakPoints || []);
+  if (normalized < 0.58) weakSet.add(topic);
+  else weakSet.delete(topic);
+  profile.weakPoints = Array.from(weakSet).slice(0, 12);
+  profile.updatedAt = now();
+  return profile;
+}
+
+function normalizeDifyCallbackPayload(body = {}) {
+  const root = typeof body === "string" ? parseJsonish(body, {}) : body;
+  const rootObject = root && typeof root === "object" && !Array.isArray(root) ? root : {};
+  const rawCallbackPayload = rootObject.callback_payload ?? rootObject.payload ?? rootObject[""] ?? rootObject.body ?? root;
+  const callbackPayload = parseJsonish(rawCallbackPayload, rawCallbackPayload || {});
+  const callbackObject = callbackPayload && typeof callbackPayload === "object" && !Array.isArray(callbackPayload) ? callbackPayload : {};
+  const structured = parseJsonish(rootObject.structured_result ?? callbackObject.structured_result, rootObject.structured_result || callbackObject.structured_result || {});
+  const payload = {
+    ...callbackObject,
+    ...rootObject
   };
-  return typeLabels[source.type] || "教师输入主题";
+  payload.structured_result = {
+    ...(typeof structured === "object" ? structured : {}),
+    ...(typeof payload.structured_result === "object" ? payload.structured_result : {})
+  };
+  return payload;
 }
 
-function lessonDefaultObjectives(topic, subject, topics = []) {
-  const focus = topics.filter(Boolean).slice(0, 3);
-  return [
-    `理解「${topic}」的核心概念和适用场景`,
-    focus[0] ? `能解释 ${focus[0]} 与前置知识的关系` : `能说出 ${subject} 中该知识点的关键条件`,
-    focus[1] ? `能完成围绕 ${focus[1]} 的课堂小测` : "能完成课堂即时测验并复盘错因"
-  ];
-}
-
-function lessonWhiteboardObjects(topic, subject, topics = []) {
-  const first = topics[0] || topic;
-  const second = topics[1] || "前置知识";
-  const third = topics[2] || "典型应用";
-  return [
-    { id: uid("wb"), type: "text", x: 80, y: 72, text: `${subject}：${topic}` },
-    { id: uid("wb"), type: "rect", x: 80, y: 118, width: 190, height: 58, text: first },
-    { id: uid("wb"), type: "arrow", from: [270, 147], to: [360, 147], text: "依赖" },
-    { id: uid("wb"), type: "rect", x: 360, y: 118, width: 190, height: 58, text: second },
-    { id: uid("wb"), type: "arrow", from: [550, 147], to: [640, 147], text: "迁移" },
-    { id: uid("wb"), type: "rect", x: 640, y: 118, width: 190, height: 58, text: third },
-    { id: uid("wb"), type: "note", x: 110, y: 230, text: "课堂目标：先讲概念，再用问题暴露误区，最后用小测回流画像。" }
-  ];
-}
-
-function buildLessonQuiz(topic, subject, topics = []) {
-  const focus = topics.filter(Boolean).slice(0, 4);
-  const first = focus[0] || topic;
-  const second = focus[1] || "前置知识";
-  const third = focus[2] || "应用场景";
-  const fourth = focus[3] || "课堂总结";
-  return [
-    {
-      id: uid("quiz"),
-      type: "single",
-      topic: first,
-      stem: `学习「${topic}」时，第一步最应该确认什么？`,
-      options: [
-        `核心概念、适用条件和前置知识`,
-        "直接记住所有题目答案",
-        "跳过定义只看结论",
-        "只看无关例子"
-      ],
-      answer: "核心概念、适用条件和前置知识",
-      explanation: `课堂重点是把「${first}」放回 ${subject} 的知识结构中理解。`
-    },
-    {
-      id: uid("quiz"),
-      type: "truefalse",
-      topic: first,
-      stem: `判断：学习「${topic}」时，只记结论、不看适用条件也能稳定迁移到新题。`,
-      answer: "错误",
-      explanation: "教育图谱强调概念边界、前置依赖和应用条件，不能只记结论。"
-    },
-    {
-      id: uid("quiz"),
-      type: "multi",
-      topic: second,
-      stem: `围绕「${topic}」设计复习路径时，哪些信息应该被纳入？`,
-      options: [
-        "前置知识",
-        "常见误区",
-        "课堂测验结果",
-        "与主题无关的随机材料"
-      ],
-      answer: ["前置知识", "常见误区", "课堂测验结果"],
-      explanation: "学习路径应由资料、图谱关系、测验表现和错题证据共同决定。"
-    },
-    {
-      id: uid("quiz"),
-      type: "fill",
-      topic: third,
-      stem: `填空：「${topic}」的课堂结果会回流到学生的____和错题本。`,
-      answer: "学习画像",
-      explanation: "课堂表现必须回流画像，才能形成持续学习闭环。"
-    },
-    {
-      id: uid("quiz"),
-      type: "single",
-      topic: second,
-      stem: `如果学生在「${topic}」上卡住，优先回看哪类内容？`,
-      options: [
-        `${second} 等前置知识`,
-        "完全无关的新章节",
-        "只背答案不看过程",
-        "跳过课堂小测"
-      ],
-      answer: `${second} 等前置知识`,
-      explanation: "前置依赖是学习路径规划和薄弱点归因的关键。"
-    },
-    {
-      id: uid("quiz"),
-      type: "short",
-      topic: third,
-      stem: `请用一句话说明「${topic}」最容易混淆的地方或使用边界。`,
-      answer: topic,
-      explanation: "简答题由教师复核，系统先根据关键词给出课堂反馈。"
-    },
-    {
-      id: uid("quiz"),
-      type: "step",
-      topic: fourth,
-      stem: `请写出用互动课堂学习「${topic}」的 3 个步骤。`,
-      answer: "概念,白板,测验",
-      explanation: "标准路径是概念导入、白板推导/仿真、测验反馈与补救。"
-    }
-  ];
-}
-
-function buildLessonSimulation(topic, subject, topics = []) {
-  const text = `${subject} ${topic} ${topics.join(" ")}`.toLowerCase();
-  if (/knn|k近邻|机器学习|分类/.test(text)) {
+function difyCitationsFromEvidence(evidence = []) {
+  const items = Array.isArray(evidence) ? evidence : arrayFromJsonish(evidence);
+  return items.slice(0, 8).map((item, index) => {
+    const source = item && typeof item === "object" ? item : { quote: String(item || "") };
     return {
-      kind: "knn",
-      title: "KNN 分类边界可视化",
-      description: "拖动 K 值观察近邻数量变化对分类稳定性的影响。",
-      controls: [
-        { key: "k", label: "K 值", type: "range", min: 1, max: 15, step: 2, value: 5 }
-      ],
-      points: [
-        { x: 16, y: 28, group: "A" }, { x: 22, y: 44, group: "A" }, { x: 34, y: 24, group: "A" },
-        { x: 66, y: 56, group: "B" }, { x: 76, y: 36, group: "B" }, { x: 58, y: 70, group: "B" },
-        { x: 48, y: 46, group: "query" }
-      ]
+      id: source.id || `E${index + 1}`,
+      type: source.type || "dify-evidence",
+      title: source.title || source.sourceName || "Dify RAG 证据",
+      sourceName: source.sourceName || source.title || "",
+      subject: source.subject || "机器学习",
+      chapter: source.chapter || "",
+      page: source.page || "",
+      quote: source.quote || source.text || source.content || "",
+      materialId: source.materialId || "",
+      ownerId: source.ownerId || "",
+      global: Boolean(source.global),
+      classId: source.classId || "",
+      ragChannel: source.ragChannel || "dify",
+      graphId: source.graphId || "",
+      nodeId: source.nodeId || ""
+    };
+  });
+}
+
+function syncDifyDiagnosisCallback(db, rawBody, req) {
+  const payload = normalizeDifyCallbackPayload(rawBody);
+  const structured = payload.structured_result || {};
+  const userId = String(payload.student_id || payload.studentId || payload.userId || "").trim();
+  const topic = String(payload.topic_label || structured.topic_label || "机器学习诊断").trim();
+  const question = String(payload.question || structured.question || "").trim();
+  const studentAnswer = String(payload.student_answer || payload.studentAnswer || "").trim();
+  const finalAnswer = String(payload.final_answer || structured.final_answer || structured.standard_answer || "").trim();
+  if (!userId) {
+    return {
+      skipped: true,
+      reason: "missing_student_id",
+      message: "Dify 测试运行未提供 student_id，项目端已跳过数据库写入；从前端 AI 助教触发时会自动传入当前学生 ID。",
+      topic,
+      hasFinalAnswer: Boolean(finalAnswer)
     };
   }
-  if (/cache|地址|组成|计算机/.test(text)) {
-    return {
-      kind: "address",
-      title: "地址划分仿真",
-      description: "调整地址位数和块内偏移，观察 Tag、Index、Offset 的分段关系。",
-      controls: [
-        { key: "addressBits", label: "地址位数", type: "range", min: 8, max: 32, step: 1, value: 16 },
-        { key: "offsetBits", label: "Offset 位数", type: "range", min: 1, max: 8, step: 1, value: 4 }
-      ],
-      formula: "主存地址 = Tag + Index + Offset"
-    };
+  const user = getUser(db, userId);
+  if (!user) {
+    throw Object.assign(new Error("Dify 回调中的 student_id 不存在"), { status: 404 });
   }
-  return {
-    kind: "process",
-    title: `${topic} 流程仿真`,
-    description: "通过流程节点观察概念、条件、例题和反馈之间的关系。",
-    controls: [
-      { key: "speed", label: "演示速度", type: "range", min: 1, max: 5, step: 1, value: 3 }
-    ],
-    steps: ["概念", topics[1] || "前置知识", topics[2] || "例题", "课堂测验", "补救建议"]
-  };
-}
-
-function buildLessonPbl(topic, subject, topics = []) {
-  return {
-    drivingQuestion: `如何用「${topic}」解决一个真实的 ${subject} 学习或应用问题？`,
-    roles: [
-      { name: "资料负责人", task: "整理课程资料和引用来源" },
-      { name: "图谱负责人", task: "标注前置知识、易错点和关联节点" },
-      { name: "仿真负责人", task: "用白板或仿真说明关键过程" },
-      { name: "汇报负责人", task: "输出 5 分钟课堂展示和反思" }
-    ],
-    tasks: [
-      `拆解「${topic}」的核心概念和使用条件`,
-      `找出至少 2 个前置知识：${topics.slice(1, 3).join("、") || "由小组自行确定"}`,
-      "设计一个小测题并给出答案解析",
-      "形成项目报告、白板说明和补救建议"
-    ],
-    rubric: [
-      { item: "概念准确", score: 30 },
-      { item: "证据引用", score: 20 },
-      { item: "仿真/白板表达", score: 20 },
-      { item: "测验与反馈", score: 20 },
-      { item: "协作分工", score: 10 }
-    ]
-  };
-}
-
-function buildLessonScenes({ subject, topic, objectives, topics, citations, duration }) {
-  const minutes = Math.max(10, Math.min(90, Number(duration || 20)));
-  const citationText = citations.length ? citations.slice(0, 2).map((item) => `${item.sourceName || item.title || "课程资料"} ${item.chapter || ""}`).join("；") : "暂无资料引用，按教师输入主题生成";
-  return [
-    {
-      id: uid("scene"),
-      type: "slide",
-      title: "概念导入",
-      duration: Math.round(minutes * 0.18 * 60),
-      objective: objectives[0],
-      content: {
-        headline: topic,
-        bullets: [
-          `本节课聚焦 ${subject} 中的「${topic}」。`,
-          `先明确概念边界，再进入例子、白板推导和课堂小测。`,
-          `引用来源：${citationText}`
-        ]
-      }
-    },
-    {
-      id: uid("scene"),
-      type: "whiteboard",
-      title: "白板讲解",
-      duration: Math.round(minutes * 0.22 * 60),
-      objective: objectives[1] || objectives[0],
-      whiteboard: { objects: lessonWhiteboardObjects(topic, subject, topics) },
-      content: {
-        headline: "结构化推导",
-        bullets: [
-          "左侧放核心概念，中间放前置依赖，右侧放迁移应用。",
-          "教师可继续添加公式、箭头、流程节点或高亮说明。"
-        ]
-      }
-    },
-    {
-      id: uid("scene"),
-      type: "discussion",
-      title: "多智能体讨论",
-      duration: Math.round(minutes * 0.22 * 60),
-      objective: "通过 AI 同学追问暴露误区",
-      script: [
-        { agentRole: "teacher", agentName: "AI教师", text: `我们先用一个具体问题检查你是否真正理解「${topic}」。` },
-        { agentRole: "assistant", agentName: "AI助教", text: `我会把回答限定在课程资料和图谱关联知识内，并标出不确定部分。` },
-        { agentRole: "student-basic", agentName: "基础同学", text: `${topic} 和 ${topics[1] || "前置知识"} 的关系是什么？` },
-        { agentRole: "student-misconception", agentName: "易错同学", text: `如果只记结论不看条件，会不会也能做题？` }
-      ]
-    },
-    {
-      id: uid("scene"),
-      type: "simulation",
-      title: "交互式仿真",
-      duration: Math.round(minutes * 0.16 * 60),
-      objective: "用可操作组件理解变量变化对结果的影响",
-      simulation: buildLessonSimulation(topic, subject, topics)
-    },
-    {
-      id: uid("scene"),
-      type: "pbl",
-      title: "项目制学习任务",
-      duration: Math.round(minutes * 0.18 * 60),
-      objective: "把知识点迁移到项目任务和小组协作",
-      pbl: buildLessonPbl(topic, subject, topics)
-    },
-    {
-      id: uid("scene"),
-      type: "quiz",
-      title: "课堂小测",
-      duration: Math.round(minutes * 0.18 * 60),
-      objective: objectives[2] || "即时检测掌握情况",
-      quiz: { questions: buildLessonQuiz(topic, subject, topics) }
-    },
-    {
-      id: uid("scene"),
-      type: "summary",
-      title: "总结与补救路径",
-      duration: Math.round(minutes * 0.18 * 60),
-      objective: "把课堂结果回流到学习画像",
-      content: {
-        headline: "课堂闭环",
-        bullets: [
-          "完成测验后会记录掌握度证据。",
-          "答错的知识点会进入错题线索，教师可继续生成补救作业。",
-          "课堂脚本可导出为 Markdown 或 HTML。"
-        ]
-      }
-    }
-  ];
-}
-
-function lessonCitationsFromHits(hits) {
-  return hits.slice(0, 5).map((hit) => ({
-    id: hit.id || hit.chunkId || hit.nodeId || uid("cite"),
-    title: hit.title || hit.graphTitle || "课程资料",
-    sourceName: hit.sourceName || hit.title || hit.graphTitle || "课程资料",
-    subject: hit.subject || "",
-    chapter: hit.chapter || "",
-    page: hit.page || "",
-    snippet: compactServerText(hit.text || hit.summary || hit.label || "", 160)
-  }));
-}
-
-function collectLessonGenerationContext(db, userId, body) {
-  const subject = normalizeSubject(body.subject || "");
-  let topic = String(body.topic || body.knowledgePoint || body.title || "").trim();
-  const source = { type: String(body.sourceType || "topic") };
-  const contextParts = [];
-
-  if (body.materialId) {
-    const material = visibleCourseMaterials(db, userId).find((item) => item.id === body.materialId);
-    if (material) {
-      source.type = "material";
-      source.materialId = material.id;
-      topic = topic || material.title || material.subject;
-      contextParts.push(material.text || "", material.title || "", material.subject || "");
-    }
-  }
-
-  if (body.graphId) {
-    const graph = visibleKnowledgeGraphs(db, userId).find((item) => item.id === body.graphId);
-    if (graph) {
-      source.type = body.nodeId ? "graph_node" : "graph";
-      source.graphId = graph.id;
-      source.graphTitle = graph.title;
-      const node = body.nodeId ? (graph.nodes || []).find((item) => item.id === body.nodeId) : null;
-      if (node) {
-        source.nodeId = node.id;
-        source.nodeLabel = node.label;
-        topic = topic || node.label;
-        contextParts.push(node.label, node.summary || "", node.details || "", (node.knowledgePoints || []).join("\n"));
-      } else {
-        topic = topic || graph.title || graph.subject;
-        contextParts.push(graph.title || "", (graph.nodes || []).slice(0, 12).map((nodeItem) => nodeItem.label).join("\n"));
-      }
-    }
-  }
-
-  if (body.homeworkId) {
-    const homework = (db.homework || []).find((item) => item.id === body.homeworkId && item.teacherId === userId);
-    if (homework) {
-      source.type = "homework";
-      source.homeworkId = homework.id;
-      topic = topic || `${homework.title}错因补救`;
-      contextParts.push(homework.title || "", homework.description || "", homework.answer || "", homework.rubricText || "");
-    }
-  }
-
-  if (body.weaknessTopic) {
-    source.type = "weakness";
-    source.weaknessTopic = String(body.weaknessTopic || "").trim().slice(0, 80);
-    topic = topic || `${source.weaknessTopic}补救课堂`;
-    contextParts.push(source.weaknessTopic);
-  }
-
-  topic = topic || subject || "互动课堂";
-  source.topic = topic;
-  const query = [topic, subject, contextParts.join("\n")].filter(Boolean).join("\n");
-  const hits = searchCourseKnowledge(db, userId, query, { subject, limit: 5 });
-  const citations = lessonCitationsFromHits(hits);
-  const topics = Array.from(new Set([
-    topic,
-    ...inferQuestionTopics(query, subject),
-    ...hits.flatMap((hit) => inferQuestionTopics(hit.text || hit.title || "", subject))
-  ].filter(Boolean))).slice(0, 8);
-  return {
-    subject: subject || hits[0]?.subject || "通用",
-    topic,
-    source,
-    contextText: query,
-    hits,
+  const rawScore = Number(payload.mastery_score ?? structured.mastery_score);
+  const normalizedScore = Number.isFinite(rawScore) ? (rawScore > 1 ? rawScore / 100 : rawScore) : null;
+  const errors = arrayFromJsonish(payload.error_tags || structured.error_tags);
+  const missing = arrayFromJsonish(payload.missing_points || structured.missing_points);
+  const masteryLevel = String(payload.mastery_level || structured.mastery_level || "");
+  const ragEvidence = parseJsonish(payload.rag_evidence ?? structured.rag_evidence, payload.rag_evidence || structured.rag_evidence || []);
+  const citations = difyCitationsFromEvidence(ragEvidence);
+  const syncMode = String(payload.sync_mode || payload.syncMode || "").trim();
+  const conversationId = String(payload.conversation_id || payload.conversationId || "").trim();
+  const workflow = buildMlDiagnosisWorkflowTrace({
+    retrieval: { hits: [], courseHits: [], mistakeHits: [] },
     citations,
-    topics
-  };
-}
-
-function createLessonFromRequest(db, teacher, body) {
-  const context = collectLessonGenerationContext(db, teacher.id, body);
-  const objectives = Array.isArray(body.objectives) && body.objectives.length
-    ? body.objectives.map(String).filter(Boolean).slice(0, 8)
-    : lessonDefaultObjectives(context.topic, context.subject, context.topics);
-  const lesson = {
-    id: uid("lesson"),
-    teacherId: teacher.id,
-    title: String(body.title || `${context.topic}互动课堂`).trim().slice(0, 80),
-    subject: context.subject,
-    source: context.source,
-    status: body.status === "published" ? "published" : "draft",
-    classIds: Array.isArray(body.classIds) ? body.classIds.map(String).filter(Boolean) : [],
-    duration: Math.max(10, Math.min(90, Number(body.duration || 20))),
-    objectives,
-    agents: Array.isArray(body.agents) && body.agents.length ? body.agents : defaultLessonAgents(),
-    scenes: buildLessonScenes({
-      subject: context.subject,
-      topic: context.topic,
-      objectives,
-      topics: context.topics,
-      citations: context.citations,
-      duration: body.duration
-    }),
-    citations: context.citations,
-    tags: context.topics,
-    analytics: { sessions: 0, attempts: 0, averageScore: null },
-    createdAt: now(),
-    updatedAt: now()
-  };
-  return lesson;
-}
-
-function lessonCanView(db, lesson, user) {
-  if (!lesson || !user) return false;
-  if (user.role === "admin" || lesson.teacherId === user.id) return true;
-  if (user.role !== "student") return false;
-  const userClassIds = new Set(user.classIds || []);
-  const sharedToClass = (lesson.classIds || []).some((classId) => userClassIds.has(classId));
-  const joinedSession = (db.classroomSessions || []).some((session) => session.lessonId === lesson.id && (session.participantIds || []).includes(user.id));
-  return lesson.status === "published" && (sharedToClass || joinedSession);
-}
-
-function visibleLessons(db, userId) {
-  const user = ensureUser(db, userId);
-  return (db.lessons || [])
-    .filter((lesson) => lessonCanView(db, lesson, user))
-    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
-}
-
-function publicLesson(db, lesson, userId) {
-  const attempts = (db.quizAttempts || []).filter((item) => item.lessonId === lesson.id);
-  const scores = attempts.map((item) => Number(item.score)).filter(Number.isFinite);
-  return {
-    ...lesson,
-    analytics: {
-      ...(lesson.analytics || {}),
-      sessions: (db.classroomSessions || []).filter((item) => item.lessonId === lesson.id).length,
-      attempts: attempts.length,
-      myAttempts: attempts.filter((item) => item.studentId === userId).length,
-      averageScore: scores.length ? Math.round(scores.reduce((sum, item) => sum + item, 0) / scores.length) : null
-    }
-  };
-}
-
-function publicClassroomSession(session, userId) {
-  return {
-    ...session,
-    events: (session.events || []).slice(-80),
-    isParticipant: (session.participantIds || []).includes(userId)
-  };
-}
-
-function assertLessonEditable(lesson, actor) {
-  if (!lesson) throw Object.assign(new Error("课堂不存在"), { status: 404 });
-  if (actor.role !== "admin" && lesson.teacherId !== actor.id) {
-    throw Object.assign(new Error("只能修改自己创建的课堂"), { status: 403 });
+    mode: studentAnswer ? "grade" : "qa",
+    topics: [topic].filter(Boolean),
+    hasStudentAnswer: Boolean(studentAnswer)
+  });
+  let profile = ensureLearningProfile(db, userId);
+  const shouldWriteMastery = normalizedScore !== null && (Boolean(studentAnswer) || (masteryLevel && masteryLevel !== "未诊断" && normalizedScore > 0));
+  if (shouldWriteMastery) {
+    profile = setTopicMasteryScore(
+      db,
+      userId,
+      topic,
+      normalizedScore,
+      `Dify 工作流回调：${question.slice(0, 80) || topic}`,
+      masteryLevel
+    );
   }
-}
-
-function assertSessionVisible(db, session, actor) {
-  if (!session) throw Object.assign(new Error("课堂会话不存在"), { status: 404 });
-  const lesson = (db.lessons || []).find((item) => item.id === session.lessonId);
-  if (!lesson) throw Object.assign(new Error("课堂不存在"), { status: 404 });
-  if (actor.role === "admin" || lesson.teacherId === actor.id || (session.participantIds || []).includes(actor.id)) {
-    return lesson;
+  let wrongNote = null;
+  if (studentAnswer && (errors.length || missing.length || (normalizedScore !== null && normalizedScore < 0.75))) {
+    wrongNote = addWrongNote(db, userId, {
+      source: "Dify 工作流诊断",
+      topic,
+      question,
+      answer: studentAnswer,
+      analysis: errors.length ? `错因：${errors.join("、")}` : "Dify 工作流建议复盘该知识点。",
+      recommendation: missing.length ? `补齐：${missing.join("、")}` : "按标准解释重写答案并完成同类题。"
+    });
   }
-  throw Object.assign(new Error("无权访问该课堂会话"), { status: 403 });
-}
-
-function lessonSceneAgentEvents(scene, lesson) {
-  if (!scene) return [];
-  const teacher = (lesson.agents || []).find((item) => item.role === "teacher") || { name: "AI教师", role: "teacher" };
-  const assistant = (lesson.agents || []).find((item) => item.role === "assistant") || { name: "AI助教", role: "assistant" };
-  if (scene.type === "discussion" && Array.isArray(scene.script)) {
-    return scene.script.map((line) => ({
-      id: uid("event"),
-      type: "agent_speech",
-      agentRole: line.agentRole,
-      agentName: line.agentName,
-      text: line.text,
-      createdAt: now()
-    }));
-  }
-  if (scene.type === "quiz") {
-    return [{
-      id: uid("event"),
-      type: "agent_speech",
-      agentRole: "grader",
-      agentName: "评分Agent",
-      text: "课堂小测已准备好，提交后会把结果回流到学习画像。",
-      createdAt: now()
-    }];
-  }
-  return [
-    {
-      id: uid("event"),
-      type: "agent_speech",
-      agentRole: teacher.role,
-      agentName: teacher.name,
-      text: scene.content?.headline ? `${scene.title}：${scene.content.headline}` : `进入环节：${scene.title}`,
-      createdAt: now()
-    },
-    {
-      id: uid("event"),
-      type: "agent_speech",
-      agentRole: assistant.role,
-      agentName: assistant.name,
-      text: (scene.content?.bullets || []).slice(0, 2).join("；") || `本环节目标：${scene.objective || "理解并应用当前知识点"}`,
-      createdAt: now()
-    }
-  ];
-}
-
-function addClassroomEvents(db, session, events) {
-  const normalized = events.map((event) => ({
-    id: event.id || uid("event"),
-    sessionId: session.id,
-    lessonId: session.lessonId,
-    ...event,
-    createdAt: event.createdAt || now()
-  }));
-  session.events = Array.isArray(session.events) ? session.events : [];
-  session.events.push(...normalized);
-  session.events = session.events.slice(-160);
-  db.classroomEvents.push(...normalized);
-  db.classroomEvents = db.classroomEvents.slice(-2000);
-  session.updatedAt = now();
-  return normalized;
-}
-
-function startClassroomSession(db, lesson, actor, body) {
-  const classId = String(body.classId || "").trim();
-  const participantIds = new Set();
-  if (actor.role === "student") participantIds.add(actor.id);
-  if (classId) {
-    const klass = (db.classes || []).find((item) => item.id === classId);
-    if (!klass) throw Object.assign(new Error("班级不存在"), { status: 404 });
-    if (lesson.teacherId !== actor.id && !lessonCanView(db, lesson, actor)) {
-      throw Object.assign(new Error("无权启动该课堂"), { status: 403 });
-    }
-    (klass.studentIds || []).forEach((id) => participantIds.add(id));
-  }
-  const session = {
-    id: uid("classroom"),
-    lessonId: lesson.id,
-    teacherId: lesson.teacherId,
-    classId,
-    participantIds: Array.from(participantIds),
-    currentSceneIndex: 0,
-    status: "running",
-    events: [],
-    notes: [],
-    startedBy: actor.id,
-    startedAt: now(),
-    updatedAt: now()
-  };
-  addClassroomEvents(db, session, [{
-    type: "system",
-    text: `课堂「${lesson.title}」已启动。`,
-    createdAt: now()
-  }, ...lessonSceneAgentEvents((lesson.scenes || [])[0], lesson)]);
-  db.classroomSessions.unshift(session);
-  lesson.analytics = lesson.analytics || {};
-  lesson.analytics.sessions = Number(lesson.analytics.sessions || 0) + 1;
-  lesson.updatedAt = now();
-  return session;
-}
-
-function scoreLessonQuiz(scene, answers = {}) {
-  const questions = scene?.quiz?.questions || [];
-  if (!questions.length) return { score: 0, results: [] };
-  const results = questions.map((question) => {
-    const raw = answers[question.id] ?? answers[question.stem] ?? "";
-    const givenValues = Array.isArray(raw) ? raw.map((item) => String(item || "").trim()).filter(Boolean) : [String(raw || "").trim()].filter(Boolean);
-    const given = givenValues.join("、");
-    const expectedValues = Array.isArray(question.answer) ? question.answer.map((item) => String(item || "").trim()).filter(Boolean) : [String(question.answer || "").trim()].filter(Boolean);
-    const expected = expectedValues.join("、");
-    let correct = false;
-    if (question.type === "multi") {
-      const givenSet = new Set(givenValues);
-      const expectedSet = new Set(expectedValues);
-      correct = givenSet.size === expectedSet.size && expectedValues.every((item) => givenSet.has(item));
-    } else if (["short", "fill", "step", "code", "graph-locate"].includes(question.type)) {
-      const tokens = tokenizeForSearch(expected);
-      const givenTokens = new Set(tokenizeForSearch(given));
-      correct = Boolean(given) && (tokens.some((token) => givenTokens.has(token)) || given.includes(expected) || expected.includes(given));
+  let conversation = null;
+  const skipConversationWrite = syncMode === "api-return" || syncMode === "api_return";
+  if (!skipConversationWrite && (question || finalAnswer)) {
+    conversation = conversationId ? (db.conversations || []).find((item) => item.id === conversationId && item.userId === userId) : null;
+    if (conversation) {
+      if (question && !(conversation.messages || []).some((message) => message.role === "user" && message.content === question)) {
+        conversation.messages.push({ id: uid("msg"), role: "user", content: [question, studentAnswer ? `学生答案：${studentAnswer}` : ""].filter(Boolean).join("\n\n"), createdAt: now() });
+      }
+      conversation.messages.push({
+        id: uid("msg"),
+        role: "assistant",
+        content: finalAnswer || "Dify 工作流已完成诊断，但未返回 final_answer。",
+        citations,
+        confidence: "dify",
+        mode: studentAnswer ? "grade" : "qa",
+        intent: studentAnswer ? "grade" : "qa",
+        strategy: "Dify 多 RAG 学习诊断工作流",
+        knowledgePoints: [topic],
+        workflow,
+        workflowResult: {
+          ...structured,
+          topic_label: topic,
+          mastery_score: Number.isFinite(rawScore) ? rawScore : 0,
+          mastery_level: masteryLevel || "未诊断",
+          error_tags: errors,
+          missing_points: missing,
+          rag_evidence: Array.isArray(ragEvidence) ? ragEvidence : [],
+          final_answer: finalAnswer,
+          source: "dify-callback",
+          request_id: payload.request_id || payload.requestId || ""
+        },
+        retrieved: [],
+        createdAt: now()
+      });
+      conversation.updatedAt = now();
     } else {
-      correct = given === expected;
+      conversation = {
+        id: uid("conv"),
+        userId,
+        role: user.role,
+        title: question.slice(0, 24) || `Dify 诊断：${topic}`.slice(0, 24),
+        mode: studentAnswer ? "grade" : "qa",
+        messages: [
+          { id: uid("msg"), role: "user", content: [question, studentAnswer ? `学生答案：${studentAnswer}` : ""].filter(Boolean).join("\n\n"), createdAt: now() },
+          {
+            id: uid("msg"),
+            role: "assistant",
+            content: finalAnswer || "Dify 工作流已完成诊断，但未返回 final_answer。",
+            citations,
+            confidence: "dify",
+            mode: studentAnswer ? "grade" : "qa",
+            intent: studentAnswer ? "grade" : "qa",
+            strategy: "Dify 多 RAG 学习诊断工作流",
+            knowledgePoints: [topic],
+            workflow,
+            workflowResult: {
+              ...structured,
+              topic_label: topic,
+              mastery_score: Number.isFinite(rawScore) ? rawScore : 0,
+              mastery_level: masteryLevel || "未诊断",
+              error_tags: errors,
+              missing_points: missing,
+              rag_evidence: Array.isArray(ragEvidence) ? ragEvidence : [],
+              final_answer: finalAnswer,
+              source: "dify-callback",
+              request_id: payload.request_id || payload.requestId || ""
+            },
+            retrieved: [],
+            createdAt: now()
+          }
+        ],
+        createdAt: now(),
+        updatedAt: now()
+      };
+      db.conversations.unshift(conversation);
     }
-    return {
-      questionId: question.id,
-      topic: question.topic || scene.title,
-      stem: question.stem,
-      answer: given,
-      expected,
-      correct,
-      explanation: question.explanation || ""
-    };
+  }
+  db.agentRuns = Array.isArray(db.agentRuns) ? db.agentRuns : [];
+  db.agentRuns.unshift({
+    id: uid("run"),
+    userId,
+    conversationId: conversation?.id || conversationId || "",
+    mode: studentAnswer ? "grade" : "qa",
+    prompt: question.slice(0, 240),
+    confidence: "dify",
+    citations,
+    retrieved: [],
+    intent: studentAnswer ? "grade" : "qa",
+    strategy: "Dify 多 RAG 学习诊断工作流",
+    knowledgePoints: [topic],
+    tools: ["dify_workflow_callback", "structured_json_output", shouldWriteMastery ? "update_mastery" : ""].filter(Boolean),
+    workflow,
+    workflowResult: {
+      ...structured,
+      topic_label: topic,
+      mastery_score: Number.isFinite(rawScore) ? rawScore : 0,
+      mastery_level: masteryLevel || "未诊断",
+      error_tags: errors,
+      missing_points: missing,
+      rag_evidence: Array.isArray(ragEvidence) ? ragEvidence : [],
+      final_answer: finalAnswer,
+      source: "dify-callback",
+      request_id: payload.request_id || payload.requestId || "",
+      sync_mode: syncMode
+    },
+    steps: workflow.steps,
+    createdAt: now()
   });
-  const correctCount = results.filter((item) => item.correct).length;
+  db.agentRuns = db.agentRuns.slice(0, 200);
+  recordAudit(db, null, "dify.diagnosis_callback", {
+    actorId: "dify-workflow",
+    actorRole: "integration",
+    resourceType: "learningProfile",
+    resourceId: userId,
+    meta: { topic, masteryScore: shouldWriteMastery ? normalizedScore : null, wrongNoteId: wrongNote?.id || "", conversationId: conversation?.id || conversationId || "", syncMode }
+  }, req);
   return {
-    score: Math.round((correctCount / questions.length) * 100),
-    results
+    userId,
+    topic,
+    skippedConversationWrite: skipConversationWrite,
+    conversationId: conversation?.id || conversationId || "",
+    wrongNoteId: wrongNote?.id || "",
+    masteryUpdated: shouldWriteMastery,
+    mastery: profile.mastery?.[topic] || null
   };
-}
-
-function xmlEscape(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("\"", "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-const CRC32_TABLE = (() => {
-  const table = [];
-  for (let i = 0; i < 256; i += 1) {
-    let c = i;
-    for (let j = 0; j < 8; j += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buffer.length; i += 1) crc = CRC32_TABLE[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function dosDateTime(date = new Date()) {
-  const year = Math.max(1980, date.getFullYear());
-  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
-  return { dosTime, dosDate };
-}
-
-function zipStore(entries) {
-  const fileParts = [];
-  const centralParts = [];
-  let offset = 0;
-  const { dosTime, dosDate } = dosDateTime();
-  entries.forEach((entry) => {
-    const name = Buffer.from(entry.name, "utf8");
-    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(String(entry.data || ""), "utf8");
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6);
-    local.writeUInt16LE(0, 8);
-    local.writeUInt16LE(dosTime, 10);
-    local.writeUInt16LE(dosDate, 12);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    fileParts.push(local, name, data);
-
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
-    central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0x0800, 8);
-    central.writeUInt16LE(0, 10);
-    central.writeUInt16LE(dosTime, 12);
-    central.writeUInt16LE(dosDate, 14);
-    central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(data.length, 20);
-    central.writeUInt32LE(data.length, 24);
-    central.writeUInt16LE(name.length, 28);
-    central.writeUInt32LE(offset, 42);
-    centralParts.push(central, name);
-    offset += local.length + name.length + data.length;
-  });
-  const centralOffset = offset;
-  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(entries.length, 8);
-  end.writeUInt16LE(entries.length, 10);
-  end.writeUInt32LE(centralSize, 12);
-  end.writeUInt32LE(centralOffset, 16);
-  return Buffer.concat([...fileParts, ...centralParts, end]);
-}
-
-function pptxTextShape(id, x, y, w, h, text, size = 2400, bold = false) {
-  const lines = String(text || "").split(/\n+/).filter(Boolean);
-  const body = lines.length ? lines.map((line) => `<a:p><a:r><a:rPr lang="zh-CN" sz="${size}" ${bold ? "b=\"1\"" : ""}/><a:t>${xmlEscape(line)}</a:t></a:r></a:p>`).join("") : "<a:p/>";
-  return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="Text ${id}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${body}</p:txBody></p:sp>`;
-}
-
-function pptxSlideXml(title, bullets = []) {
-  const bodyText = bullets.filter(Boolean).slice(0, 8).map((item) => `• ${item}`).join("\n");
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${pptxTextShape(2, 650000, 450000, 7800000, 720000, title, 3200, true)}${pptxTextShape(3, 780000, 1380000, 7600000, 4300000, bodyText, 2100)}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
-}
-
-function lessonPptxBuffer(lesson) {
-  const slides = [
-    { title: lesson.title, bullets: [`学科：${lesson.subject}`, `来源：${lessonSourceLabel(lesson.source)} ${lesson.source?.topic || ""}`, `时长：${lesson.duration || 20} 分钟`] },
-    { title: "课堂目标", bullets: lesson.objectives || [] },
-    { title: "多智能体角色", bullets: (lesson.agents || []).map((agent) => `${agent.name}：${agent.style || agent.role}`) },
-    ...(lesson.scenes || []).map((scene, index) => ({
-      title: `${index + 1}. ${scene.title}`,
-      bullets: [
-        `类型：${scene.type}`,
-        scene.objective || "",
-        ...(scene.content?.bullets || []),
-        ...(scene.script || []).map((line) => `${line.agentName || line.agentRole}：${line.text}`),
-        ...(scene.quiz?.questions || []).slice(0, 3).map((q) => `题：${q.stem}`),
-        ...(scene.pbl?.tasks || []).slice(0, 3).map((task) => `项目任务：${task}`),
-        scene.simulation?.title ? `仿真：${scene.simulation.title}` : ""
-      ]
-    }))
-  ].slice(0, 16);
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>${slides.map((_, i) => `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join("")}</Types>`;
-  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>`;
-  const presentationRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${slides.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`).join("")}</Relationships>`;
-  const presentation = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldSz cx="10000000" cy="5625000" type="wide"/><p:sldIdLst>${slides.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join("")}</p:sldIdLst></p:presentation>`;
-  const entries = [
-    { name: "[Content_Types].xml", data: contentTypes },
-    { name: "_rels/.rels", data: rels },
-    { name: "ppt/presentation.xml", data: presentation },
-    { name: "ppt/_rels/presentation.xml.rels", data: presentationRels },
-    ...slides.map((slide, i) => ({ name: `ppt/slides/slide${i + 1}.xml`, data: pptxSlideXml(slide.title, slide.bullets) }))
-  ];
-  return zipStore(entries);
-}
-
-function lessonExportContent(lesson, format = "markdown") {
-  if (format === "json") return JSON.stringify(lesson, null, 2);
-  if (format === "pptx") return lessonPptxBuffer(lesson);
-  const sceneMarkdown = (lesson.scenes || []).map((scene, index) => {
-    const lines = [
-      `## ${index + 1}. ${scene.title}`,
-      `类型：${scene.type}`,
-      scene.objective ? `目标：${scene.objective}` : "",
-      ...(scene.content?.bullets || []).map((item) => `- ${item}`),
-      ...(scene.script || []).map((line) => `- ${line.agentName || line.agentRole}：${line.text}`),
-      ...(scene.simulation ? [`- 仿真：${scene.simulation.title}。${scene.simulation.description || ""}`] : []),
-      ...(scene.pbl?.tasks || []).map((task) => `- 项目任务：${task}`),
-      ...(scene.quiz?.questions || []).map((q, qIndex) => `- 题 ${qIndex + 1}：${q.stem}\n  答案：${Array.isArray(q.answer) ? q.answer.join("、") : q.answer}\n  解析：${q.explanation || ""}`)
-    ];
-    return lines.filter(Boolean).join("\n");
-  }).join("\n\n");
-  const markdown = [
-    `# ${lesson.title}`,
-    "",
-    `学科：${lesson.subject}`,
-    `来源：${lessonSourceLabel(lesson.source)} · ${lesson.source?.topic || ""}`,
-    `时长：${lesson.duration || 20} 分钟`,
-    "",
-    "## 课堂目标",
-    ...(lesson.objectives || []).map((item) => `- ${item}`),
-    "",
-    "## 多智能体角色",
-    ...(lesson.agents || []).map((agent) => `- ${agent.name}：${agent.style || agent.role}`),
-    "",
-    sceneMarkdown
-  ].join("\n");
-  if (format === "html") {
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${lesson.title}</title><style>body{font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.7;max-width:960px;margin:36px auto;padding:0 24px;color:#172033}h1,h2{color:#1d4ed8}section{border:1px solid #d8e0ef;border-radius:8px;padding:18px;margin:16px 0}</style></head><body>${markdown.split("\n\n").map((block) => {
-      if (block.startsWith("# ")) return `<h1>${block.slice(2)}</h1>`;
-      if (block.startsWith("## ")) return `<h2>${block.slice(3)}</h2>`;
-      return `<section>${block.split("\n").map((line) => `<p>${line.replace(/^-\s*/, "")}</p>`).join("")}</section>`;
-    }).join("")}</body></html>`;
-  }
-  return markdown;
 }
 
 function gradeSubmissionWithFeedback(db, homework, submission) {
@@ -5336,13 +7897,40 @@ function classTeacherIdsForUser(db, user) {
     .filter(Boolean)));
 }
 
+function syncUserPrimaryClassName(db, user, excludedClassId = "") {
+  if (!user || user.role !== "student") return;
+  const classIds = Array.isArray(user.classIds) ? user.classIds.map(String) : [];
+  const primaryClass = (db.classes || []).find((klass) => klass.id !== excludedClassId && classIds.includes(klass.id));
+  user.className = primaryClass?.name || "";
+  user.updatedAt = now();
+}
+
+function removeStudentFromClass(db, klass, studentId) {
+  const id = String(studentId || "");
+  const student = getUser(db, id);
+  const classStudentIds = Array.isArray(klass.studentIds) ? klass.studentIds.map(String) : [];
+  const wasInClass = classStudentIds.includes(id);
+  let hadUserClass = false;
+
+  klass.studentIds = classStudentIds.filter((item) => item !== id);
+  klass.updatedAt = now();
+
+  if (student) {
+    const classIds = Array.isArray(student.classIds) ? student.classIds.map(String) : [];
+    hadUserClass = classIds.includes(klass.id);
+    student.classIds = classIds.filter((classId) => classId !== klass.id);
+    syncUserPrimaryClassName(db, student);
+  }
+
+  return { student, removed: wasInClass || hadUserClass };
+}
+
 function visibleKnowledgeGraphs(db, userId) {
   const user = ensureUser(db, userId);
   if (user.role === "admin") return db.knowledgeGraphs || [];
-  const teacherIds = classTeacherIdsForUser(db, user);
   return (db.knowledgeGraphs || []).filter((graph) => (
     graph.ownerId === userId
-    || (user.role === "student" && graph.global && teacherIds.includes(graph.ownerId))
+    || (user.role === "student" && graph.global)
   ));
 }
 
@@ -5397,15 +7985,6 @@ function getRelevantState(db, userId) {
     homework: db.homework.filter((item) => item.teacherId === userId || classIds.includes(item.classId)),
     submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
     courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
-    lessons: visibleLessons(db, userId).map((lesson) => publicLesson(db, lesson, userId)),
-    classroomSessions: (db.classroomSessions || [])
-      .filter((session) => {
-        const lesson = (db.lessons || []).find((item) => item.id === session.lessonId);
-        return lesson && lessonCanView(db, lesson, user) && (lesson.teacherId === userId || (session.participantIds || []).includes(userId) || user.role === "admin");
-      })
-      .map((session) => publicClassroomSession(session, userId)),
-    quizAttempts: (db.quizAttempts || []).filter((item) => item.studentId === userId || db.lessons.some((lesson) => lesson.id === item.lessonId && lesson.teacherId === userId)).slice(0, 120),
-    lessonExports: (db.lessonExports || []).filter((item) => db.lessons.some((lesson) => lesson.id === item.lessonId && (lesson.teacherId === userId || user.role === "admin"))).slice(0, 80),
     learningProfile: ensureLearningProfile(db, userId),
     wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
     learningAnalytics: learningAnalytics(db, userId),
@@ -5433,14 +8012,29 @@ async function handleApi(req, res, pathname, searchParams) {
       runtimeDirWritable: checkRuntimeDirWritable(),
       sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
       cookieSecure: process.env.COOKIE_SECURE === "true",
+      difyWorkflowConfigured: isDifyWorkflowConfigured(),
+      difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
+      difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
+      difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
       storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
       uploadSessions: uploadSessions.size,
       graphJobs: graphJobs.size
     };
     const warnings = [];
     if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
+    if (!checks.difyStudentWorkflowConfigured) warnings.push("未配置有效 DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY，学生端 AI 助教会返回配置错误");
+    if (!checks.difyTeacherWorkflowConfigured) warnings.push("未配置有效 DIFY_TEACHER_WORKFLOW_API_KEY，教师端教学 AI 助教会返回配置错误");
+    if (!checks.difyCallbackTokenConfigured) warnings.push("未配置强随机 DIFY_CALLBACK_TOKEN，Dify 回调接口将拒绝默认令牌");
     if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
-    const ready = checks.dataDirWritable && checks.runtimeDirWritable && (process.env.NODE_ENV !== "production" || (checks.sessionSecretConfigured && checks.cookieSecure));
+    const ready = checks.dataDirWritable
+      && checks.runtimeDirWritable
+      && (process.env.NODE_ENV !== "production" || (
+        checks.sessionSecretConfigured
+        && checks.cookieSecure
+        && checks.difyStudentWorkflowConfigured
+        && checks.difyTeacherWorkflowConfigured
+        && checks.difyCallbackTokenConfigured
+      ));
     return send(res, ready ? 200 : 503, {
       ok: ready,
       status: ready ? "ready" : "not-ready",
@@ -5449,6 +8043,79 @@ async function handleApi(req, res, pathname, searchParams) {
       checks,
       warnings
     });
+  }
+
+  if (method === "GET" && pathname === "/api/admin/overview") {
+    const actor = requireActor(req, db);
+    requireRole(actor, ["admin"]);
+    cleanupGraphJobs();
+    const checks = {
+      dataDirWritable: checkDataDirWritable(),
+      runtimeDirWritable: checkRuntimeDirWritable(),
+      sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
+      cookieSecure: process.env.COOKIE_SECURE === "true",
+      difyWorkflowConfigured: isDifyWorkflowConfigured(),
+      difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
+      difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
+      difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
+      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
+      uploadSessions: uploadSessions.size,
+      graphJobs: graphJobs.size
+    };
+    const warnings = [];
+    if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
+    if (!checks.difyStudentWorkflowConfigured) warnings.push("未配置有效 DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY，学生端 AI 助教会返回配置错误");
+    if (!checks.difyTeacherWorkflowConfigured) warnings.push("未配置有效 DIFY_TEACHER_WORKFLOW_API_KEY，教师端教学 AI 助教会返回配置错误");
+    if (!checks.difyCallbackTokenConfigured) warnings.push("未配置强随机 DIFY_CALLBACK_TOKEN，Dify 回调接口将拒绝默认令牌");
+    if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
+    const recentUsers = (db.users || [])
+      .map(publicUser)
+      .sort((a, b) => new Date(b.lastLoginAt || b.createdAt || 0) - new Date(a.lastLoginAt || a.createdAt || 0))
+      .slice(0, 12);
+    const graphJobList = Array.from(graphJobs.values())
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+      .slice(0, 20)
+      .map(publicGraphJob);
+    const counts = {
+      users: db.users.length,
+      teachers: db.users.filter((user) => user.role === "teacher").length,
+      students: db.users.filter((user) => user.role === "student").length,
+      materials: db.courseMaterials.length,
+      publicMaterials: db.courseMaterials.filter((item) => item.global).length,
+      graphs: db.knowledgeGraphs.length,
+      publicGraphs: db.knowledgeGraphs.filter((item) => item.global).length,
+      classes: db.classes.length,
+      homework: db.homework.length,
+      submissions: db.submissions.length,
+      failedJobs: graphJobList.filter((job) => job.status === "failed").length
+    };
+    return send(res, 200, {
+      ok: true,
+      overview: {
+        counts,
+        checks,
+        warnings,
+        health: { status: "ok", storage: checks.storage },
+        ready: { status: warnings.length ? "warning" : "ready" },
+        recentUsers,
+        graphJobs: graphJobList,
+        auditLogs: (db.auditLogs || []).slice(0, 80)
+      }
+    });
+  }
+
+  if (method === "POST" && pathname === "/api/admin/backup") {
+    const actor = requireActor(req, db);
+    requireRole(actor, ["admin"]);
+    ensureDataDir();
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `db-backup-${stamp}.json`;
+    const target = path.join(BACKUP_DIR, fileName);
+    fs.copyFileSync(DB_PATH, target);
+    recordAudit(db, actor, "admin.backup", { resourceType: "backup", resourceId: fileName }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, fileName, path: target });
   }
 
   if (method === "POST" && pathname === "/api/auth/register") {
@@ -5544,11 +8211,87 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 200, { ok: true, user: publicUser(actor), state: getRelevantState(db, actor.id) });
   }
 
+  if (method === "POST" && pathname === "/api/integrations/dify/diagnosis-callback") {
+    if (!isDifyCallbackAuthorized(req)) return sendError(res, 401, "Dify 回调令牌无效");
+    const body = await readBody(req);
+    const synced = syncDifyDiagnosisCallback(db, body, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, synced });
+  }
+
+  if (method === "POST" && pathname === "/api/integrations/dify/graph-context") {
+    if (!isDifyCallbackAuthorized(req)) return sendError(res, 401, "Dify 图谱查询令牌无效");
+    const body = await readBody(req);
+    const requestUserId = String(body.request_user_id || body.requestUserId || body.user_id || body.userId || body.student_id || "").trim();
+    const user = requestUserId ? getUser(db, requestUserId) : null;
+    const hits = graphDatabaseHitsForWorkflow(db, user?.id || "", {
+      question: body.question || body.query || "",
+      subject: body.subject || "",
+      chapter: body.chapter || "",
+      knowledgePoint: body.knowledge_point || body.knowledgePoint || "",
+      graphId: body.graph_id || body.graphId || "",
+      nodeId: body.node_id || body.nodeId || "",
+      limit: Math.max(1, Math.min(12, Number(body.limit || 8)))
+    });
+    const docs = difyProjectDocsFromHits(hits, "项目知识图谱数据库", 12);
+    recordAudit(db, user || null, "dify.graph_context", {
+      resourceType: "knowledgeGraph",
+      resourceId: String(body.graph_id || body.graphId || ""),
+      meta: { requestUserId, subject: body.subject || "", hits: docs.length }
+    }, req);
+    writeDb(db);
+    return send(res, 200, {
+      ok: true,
+      source: "project-knowledge-graph-db",
+      request_user_id: requestUserId,
+      graph_id: String(body.graph_id || body.graphId || ""),
+      node_id: String(body.node_id || body.nodeId || ""),
+      documents: docs
+    });
+  }
+
   const actor = requireActor(req, db);
   res.sessionActor = actor;
 
   if (method === "GET" && pathname === "/api/state") {
     return send(res, 200, { ok: true, state: getRelevantState(db, actor.id) });
+  }
+
+  if (method === "POST" && pathname === "/api/knowledge-tests/generate") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    const quiz = buildKnowledgeTestQuestions(db, userId, {
+      subject: String(body.subject || ""),
+      materialId: String(body.materialId || body.material_id || ""),
+      count: body.count
+    });
+    recordAudit(db, actor, "knowledge_test.generate", {
+      resourceType: "knowledgeTest",
+      resourceId: quiz.id,
+      meta: { subject: quiz.subject, materialId: quiz.materialId, topic: quiz.topic }
+    }, req);
+    return send(res, 200, { ok: true, quiz });
+  }
+
+  if (method === "POST" && pathname === "/api/knowledge-tests/evaluate") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    const result = evaluateKnowledgeTestAnswer(db, userId, body.question || {}, body.answer, {
+      quizId: String(body.quizId || body.quiz_id || ""),
+      subject: String(body.subject || ""),
+      materialId: String(body.materialId || body.material_id || ""),
+      attempts: body.attempts || [],
+      questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions
+    });
+    recordAudit(db, actor, "knowledge_test.evaluate", {
+      resourceType: "knowledgeTest",
+      resourceId: String(body.quizId || body.quiz_id || ""),
+      meta: { topic: result.topic, accuracy: result.accuracy, overallAccuracy: result.overall?.accuracy, masteryLevel: result.overall?.masteryLevel }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, result, learningProfile: ensureLearningProfile(db, userId) });
   }
 
   if (method === "GET" && pathname === "/api/users/search") {
@@ -5577,249 +8320,6 @@ async function handleApi(req, res, pathname, searchParams) {
     recordAudit(db, actor, "user.update", { resourceType: "user", resourceId: user.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, user: publicUser(user) });
-  }
-
-  if (method === "GET" && pathname === "/api/lessons") {
-    const userId = queryUserId(searchParams, actor);
-    const subject = searchParams.get("subject");
-    let lessons = visibleLessons(db, userId);
-    if (subject) lessons = lessons.filter((lesson) => lesson.subject === normalizeSubject(subject));
-    return send(res, 200, { ok: true, lessons: lessons.map((lesson) => publicLesson(db, lesson, userId)) });
-  }
-
-  if (method === "POST" && pathname === "/api/lessons/generate") {
-    const body = await readBody(req);
-    assertRequired(body, ["teacherId"]);
-    requireRole(actor, ["teacher", "admin"]);
-    const teacher = ensureUser(db, body.teacherId);
-    if (!["teacher", "admin"].includes(teacher.role)) return sendError(res, 403, "只有教师可以生成互动课堂");
-    const ownedClassIds = new Set((db.classes || []).filter((klass) => klass.teacherId === teacher.id).map((klass) => klass.id));
-    const requestedClassIds = Array.isArray(body.classIds) ? body.classIds.map(String).filter(Boolean) : [];
-    body.classIds = requestedClassIds.filter((classId) => ownedClassIds.has(classId));
-    const lesson = createLessonFromRequest(db, teacher, body);
-    db.lessons.unshift(lesson);
-    recordAudit(db, actor, "lesson.generate", { resourceType: "lesson", resourceId: lesson.id, meta: { title: lesson.title, subject: lesson.subject } }, req);
-    writeDb(db);
-    return send(res, 201, { ok: true, lesson: publicLesson(db, lesson, actor.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/lessons/:id");
-  if (method === "GET" && params) {
-    const lesson = (db.lessons || []).find((item) => item.id === params.id);
-    if (!lesson) return notFound(res);
-    if (!lessonCanView(db, lesson, actor)) return sendError(res, 403, "无权查看该课堂");
-    return send(res, 200, { ok: true, lesson: publicLesson(db, lesson, actor.id) });
-  }
-
-  if (method === "PUT" && params) {
-    const body = await readBody(req);
-    const lesson = (db.lessons || []).find((item) => item.id === params.id);
-    try {
-      assertLessonEditable(lesson, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    if (body.title !== undefined) lesson.title = String(body.title || lesson.title).trim().slice(0, 80) || lesson.title;
-    if (body.subject !== undefined) lesson.subject = normalizeSubject(body.subject);
-    if (Array.isArray(body.objectives)) lesson.objectives = body.objectives.map(String).filter(Boolean).slice(0, 10);
-    if (Array.isArray(body.agents)) lesson.agents = body.agents.filter(Boolean).slice(0, 12);
-    if (Array.isArray(body.scenes)) lesson.scenes = body.scenes.filter(Boolean).slice(0, 24);
-    if (Array.isArray(body.classIds)) {
-      const ownedClassIds = new Set((db.classes || []).filter((klass) => klass.teacherId === lesson.teacherId).map((klass) => klass.id));
-      lesson.classIds = body.classIds.map(String).filter((classId) => ownedClassIds.has(classId));
-    }
-    if (["draft", "published"].includes(body.status)) lesson.status = body.status;
-    lesson.updatedAt = now();
-    recordAudit(db, actor, "lesson.update", { resourceType: "lesson", resourceId: lesson.id }, req);
-    writeDb(db);
-    return send(res, 200, { ok: true, lesson: publicLesson(db, lesson, actor.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/lessons/:id/export");
-  if (method === "POST" && params) {
-    const body = await readBody(req);
-    const lesson = (db.lessons || []).find((item) => item.id === params.id);
-    try {
-      assertLessonEditable(lesson, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    const format = ["markdown", "html", "json", "pptx"].includes(body.format) ? body.format : "markdown";
-    const content = lessonExportContent(lesson, format);
-    const isBinary = Buffer.isBuffer(content);
-    const exportRecord = {
-      id: uid("lesson_export"),
-      lessonId: lesson.id,
-      teacherId: lesson.teacherId,
-      format,
-      fileName: `${lesson.title}.${format === "markdown" ? "md" : format}`,
-      characters: isBinary ? content.length : String(content).length,
-      content: isBinary ? "" : content,
-      contentBase64: isBinary ? content.toString("base64") : "",
-      mimeType: format === "pptx" ? "application/vnd.openxmlformats-officedocument.presentationml.presentation" : format === "html" ? "text/html;charset=utf-8" : "text/plain;charset=utf-8",
-      createdAt: now()
-    };
-    db.lessonExports.unshift(exportRecord);
-    recordAudit(db, actor, "lesson.export", { resourceType: "lesson", resourceId: lesson.id, meta: { format } }, req);
-    writeDb(db);
-    return send(res, 200, { ok: true, export: exportRecord });
-  }
-
-  params = routePattern(pathname, "/api/classrooms/:lessonId/start");
-  if (method === "POST" && params) {
-    const body = await readBody(req);
-    const lesson = (db.lessons || []).find((item) => item.id === params.lessonId);
-    if (!lesson) return notFound(res);
-    if (actor.role === "teacher" || actor.role === "admin") {
-      try {
-        assertLessonEditable(lesson, actor);
-      } catch (error) {
-        return sendError(res, error.status || 500, error.message);
-      }
-    } else if (!lessonCanView(db, lesson, actor)) {
-      return sendError(res, 403, "无权启动该课堂");
-    }
-    const session = startClassroomSession(db, lesson, actor, body);
-    recordAudit(db, actor, "classroom.start", { resourceType: "classroomSession", resourceId: session.id, meta: { lessonId: lesson.id } }, req);
-    writeDb(db);
-    return send(res, 201, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/classrooms/:sessionId/next");
-  if (method === "POST" && params) {
-    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
-    let lesson;
-    try {
-      lesson = assertSessionVisible(db, session, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    const scenes = lesson.scenes || [];
-    if (!scenes.length) return sendError(res, 400, "该课堂没有可运行的环节");
-    if (session.currentSceneIndex >= scenes.length - 1) {
-      session.status = "complete";
-      addClassroomEvents(db, session, [{ type: "system", text: "课堂已完成，可以导出课件或查看测验回流。", createdAt: now() }]);
-    } else {
-      session.currentSceneIndex += 1;
-      addClassroomEvents(db, session, lessonSceneAgentEvents(scenes[session.currentSceneIndex], lesson));
-    }
-    recordAudit(db, actor, "classroom.next", { resourceType: "classroomSession", resourceId: session.id, meta: { sceneIndex: session.currentSceneIndex } }, req);
-    writeDb(db);
-    return send(res, 200, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/classrooms/:sessionId/ask");
-  if (method === "POST" && params) {
-    const body = await readBody(req);
-    assertRequired(body, ["question"]);
-    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
-    let lesson;
-    try {
-      lesson = assertSessionVisible(db, session, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    const question = String(body.question || "").trim().slice(0, 500);
-    const hits = searchCourseKnowledge(db, actor.id, `${lesson.title}\n${question}`, { subject: lesson.subject, limit: 3 });
-    const citations = lessonCitationsFromHits(hits);
-    const answer = [
-      `针对你的问题「${question}」，我会先回到本节课主题「${lesson.source?.topic || lesson.title}」。`,
-      citations[0] ? `可引用资料：${citations[0].sourceName || citations[0].title}${citations[0].chapter ? ` · ${citations[0].chapter}` : ""}。` : "当前没有命中课程资料，以下为课堂脚本内的引导性解释。",
-      "建议先说明概念边界，再举一个例子，最后用课堂小测验证。"
-    ].join("\n");
-    addClassroomEvents(db, session, [
-      { type: "student_question", userId: actor.id, text: question, createdAt: now() },
-      { type: "agent_speech", agentRole: "assistant", agentName: "AI助教", text: answer, citations, createdAt: now() }
-    ]);
-    if (actor.role === "student") {
-      recordLearningActivity(db, actor.id, { kind: "question", mode: "classroom", prompt: question, topics: lesson.tags || [], confidence: citations.length ? "medium" : "low", minutes: 2 });
-    }
-    recordAudit(db, actor, "classroom.ask", { resourceType: "classroomSession", resourceId: session.id }, req);
-    writeDb(db);
-    return send(res, 200, { ok: true, session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/classrooms/:sessionId/quiz/submit");
-  if (method === "POST" && params) {
-    const body = await readBody(req);
-    assertRequired(body, ["studentId"]);
-    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
-    let lesson;
-    try {
-      lesson = assertSessionVisible(db, session, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    const student = ensureUser(db, body.studentId);
-    if (student.role !== "student") return sendError(res, 400, "课堂测验只能由学生提交");
-    if (!lessonCanView(db, lesson, student) && !(session.participantIds || []).includes(student.id)) return sendError(res, 403, "该学生不在课堂中");
-    const scene = (lesson.scenes || []).find((item) => item.id === body.sceneId) || (lesson.scenes || []).find((item) => item.type === "quiz");
-    if (!scene || scene.type !== "quiz") return sendError(res, 404, "该课堂没有测验环节");
-    const result = scoreLessonQuiz(scene, body.answers || {});
-    const topics = Array.from(new Set(result.results.map((item) => item.topic).filter(Boolean))).slice(0, 8);
-    const attempt = {
-      id: uid("quiz_attempt"),
-      lessonId: lesson.id,
-      sessionId: session.id,
-      sceneId: scene.id,
-      studentId: student.id,
-      answers: body.answers || {},
-      score: result.score,
-      results: result.results,
-      topics,
-      createdAt: now()
-    };
-    db.quizAttempts.unshift(attempt);
-    db.quizAttempts = db.quizAttempts.slice(0, 1000);
-    updateTopicMastery(db, student.id, topics, result.score >= 70 ? 0.08 : -0.08, `互动课堂测验：${lesson.title}，得分 ${result.score}`);
-    recordLearningActivity(db, student.id, { kind: "practice", mode: "classroom_quiz", prompt: lesson.title, topics, confidence: "high", minutes: 5 });
-    result.results.filter((item) => !item.correct).slice(0, 3).forEach((item) => {
-      addWrongNote(db, student.id, {
-        source: "课堂测验",
-        topic: item.topic || lesson.title,
-        question: item.stem,
-        answer: item.answer,
-        analysis: `课堂测验答错，参考答案：${item.expected}`,
-        recommendation: item.explanation || "建议回看课堂白板和对应知识图谱节点。"
-      });
-    });
-    addClassroomEvents(db, session, [{ type: "quiz_attempt", userId: student.id, text: `${student.name} 完成课堂小测，得分 ${result.score}`, attemptId: attempt.id, createdAt: now() }]);
-    lesson.analytics = lesson.analytics || {};
-    lesson.analytics.attempts = Number(lesson.analytics.attempts || 0) + 1;
-    lesson.updatedAt = now();
-    recordAudit(db, actor, "classroom.quiz_submit", { resourceType: "quizAttempt", resourceId: attempt.id, meta: { score: result.score } }, req);
-    writeDb(db);
-    return send(res, 201, { ok: true, attempt, session: publicClassroomSession(session, actor.id), learningAnalytics: learningAnalytics(db, student.id), state: getRelevantState(db, actor.id) });
-  }
-
-  params = routePattern(pathname, "/api/classrooms/:sessionId/whiteboard/action");
-  if (method === "POST" && params) {
-    const body = await readBody(req);
-    const session = (db.classroomSessions || []).find((item) => item.id === params.sessionId);
-    let lesson;
-    try {
-      lesson = assertSessionVisible(db, session, actor);
-    } catch (error) {
-      return sendError(res, error.status || 500, error.message);
-    }
-    const scene = (lesson.scenes || [])[session.currentSceneIndex] || (lesson.scenes || []).find((item) => item.type === "whiteboard");
-    if (!scene) return sendError(res, 404, "当前课堂没有可写入的白板环节");
-    scene.whiteboard = scene.whiteboard || { objects: [] };
-    const object = {
-      id: uid("wb"),
-      type: String(body.type || "note"),
-      x: Number(body.x || 120),
-      y: Number(body.y || 120),
-      text: String(body.text || "课堂备注").slice(0, 300),
-      createdBy: actor.id,
-      createdAt: now()
-    };
-    scene.whiteboard.objects.push(object);
-    lesson.updatedAt = now();
-    addClassroomEvents(db, session, [{ type: "whiteboard_action", userId: actor.id, text: object.text, object, createdAt: now() }]);
-    recordAudit(db, actor, "classroom.whiteboard_action", { resourceType: "classroomSession", resourceId: session.id }, req);
-    writeDb(db);
-    return send(res, 201, { ok: true, object, lesson: publicLesson(db, lesson, actor.id), session: publicClassroomSession(session, actor.id), state: getRelevantState(db, actor.id) });
   }
 
   if (method === "GET" && pathname === "/api/graphs") {
@@ -5869,25 +8369,34 @@ async function handleApi(req, res, pathname, searchParams) {
 
   if (method === "POST" && pathname === "/api/graphs/generate-upload") {
     const body = await readBody(req);
-    assertRequired(body, ["userId", "uploadId", "subject"]);
-    const session = getUploadSession(body.uploadId);
-    if (session.userId !== body.userId) return sendError(res, 403, "不能使用其他账号的上传文件");
-    if (session.received !== session.size) return sendError(res, 400, "文件尚未上传完成");
-    assertStoredUploadSafe(session);
+    assertRequired(body, ["userId", "subject"]);
+    const uploadIds = Array.isArray(body.uploadIds)
+      ? body.uploadIds.map(String).filter(Boolean)
+      : [String(body.uploadId || "")].filter(Boolean);
+    if (!uploadIds.length) return sendError(res, 400, "请至少上传一个文件");
+    if (uploadIds.length > 10) return sendError(res, 400, "一次最多汇总 10 个文件生成图谱");
+    const sessions = uploadIds.map((uploadId) => getUploadSession(uploadId));
+    sessions.forEach((session) => {
+      if (session.userId !== body.userId) throw Object.assign(new Error("不能使用其他账号的上传文件"), { status: 403 });
+      if (session.received !== session.size) throw Object.assign(new Error(`文件 ${session.fileName} 尚未上传完成`), { status: 400 });
+      assertStoredUploadSafe(session);
+    });
     const subject = normalizeSubject(body.subject);
     const title = body.title || `${subject}知识图谱`;
-    const sourceName = body.sourceName || session.fileName;
+    const sourceName = body.sourceName || sessions.map((session) => session.fileName).join("、");
     const extractor = body.extractor || AI_UNLIMITED_EXTRACTOR;
     const job = createGraphJob({
       userId: body.userId,
       subject,
       title,
       sourceName,
-      fileSize: session.size,
+      fileSize: sessions.reduce((sum, session) => sum + Number(session.size || 0), 0),
+      fileCount: sessions.length,
       extractor,
-      uploadId: session.id
+      uploadIds: sessions.map((session) => session.id),
+      sourceFiles: sessions.map((session) => ({ id: session.id, name: session.fileName, size: session.size, type: session.fileType }))
     });
-    recordAudit(db, actor, "graph.generate_upload", { resourceType: "graphJob", resourceId: job.id, meta: { subject, title, sourceName } }, req);
+    recordAudit(db, actor, "graph.generate_upload", { resourceType: "graphJob", resourceId: job.id, meta: { subject, title, sourceName, fileCount: sessions.length } }, req);
     send(res, 202, { ok: true, job: publicGraphJob(job) });
     processGraphGenerationJob(job.id, {
       userId: body.userId,
@@ -5896,14 +8405,24 @@ async function handleApi(req, res, pathname, searchParams) {
       sourceName,
       sourceText: requestText(body.sourceText),
       extractor,
-      uploadId: session.id,
-      file: {
+      uploadIds: sessions.map((session) => session.id),
+      files: sessions.map((session) => ({
         name: session.fileName,
         type: session.fileType,
         filePath: session.filePath
-      }
+      }))
     });
     return;
+  }
+
+  if (method === "GET" && pathname === "/api/graphs/jobs") {
+    cleanupGraphJobs();
+    const jobs = Array.from(graphJobs.values())
+      .filter((job) => actor.role === "admin" || job.meta?.userId === actor.id)
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+      .slice(0, 40)
+      .map(publicGraphJob);
+    return send(res, 200, { ok: true, jobs });
   }
 
   params = routePattern(pathname, "/api/graphs/jobs/:id");
@@ -6101,6 +8620,43 @@ async function handleApi(req, res, pathname, searchParams) {
     }
   }
 
+  if (method === "POST" && pathname === "/api/materials/retrieval-test") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "query"]);
+    const user = ensureUser(db, body.userId);
+    if (actor.role !== "admin" && actor.id !== user.id) return sendError(res, 403, "只能测试自己的可见资料");
+    const visible = visibleCourseMaterials(db, user.id);
+    const material = body.materialId ? visible.find((item) => item.id === body.materialId) : null;
+    if (body.materialId && !material) return sendError(res, 404, "资料不存在或不可见");
+    let hits = searchCourseKnowledge(db, user.id, body.query, {
+      subject: body.subject || material?.subject || "",
+      limit: 12
+    });
+    if (material) hits = hits.filter((hit) => hit.materialId === material.id);
+    const publicHits = hits.slice(0, 8).map((hit) => {
+      const hitMaterial = hit.materialId ? visible.find((item) => item.id === hit.materialId) || db.courseMaterials.find((item) => item.id === hit.materialId) : null;
+      return {
+        type: hit.type,
+        score: hit.score,
+        title: hit.title,
+        sourceName: hit.sourceName,
+        subject: hit.subject,
+        chapter: hit.chapter,
+        page: hit.page,
+        quote: hit.quote,
+        materialId: hit.materialId,
+        chunkId: hit.chunkId,
+        graphId: hit.graphId,
+        nodeId: hit.nodeId,
+        studentVisible: Boolean(hitMaterial?.global),
+        scoreDetail: hit.scoreDetail
+      };
+    });
+    recordAudit(db, actor, "material.retrieval_test", { resourceType: "courseMaterial", resourceId: material?.id || "", meta: { query: String(body.query).slice(0, 120), hits: publicHits.length } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, materialId: material?.id || "", query: body.query, hits: publicHits });
+  }
+
   params = routePattern(pathname, "/api/materials/:id");
   if (method === "DELETE" && params) {
     const userId = queryUserId(searchParams, actor);
@@ -6184,7 +8740,7 @@ async function handleApi(req, res, pathname, searchParams) {
       db.conversations.unshift(conv);
     }
     const userMessage = { id: uid("msg"), role: "user", content: String(body.prompt), createdAt: now() };
-    const agentAnswer = buildEducationalAgentAnswer(db, user, body);
+    const agentAnswer = await buildEducationalAgentAnswer(db, user, body);
     const assistantMessage = {
       id: uid("msg"),
       role: "assistant",
@@ -6197,6 +8753,8 @@ async function handleApi(req, res, pathname, searchParams) {
       knowledgePoints: agentAnswer.knowledgePoints,
       graphContext: agentAnswer.graphContext,
       learningPanel: agentAnswer.learningPanel,
+      workflow: agentAnswer.workflow,
+      workflowResult: agentAnswer.workflowResult,
       actions: agentAnswer.actions,
       retrieved: agentAnswer.retrieved,
       createdAt: now()
@@ -6220,15 +8778,9 @@ async function handleApi(req, res, pathname, searchParams) {
       knowledgePoints: agentAnswer.knowledgePoints,
       graphFocus: agentAnswer.learningPanel?.graphFocus || null,
       tools: agentAnswer.tools || [],
-      steps: [
-        `意图识别：${agentAnswer.label || agentAnswer.intent || conv.mode}`,
-        "上下文补全：课程/章节/知识点/学生画像",
-        "课程资料 RAG 检索",
-        "知识图谱关联与前置知识查询",
-        `教学策略：${agentAnswer.strategy || "课程 RAG 问答"}`,
-        "可靠性与引用标注",
-        "学习记录与掌握度更新"
-      ],
+      workflow: agentAnswer.workflow,
+      workflowResult: agentAnswer.workflowResult,
+      steps: agentAnswer.workflow?.steps || ML_DIAGNOSIS_WORKFLOW_STEP_TITLES,
       createdAt: now()
     });
     db.agentRuns = db.agentRuns.slice(0, 200);
@@ -6280,6 +8832,46 @@ async function handleApi(req, res, pathname, searchParams) {
     recordAudit(db, actor, "model.create", { resourceType: "model", resourceId: model.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, model });
+  }
+
+  if (method === "POST" && pathname === "/api/model-code/generate") {
+    const body = await readBody(req);
+    assertRequired(body, ["userId", "prompt"]);
+    if (actor.role !== "admin" && actor.id !== body.userId) return sendError(res, 403, "只能为自己的账号生成算法");
+    const subject = normalizeSubject(body.subject || "机器学习");
+    const prompt = String(body.prompt || "").trim();
+    if (!prompt) return sendError(res, 400, "算法需求不能为空");
+    if (prompt.length > 1200) return sendError(res, 400, "算法需求不能超过 1200 字");
+    const hits = searchCourseKnowledge(db, body.userId, prompt, { subject, limit: 5 });
+    const relevantHits = hits.filter((hit) => Number(hit.score || 0) >= 0.8);
+    let rawGenerated = null;
+    let openAiError = null;
+    if (isConfiguredSecret(OPENAI_API_KEY)) {
+      try {
+        rawGenerated = await generateAlgorithmWithOpenAI(prompt, subject, null, relevantHits);
+      } catch (error) {
+        openAiError = error;
+      }
+    }
+    if (!rawGenerated && relevantHits.length) {
+      rawGenerated = courseAlgorithmGeneration(prompt, relevantHits);
+    }
+    if (!rawGenerated) {
+      rawGenerated = localAlgorithmGeneration(prompt, subject, openAiError ? publicGenerationFallbackReason(openAiError) : "OpenAI API Key 未配置");
+    }
+    const generated = await verifyGeneratedAlgorithm(rawGenerated, prompt, subject);
+    recordAudit(db, actor, "model.code_generate", {
+      resourceType: "modelCode",
+      resourceId: "",
+      meta: {
+        subject,
+        sourceType: generated.sourceType,
+        hits: relevantHits.length,
+        title: String(generated.title || "").slice(0, 80)
+      }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, ...generated });
   }
 
   if (method === "POST" && pathname === "/api/model-code/run") {
@@ -6517,12 +9109,62 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 201, { ok: true, class: klass });
   }
 
+  params = routePattern(pathname, "/api/classes/:id");
+  if (method === "DELETE" && params) {
+    const body = await readBody(req);
+    requireRole(actor, ["teacher", "admin"]);
+    const klass = db.classes.find((item) => item.id === params.id);
+    if (!klass) return notFound(res);
+    const teacherId = String(body.teacherId || actor.id);
+    if (actor.role !== "admin" && klass.teacherId !== actor.id) return sendError(res, 403, "只能解散自己创建的班级");
+    if (actor.role === "admin" && body.teacherId && klass.teacherId !== teacherId) return sendError(res, 403, "班级不属于指定教师");
+
+    const classStudentIds = new Set(klass.studentIds || []);
+    const classHomeworkIds = new Set(db.homework.filter((item) => item.classId === klass.id).map((item) => item.id));
+    const removed = {
+      students: classStudentIds.size,
+      homework: classHomeworkIds.size,
+      submissions: db.submissions.filter((item) => classHomeworkIds.has(item.homeworkId)).length
+    };
+
+    db.users.forEach((user) => {
+      if (!Array.isArray(user.classIds) || !user.classIds.includes(klass.id)) return;
+      user.classIds = user.classIds.filter((classId) => classId !== klass.id);
+      if (user.className === klass.name || classStudentIds.has(user.id)) {
+        syncUserPrimaryClassName(db, user, klass.id);
+      } else {
+        user.updatedAt = now();
+      }
+    });
+
+
+    db.courseMaterials.forEach((material) => {
+      if (material.classId === klass.id) {
+        material.classId = "";
+        material.updatedAt = now();
+      }
+    });
+
+    db.homework = db.homework.filter((item) => item.classId !== klass.id);
+    db.submissions = db.submissions.filter((item) => !classHomeworkIds.has(item.homeworkId));
+    db.classes = db.classes.filter((item) => item.id !== klass.id);
+
+    recordAudit(db, actor, "class.delete", { resourceType: "class", resourceId: klass.id, meta: { name: klass.name, ...removed } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, removed });
+  }
+
   params = routePattern(pathname, "/api/classes/:id/import-students");
   if (method === "POST" && params) {
     const body = await readBody(req);
+    requireRole(actor, ["teacher", "admin"]);
     const klass = db.classes.find((item) => item.id === params.id);
     if (!klass) return notFound(res);
-    if (klass.teacherId !== body.teacherId) return sendError(res, 403, "只能导入自己的班级");
+    const teacherId = String(body.teacherId || actor.id);
+    if (actor.role !== "admin" && klass.teacherId !== actor.id) return sendError(res, 403, "只能导入自己的班级");
+    if (actor.role === "admin" && body.teacherId && klass.teacherId !== teacherId) return sendError(res, 403, "班级不属于指定教师");
+    klass.studentIds = Array.isArray(klass.studentIds) ? klass.studentIds.map(String) : [];
+    klass.importedRoster = Array.isArray(klass.importedRoster) ? klass.importedRoster : [];
     const rows = Array.isArray(body.students) ? body.students : [];
     const added = [];
     rows.forEach((row) => {
@@ -6537,7 +9179,7 @@ async function handleApi(req, res, pathname, searchParams) {
           role: "student",
           passwordHash: hashPassword("123456"),
           subject: "",
-          className: klass.name,
+          className: "",
           classIds: [],
           avatar: (name || "学").slice(0, 1),
           createdAt: now()
@@ -6546,7 +9188,7 @@ async function handleApi(req, res, pathname, searchParams) {
       }
       if (!klass.studentIds.includes(user.id)) klass.studentIds.push(user.id);
       user.classIds = Array.from(new Set([...(user.classIds || []), klass.id]));
-      user.className = klass.name;
+      syncUserPrimaryClassName(db, user);
       if (!klass.importedRoster.some((item) => item.id === user.id)) {
         klass.importedRoster.push({ id: user.id, name: user.name, source: "import", createdAt: now() });
       }
@@ -6566,16 +9208,29 @@ async function handleApi(req, res, pathname, searchParams) {
     const klass = db.classes.find((item) => item.id === params.id || item.inviteCode === params.id);
     if (!klass) return notFound(res);
     const student = ensureUser(db, body.studentId);
+    if (student.role !== "student") return sendError(res, 403, "只有学生可以加入班级");
+    if (actor.role === "student" && actor.id !== student.id) return sendError(res, 403, "只能为自己加入班级");
+    klass.studentIds = Array.isArray(klass.studentIds) ? klass.studentIds.map(String) : [];
+    klass.importedRoster = Array.isArray(klass.importedRoster) ? klass.importedRoster : [];
+    klass.applications = Array.isArray(klass.applications) ? klass.applications : [];
     const existsInRoster = klass.importedRoster.some((item) => item.id === student.id || item.name === student.name);
-    if (!klass.studentIds.includes(student.id)) klass.studentIds.push(student.id);
-    student.classIds = Array.from(new Set([...(student.classIds || []), klass.id]));
-    student.className = klass.name;
+    const alreadyJoined = klass.studentIds.includes(student.id) || (student.classIds || []).includes(klass.id);
+    const pendingApplication = klass.applications.find((item) => item.studentId === student.id && item.status === "pending");
+    if (pendingApplication && !alreadyJoined) {
+      return send(res, 200, { ok: true, application: pendingApplication, class: klass });
+    }
+    const autoApprove = alreadyJoined || existsInRoster;
+    if (autoApprove && !klass.studentIds.includes(student.id)) klass.studentIds.push(student.id);
+    if (autoApprove) {
+      student.classIds = Array.from(new Set([...(student.classIds || []), klass.id]));
+      syncUserPrimaryClassName(db, student);
+    }
     const application = {
       id: uid("app"),
       studentId: student.id,
       studentName: student.name,
-      status: "approved",
-      reason: existsInRoster ? "导入名单匹配，自动通过" : "不在导入名单，已添加到班级名单并通过",
+      status: autoApprove ? "approved" : "pending",
+      reason: alreadyJoined ? "已在班级中，无需重复加入" : (existsInRoster ? "导入名单匹配，自动通过" : "不在导入名单，等待教师同意"),
       createdAt: now(),
       updatedAt: now()
     };
@@ -6584,6 +9239,69 @@ async function handleApi(req, res, pathname, searchParams) {
     recordAudit(db, actor, "class.apply", { resourceType: "class", resourceId: klass.id }, req);
     writeDb(db);
     return send(res, 200, { ok: true, application, class: klass });
+  }
+
+  params = routePattern(pathname, "/api/classes/:id/applications/:applicationId");
+  if (method === "POST" && params) {
+    const body = await readBody(req);
+    requireRole(actor, ["teacher", "admin"]);
+    const klass = db.classes.find((item) => item.id === params.id);
+    if (!klass) return notFound(res);
+    const teacherId = String(body.teacherId || actor.id);
+    if (actor.role !== "admin" && klass.teacherId !== actor.id) return sendError(res, 403, "只能审核自己班级的申请");
+    if (actor.role === "admin" && body.teacherId && klass.teacherId !== teacherId) return sendError(res, 403, "班级不属于指定教师");
+    klass.applications = Array.isArray(klass.applications) ? klass.applications : [];
+    const application = klass.applications.find((item) => item.id === params.applicationId);
+    if (!application) return notFound(res);
+    if (application.status !== "pending") return send(res, 200, { ok: true, application, class: klass });
+    const action = String(body.action || "").toLowerCase();
+    if (!["accept", "approve", "approved", "reject", "rejected"].includes(action)) return sendError(res, 400, "审核动作必须是 accept 或 reject");
+    const approved = ["accept", "approve", "approved"].includes(action);
+    application.status = approved ? "approved" : "rejected";
+    application.reason = approved ? "教师已同意加入班级" : "教师已拒绝加入班级";
+    application.reviewedBy = actor.id;
+    application.updatedAt = now();
+    if (approved) {
+      const student = ensureUser(db, application.studentId);
+      if (student.role !== "student") return sendError(res, 400, "申请账号不是学生");
+      klass.studentIds = Array.isArray(klass.studentIds) ? klass.studentIds.map(String) : [];
+      if (!klass.studentIds.includes(student.id)) klass.studentIds.push(student.id);
+      student.classIds = Array.from(new Set([...(student.classIds || []), klass.id]));
+      syncUserPrimaryClassName(db, student);
+    }
+    klass.updatedAt = now();
+    recordAudit(db, actor, approved ? "class.application_approve" : "class.application_reject", {
+      resourceType: "class",
+      resourceId: klass.id,
+      meta: { applicationId: application.id, studentId: application.studentId }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, application, class: klass });
+  }
+
+  params = routePattern(pathname, "/api/classes/:id/students/:studentId");
+  if (method === "DELETE" && params) {
+    requireRole(actor, ["teacher", "student", "admin"]);
+    const klass = db.classes.find((item) => item.id === params.id);
+    if (!klass) return notFound(res);
+    const studentId = String(params.studentId || "");
+    const student = getUser(db, studentId);
+    const isSelfLeave = actor.role === "student" && actor.id === studentId;
+    const isTeacherOwner = actor.role === "teacher" && klass.teacherId === actor.id;
+    if (actor.role === "student" && !isSelfLeave) return sendError(res, 403, "只能退出自己的班级");
+    if (!isSelfLeave && actor.role !== "admin" && !isTeacherOwner) return sendError(res, 403, "只能移除自己班级的学生");
+    if (student && student.role !== "student") return sendError(res, 400, "只能移除学生账号");
+    const hasMembership = (klass.studentIds || []).includes(studentId) || (student?.classIds || []).includes(klass.id);
+    if (!hasMembership) return sendError(res, 404, "该学生不在此班级");
+    const result = removeStudentFromClass(db, klass, studentId);
+    const action = isSelfLeave ? "class.leave" : "class.remove_student";
+    recordAudit(db, actor, action, {
+      resourceType: "class",
+      resourceId: klass.id,
+      meta: { studentId, studentName: result.student?.name || "" }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, removed: result.removed, class: klass, student: result.student ? publicUser(result.student) : null });
   }
 
   if (method === "GET" && pathname === "/api/homework") {
