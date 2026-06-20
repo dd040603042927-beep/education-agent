@@ -4,6 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, execFileSync } = require("child_process");
+const { createStorage } = require("./storage");
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -33,8 +34,10 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const RUNTIME_DIR = path.join(DATA_DIR, "runtime");
 const LOG_DIR = path.resolve(process.env.LOG_DIR || path.join(ROOT, "logs"));
-const BACKUP_DIR = path.resolve(process.env.BACKUP_DIR || path.join(ROOT, "backups"));
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const STORAGE_DRIVER = process.env.STORAGE_DRIVER || "json";
+const DATABASE_URL = process.env.DATABASE_URL || process.env.SQLITE_PATH || "";
+const STORAGE_SCHEMA_PATH = path.join(ROOT, "storage", "schema.sql");
 const AUDIT_LOG_PATH = path.join(LOG_DIR, "audit.log");
 const GRAPH_JOBS_PATH = path.join(RUNTIME_DIR, "graph_jobs.json");
 const UPLOAD_SESSIONS_PATH = path.join(RUNTIME_DIR, "upload_sessions.json");
@@ -69,6 +72,11 @@ const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_
 const MODEL_CODE_TIMEOUT_MS = Math.max(1000, Math.min(30 * 1000, Number(process.env.MODEL_CODE_TIMEOUT_MS || 10 * 1000)));
 const MODEL_CODE_MAX_CHARS = Math.max(1000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_CHARS || 80000)));
 const MODEL_CODE_MAX_OUTPUT_CHARS = Math.max(2000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_OUTPUT_CHARS || 30000)));
+const MODEL_CODE_REPAIR_MAX_ATTEMPTS = Math.max(0, Math.min(3, Number(process.env.MODEL_CODE_REPAIR_MAX_ATTEMPTS || 2)));
+const MODEL_CODE_ALLOWED_IMPORTS = new Set(String(process.env.MODEL_CODE_ALLOWED_IMPORTS || "math,random,statistics,collections,itertools,functools,operator,heapq,bisect,decimal,fractions,typing,dataclasses")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_BASE_URL = String(process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -347,6 +355,9 @@ function createInitialDb() {
       createLearningProfile(teacherId, "teacher")
     ],
     wrongNotes: [],
+    learningEvents: [],
+    diagnosisResults: [],
+    studentMastery: [],
     agentRuns: [],
     auditLogs: [],
     friendRequests: [],
@@ -356,18 +367,35 @@ function createInitialDb() {
   };
 }
 
-function readDb() {
-  ensureDataDir();
-  if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(createInitialDb(), null, 2), "utf8");
+let dbStorage = null;
+
+function getDbStorage() {
+  if (!dbStorage) {
+    dbStorage = createStorage({
+      driver: STORAGE_DRIVER,
+      dataDir: DATA_DIR,
+      dbPath: DB_PATH,
+      sqlitePath: DATABASE_URL,
+      schemaPath: STORAGE_SCHEMA_PATH,
+      ensureDataDir,
+      initialData: createInitialDb,
+      normalizeData: ensureDbShape,
+      writeJson: atomicWriteJson
+    });
   }
-  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-  if (ensureDbShape(db)) writeDb(db);
-  return db;
+  return dbStorage;
+}
+
+function readDb() {
+  return getDbStorage().read();
 }
 
 function writeDb(db) {
-  atomicWriteJson(DB_PATH, db);
+  getDbStorage().write(db);
+}
+
+function dbStorageMetadata() {
+  return getDbStorage().metadata();
 }
 
 function createLearningProfile(userId, role = "student") {
@@ -642,6 +670,9 @@ function ensureDbShape(db) {
     "courseMaterials",
     "learningProfiles",
     "wrongNotes",
+    "learningEvents",
+    "diagnosisResults",
+    "studentMastery",
     "agentRuns",
     "submissions",
     "auditLogs",
@@ -1795,6 +1826,27 @@ function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOu
   return sections.join("\n").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS);
 }
 
+function inspectModelCodeSafety(source) {
+  const code = String(source || "");
+  const importPattern = /^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))/gm;
+  let match = null;
+  while ((match = importPattern.exec(code))) {
+    const root = String(match[1] || match[2] || "").split(".")[0];
+    if (root && !MODEL_CODE_ALLOWED_IMPORTS.has(root)) {
+      return { ok: false, message: "Safety block: import is not allowed: " + root + ". Allowed modules: " + Array.from(MODEL_CODE_ALLOWED_IMPORTS).join(", ") + "." };
+    }
+  }
+  const blocked = [
+    { pattern: /\b(open|eval|exec|compile|input|__import__)\s*\(/, label: "dangerous builtin" },
+    { pattern: /\b(globals|locals|vars|getattr|setattr|delattr)\s*\(/, label: "runtime reflection" },
+    { pattern: /\b(system|popen|spawn|fork|remove|unlink|rmdir|mkdir|rename|replace)\s*\(/, label: "system or file operation" },
+    { pattern: /__(?:builtins|globals|subclasses|mro|base|code|closure|dict)__/, label: "Python internal object access" }
+  ];
+  const hit = blocked.find((item) => item.pattern.test(code));
+  if (hit) return { ok: false, message: "Safety block: detected " + hit.label + ". The ML lab only allows pure computation teaching code." };
+  return { ok: true };
+}
+
 function modelCodeExecutableSource(source) {
   return `import ast
 import traceback
@@ -1866,6 +1918,13 @@ function runModelCodeSnippet(code) {
         durationMs: 0,
         output: `执行状态：运行失败（退出码 1）\n\n[stderr]\n代码长度不能超过 ${MODEL_CODE_MAX_CHARS} 个字符。`
       });
+      return;
+    }
+    const safety = inspectModelCodeSafety(source);
+    if (!safety.ok) {
+      const payload = { success: false, exitCode: 1, timedOut: false, durationMs: 0, stdout: "", stderr: safety.message, pythonCommand: "", securityBlocked: true };
+      payload.output = formatModelCodeOutput(payload);
+      resolve(payload);
       return;
     }
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -5061,6 +5120,54 @@ async function verifyGeneratedAlgorithm(generated, prompt, subject) {
   };
 }
 
+function compactModelCodeRun(run, attempt = 0, label = "") {
+  return { attempt, label, success: Boolean(run?.success), exitCode: Number.isFinite(Number(run?.exitCode)) ? Number(run.exitCode) : 1, timedOut: Boolean(run?.timedOut), durationMs: Number.isFinite(Number(run?.durationMs)) ? Number(run.durationMs) : 0, pythonCommand: run?.pythonCommand || "", stdout: String(run?.stdout || "").slice(0, 2000), stderr: String(run?.stderr || "").slice(0, 1000), output: String(run?.output || "").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS), securityBlocked: Boolean(run?.securityBlocked) };
+}
+
+function verifiedRunFromResult(run) {
+  return { success: Boolean(run?.success), exitCode: Number.isFinite(Number(run?.exitCode)) ? Number(run.exitCode) : 1, durationMs: Number.isFinite(Number(run?.durationMs)) ? Number(run.durationMs) : 0, pythonCommand: run?.pythonCommand || "", stdout: String(run?.stdout || "").slice(0, 2000), stderr: String(run?.stderr || "").slice(0, 1000), output: String(run?.output || "").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS), securityBlocked: Boolean(run?.securityBlocked) };
+}
+
+async function runModelCodeWithAutoRepair({ code, prompt, subject, contextHits = [] }) {
+  let currentCode = String(code || "");
+  const repairHistory = [];
+  for (let attempt = 0; attempt <= MODEL_CODE_REPAIR_MAX_ATTEMPTS; attempt += 1) {
+    const run = await runModelCodeSnippet(currentCode);
+    repairHistory.push(compactModelCodeRun(run, attempt, attempt === 0 ? "manual-run" : "auto-repair-run"));
+    if (run.success) return { ...run, repairedCode: attempt > 0 ? currentCode : "", repairAttempts: attempt, repairHistory, repairAvailable: true };
+    if (run.securityBlocked || isPythonRuntimeUnavailable(run) || attempt >= MODEL_CODE_REPAIR_MAX_ATTEMPTS || !isConfiguredSecret(OPENAI_API_KEY)) return { ...run, repairedCode: attempt > 0 ? currentCode : "", repairAttempts: attempt, repairHistory, repairAvailable: isConfiguredSecret(OPENAI_API_KEY) && !run.securityBlocked && !isPythonRuntimeUnavailable(run) };
+    const repaired = await generateAlgorithmWithOpenAI(String(prompt || "Repair and improve this machine learning lab code"), subject, { ...run, originalCode: currentCode }, contextHits);
+    currentCode = String(repaired.code || currentCode);
+  }
+  const last = repairHistory[repairHistory.length - 1] || {};
+  return { success: false, exitCode: last.exitCode || 1, timedOut: Boolean(last.timedOut), durationMs: Number(last.durationMs || 0), stdout: last.stdout || "", stderr: last.stderr || "Auto repair did not produce runnable code.", output: last.output || "Auto repair did not produce runnable code.", repairedCode: currentCode, repairAttempts: Math.max(0, repairHistory.length - 1), repairHistory, repairAvailable: isConfiguredSecret(OPENAI_API_KEY) };
+}
+
+function simpleAlgorithmExplanation(prompt, generated = {}, hits = [], options = {}) {
+  return { agentName: "ML Lab Code Agent", codeMode: options.codeMode || "teaching", difficulty: options.difficulty || "standard", goal: "Generate a runnable Python teaching lab for: " + String(prompt || generated.title || "machine learning").slice(0, 100), steps: ["Search course materials", "Generate complete Python code", "Run it on the server", "Save prompt, code, explanation, and run result"], metrics: ["exitCode", "stdout", "durationMs"], tunables: ["codeMode", "difficulty", "algorithm parameters"], courseBasis: hits.slice(0, 3).map((hit) => ({ title: hit.title || hit.sourceName || "course material", chapter: hit.chapter || "", quote: String(hit.quote || "").slice(0, 160) })) };
+}
+
+function buildModelCodeWorkflow({ hits = [], generated = {}, run = null, repairHistory = [] }) {
+  const finalRun = run || generated.verifiedRun || repairHistory[repairHistory.length - 1] || null;
+  const repairs = Math.max(0, Number(generated.repairAttempts || 0));
+  return [
+    { key: "course_search", label: "Course search tool", status: hits.length ? "done" : "fallback", detail: hits.length ? "Matched " + hits.length + " course/graph snippets" : "Used built-in template or model fallback" },
+    { key: "code_generation", label: "Code generation tool", status: "done", detail: generated.sourceType === "openai" ? "Generated Python code with model" : generated.sourceType === "course" ? "Generated from course context and stdlib template" : "Used local template or manual code" },
+    { key: "python_runner", label: "Python sandbox runner", status: finalRun?.success ? "done" : finalRun ? "failed" : "pending", detail: finalRun ? "Exit " + finalRun.exitCode + ", " + (finalRun.durationMs || 0) + " ms" : "Waiting to run" },
+    { key: "error_repair", label: "Error repair tool", status: repairs > 0 ? "done" : finalRun?.success ? "skipped" : "pending", detail: repairs > 0 ? "Auto repaired " + repairs + " time(s)" : "No repair needed or waiting for failure" },
+    { key: "experiment_record", label: "Experiment record tool", status: "ready", detail: "Save prompt, course basis, code, run result, and explanation" }
+  ];
+}
+
+function buildExperimentRecord({ userId, subject, prompt, codeMode, difficulty, generated = {}, hits = [] }) {
+  return { agentName: "ML Lab Code Agent", userId, subject, prompt: String(prompt || "").slice(0, 1200), codeMode: codeMode || "teaching", difficulty: difficulty || "standard", sourceType: generated.sourceType || "", title: generated.title || "", chapter: generated.chapter || "", citations: Array.isArray(generated.citations) ? generated.citations.slice(0, 8) : citationsFromHits(hits).slice(0, 8), explanation: generated.explanation || null, verifiedRun: generated.verifiedRun || null, repairAttempts: Number(generated.repairAttempts || 0), repairHistory: Array.isArray(generated.repairHistory) ? generated.repairHistory.slice(0, 4) : [], workflow: buildModelCodeWorkflow({ hits, generated }), createdAt: now() };
+}
+
+function sanitizeExperimentRecord(value) {
+  if (!value || typeof value !== "object") return null;
+  return { agentName: String(value.agentName || "ML Lab Code Agent").slice(0, 80), userId: String(value.userId || "").slice(0, 80), subject: normalizeSubject(value.subject || "machine learning"), prompt: String(value.prompt || "").slice(0, 1200), codeMode: String(value.codeMode || "teaching").slice(0, 40), difficulty: String(value.difficulty || "standard").slice(0, 40), sourceType: String(value.sourceType || "").slice(0, 40), title: String(value.title || "").slice(0, 160), chapter: String(value.chapter || "").slice(0, 160), citations: Array.isArray(value.citations) ? value.citations.slice(0, 8) : [], explanation: value.explanation && typeof value.explanation === "object" ? value.explanation : null, verifiedRun: value.verifiedRun && typeof value.verifiedRun === "object" ? verifiedRunFromResult(value.verifiedRun) : null, repairAttempts: Math.max(0, Math.min(3, Number(value.repairAttempts || 0))), repairHistory: Array.isArray(value.repairHistory) ? value.repairHistory.slice(0, 4) : [], workflow: Array.isArray(value.workflow) ? value.workflow.slice(0, 8) : [], createdAt: value.createdAt || now(), updatedAt: value.updatedAt || "" };
+}
+
 function isAcademicMisuse(prompt) {
   return /直接.*(写|生成|完成).*(作业|论文|实验报告|考试|答案)|代写|替我写|帮我作弊|考试.*答案|不要解释.*只给答案/.test(String(prompt || ""));
 }
@@ -7239,6 +7346,52 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     confidence: agent.confidence,
     minutes: mode === "plan" ? 6 : 3
   });
+  const workflowResult = agent.workflowResult || {};
+  const workflowRequestId = String(workflowResult.request_id || workflowResult.requestId || "").trim();
+  const workflowScore = Number(workflowResult.mastery_score ?? workflowResult.masteryScore);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: user.id,
+    classId: String(body.classId || body.class_id || user.classIds?.[0] || ""),
+    eventType: hasStudentAnswer || mode === "grade" ? "ai_diagnosis" : "ai_question",
+    source: agent.workflowSource || "dify-api",
+    subject,
+    knowledgePoint: topics[0] || knowledgePoint,
+    graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
+    nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
+    score: Number.isFinite(workflowScore) ? workflowScore : null,
+    payload: {
+      requestId: workflowRequestId,
+      mode,
+      prompt,
+      studentAnswer,
+      topics,
+      confidence: agent.confidence,
+      workflowRunId: workflowResult.workflow_run_id || "",
+      taskId: workflowResult.task_id || ""
+    },
+    idempotencyKey: workflowRequestId ? `dify:${workflowRequestId}` : ""
+  });
+  if (workflowResult.mastery_score !== undefined || workflowResult.masteryScore !== undefined || workflowResult.mastery_level || workflowResult.masteryLevel) {
+    recordDiagnosisResult(db, {
+      studentId: user.id,
+      eventId: learningEvent?.id || "",
+      topic: workflowResult.topic_label || topics[0] || knowledgePoint,
+      masteryScore: Number.isFinite(workflowScore) ? workflowScore : null,
+      masteryLevel: workflowResult.mastery_level || workflowResult.masteryLevel || "",
+      errorTags: Array.isArray(workflowResult.error_tags) ? workflowResult.error_tags : [],
+      missingPoints: Array.isArray(workflowResult.missing_points) ? workflowResult.missing_points : [],
+      evidence: Array.isArray(workflowResult.rag_evidence) ? workflowResult.rag_evidence : [],
+      finalAnswer: agent.content || "",
+      modelOrWorkflow: agent.workflowSource || "dify-api",
+      idempotencyKey: workflowRequestId ? `dify-diagnosis:${workflowRequestId}` : ""
+    });
+  }
+  syncStudentMasteryFromProfile(db, user.id, topics, {
+    subject,
+    graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
+    nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
+    lastEventId: learningEvent?.id || ""
+  });
   if (mode === "grade" && topics[0]) {
     addWrongNote(db, user.id, {
       source: "批改反馈",
@@ -7469,6 +7622,114 @@ function setTopicMasteryScore(db, userId, topic, score, evidence, status = "") {
   return profile;
 }
 
+function normalizeLearningScore(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const score = Number(value);
+  if (!Number.isFinite(score)) return null;
+  if (score > 1 && score <= 100) return Number((score / 100).toFixed(4));
+  return Math.max(0, Math.min(1, Number(score.toFixed(4))));
+}
+
+function compactLearningPayload(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+  const copy = { ...payload };
+  ["prompt", "question", "answer", "studentAnswer", "finalAnswer"].forEach((key) => {
+    if (copy[key] !== undefined) copy[key] = String(copy[key] || "").slice(0, 1200);
+  });
+  return copy;
+}
+
+function recordLearningEvent(db, event = {}) {
+  db.learningEvents = Array.isArray(db.learningEvents) ? db.learningEvents : [];
+  const idempotencyKey = String(event.idempotencyKey || "").trim();
+  if (idempotencyKey) {
+    const existing = db.learningEvents.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) return existing;
+  }
+  const studentId = String(event.studentId || event.userId || "").trim();
+  if (!studentId) return null;
+  const item = {
+    id: event.id || uid("learn"),
+    studentId,
+    classId: String(event.classId || "").trim(),
+    teacherId: String(event.teacherId || "").trim(),
+    subject: String(event.subject || "").trim(),
+    eventType: String(event.eventType || "unknown").trim(),
+    source: String(event.source || "").trim(),
+    knowledgePoint: String(event.knowledgePoint || event.topic || "").trim(),
+    graphId: String(event.graphId || "").trim(),
+    nodeId: String(event.nodeId || "").trim(),
+    homeworkId: String(event.homeworkId || "").trim(),
+    submissionId: String(event.submissionId || "").trim(),
+    score: normalizeLearningScore(event.score),
+    durationSeconds: Number.isFinite(Number(event.durationSeconds)) ? Math.max(0, Math.round(Number(event.durationSeconds))) : null,
+    payload: compactLearningPayload(event.payload || {}),
+    idempotencyKey,
+    occurredAt: event.occurredAt || now(),
+    createdAt: now()
+  };
+  db.learningEvents.unshift(item);
+  db.learningEvents = db.learningEvents.slice(0, 5000);
+  return item;
+}
+
+function recordDiagnosisResult(db, result = {}) {
+  db.diagnosisResults = Array.isArray(db.diagnosisResults) ? db.diagnosisResults : [];
+  const idempotencyKey = String(result.idempotencyKey || "").trim();
+  if (idempotencyKey) {
+    const existing = db.diagnosisResults.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) return existing;
+  }
+  const studentId = String(result.studentId || result.userId || "").trim();
+  if (!studentId) return null;
+  const item = {
+    id: result.id || uid("diag"),
+    studentId,
+    eventId: String(result.eventId || "").trim(),
+    topic: String(result.topic || "").trim(),
+    masteryScore: normalizeLearningScore(result.masteryScore),
+    masteryLevel: String(result.masteryLevel || "").trim(),
+    errorTags: Array.isArray(result.errorTags) ? result.errorTags.map(String).filter(Boolean).slice(0, 20) : [],
+    missingPoints: Array.isArray(result.missingPoints) ? result.missingPoints.map(String).filter(Boolean).slice(0, 20) : [],
+    evidence: Array.isArray(result.evidence) ? result.evidence.slice(0, 12) : [],
+    finalAnswer: String(result.finalAnswer || "").slice(0, 3000),
+    modelOrWorkflow: String(result.modelOrWorkflow || "").trim(),
+    idempotencyKey,
+    createdAt: now()
+  };
+  db.diagnosisResults.unshift(item);
+  db.diagnosisResults = db.diagnosisResults.slice(0, 3000);
+  return item;
+}
+
+function syncStudentMasteryFromProfile(db, userId, topics = [], options = {}) {
+  db.studentMastery = Array.isArray(db.studentMastery) ? db.studentMastery : [];
+  const profile = ensureLearningProfile(db, userId);
+  const user = getUser(db, userId);
+  const subject = String(options.subject || user?.subject || "").trim();
+  const uniqueTopics = Array.from(new Set((Array.isArray(topics) ? topics : [topics]).map(String).map((item) => item.trim()).filter(Boolean))).slice(0, 12);
+  uniqueTopics.forEach((topic) => {
+    const mastery = profile.mastery?.[topic];
+    if (!mastery) return;
+    const existing = db.studentMastery.find((item) => item.studentId === userId && item.subject === subject && item.knowledgePoint === topic);
+    const snapshot = {
+      studentId: userId,
+      subject,
+      knowledgePoint: topic,
+      graphId: String(options.graphId || existing?.graphId || "").trim(),
+      nodeId: String(options.nodeId || existing?.nodeId || "").trim(),
+      score: normalizeLearningScore(mastery.score),
+      status: String(mastery.status || "").trim(),
+      evidenceCount: Array.isArray(mastery.evidence) ? mastery.evidence.length : 0,
+      lastEventId: String(options.lastEventId || existing?.lastEventId || "").trim(),
+      updatedAt: mastery.updatedAt || now()
+    };
+    if (existing) Object.assign(existing, snapshot);
+    else db.studentMastery.push(snapshot);
+  });
+  return db.studentMastery.filter((item) => item.studentId === userId);
+}
+
 function normalizeDifyCallbackPayload(body = {}) {
   const root = typeof body === "string" ? parseJsonish(body, {}) : body;
   const rootObject = root && typeof root === "object" && !Array.isArray(root) ? root : {};
@@ -7560,6 +7821,47 @@ function syncDifyDiagnosisCallback(db, rawBody, req) {
       masteryLevel
     );
   }
+  const callbackRequestId = String(payload.request_id || payload.requestId || "").trim();
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "dify_diagnosis",
+    source: "dify",
+    subject: String(payload.subject || structured.subject || user.subject || ""),
+    knowledgePoint: topic,
+    score: normalizedScore,
+    payload: {
+      requestId: callbackRequestId,
+      syncMode,
+      conversationId,
+      question,
+      studentAnswer,
+      finalAnswer,
+      masteryLevel,
+      errorTags: errors,
+      missingPoints: missing,
+      citations
+    },
+    idempotencyKey: callbackRequestId ? `dify:${callbackRequestId}` : ""
+  });
+  recordDiagnosisResult(db, {
+    studentId: userId,
+    eventId: learningEvent?.id || "",
+    topic,
+    masteryScore: normalizedScore,
+    masteryLevel,
+    errorTags: errors,
+    missingPoints: missing,
+    evidence: Array.isArray(ragEvidence) ? ragEvidence : [],
+    finalAnswer,
+    modelOrWorkflow: "dify-student-diagnosis",
+    idempotencyKey: callbackRequestId ? `dify-diagnosis:${callbackRequestId}` : ""
+  });
+  if (shouldWriteMastery) {
+    syncStudentMasteryFromProfile(db, userId, [topic], {
+      subject: String(payload.subject || structured.subject || user.subject || ""),
+      lastEventId: learningEvent?.id || ""
+    });
+  }
   let wrongNote = null;
   if (studentAnswer && (errors.length || missing.length || (normalizedScore !== null && normalizedScore < 0.75))) {
     wrongNote = addWrongNote(db, userId, {
@@ -7571,6 +7873,7 @@ function syncDifyDiagnosisCallback(db, rawBody, req) {
       recommendation: missing.length ? `补齐：${missing.join("、")}` : "按标准解释重写答案并完成同类题。"
     });
   }
+  if (learningEvent && wrongNote) learningEvent.payload.wrongNoteId = wrongNote.id;
   let conversation = null;
   const skipConversationWrite = syncMode === "api-return" || syncMode === "api_return";
   if (!skipConversationWrite && (question || finalAnswer)) {
@@ -7992,21 +8295,418 @@ function getRelevantState(db, userId) {
   };
 }
 
+function reportDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || "");
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function reportCompactText(value, maxLength = 120) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function reportScorePercent(value) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? "" : Math.round(normalized * 100);
+}
+
+function reportHtmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function reportEventLabel(type) {
+  return {
+    ai_diagnosis: "AI 诊断",
+    ai_question: "AI 问答",
+    dify_diagnosis: "AI 诊断",
+    knowledge_test_evaluate: "知识测验",
+    homework_grade_confirmed: "作业批改确认",
+    wrong_note: "错题记录",
+    manual_mastery_update: "掌握度调整",
+    student_mastery_snapshot: "掌握度快照"
+  }[String(type || "")] || String(type || "学习事件");
+}
+
+function reportStatusLabel(status) {
+  return {
+    submitted: "已提交",
+    review_pending: "待教师确认",
+    graded: "已批改"
+  }[String(status || "")] || String(status || "未提交");
+}
+
+function sectionColumns(rows = []) {
+  const seen = new Set();
+  rows.forEach((row) => Object.keys(row || {}).forEach((key) => seen.add(key)));
+  return Array.from(seen);
+}
+
+function buildAdminExportReport(db) {
+  const students = (db.users || [])
+    .filter((user) => user.role === "student")
+    .sort((a, b) => String(a.createdAt || a.id).localeCompare(String(b.createdAt || b.id)));
+  const studentIds = new Set(students.map((student) => student.id));
+  const aliasByStudentId = new Map(students.map((student, index) => [student.id, `S${String(index + 1).padStart(3, "0")}`]));
+  const classById = new Map((db.classes || []).map((klass) => [klass.id, klass]));
+  const homeworkById = new Map((db.homework || []).map((item) => [item.id, item]));
+  const graphById = new Map((db.knowledgeGraphs || []).map((item) => [item.id, item]));
+  const userById = new Map((db.users || []).map((user) => [user.id, user]));
+  const profileByUserId = new Map((db.learningProfiles || []).map((profile) => [profile.userId, profile]));
+  const events = (db.learningEvents || []).filter((event) => studentIds.has(event.studentId));
+
+  const classNamesForStudent = (student) => {
+    const ids = new Set(Array.isArray(student.classIds) ? student.classIds : []);
+    (db.classes || []).forEach((klass) => {
+      if ((klass.studentIds || []).includes(student.id)) ids.add(klass.id);
+    });
+    const names = Array.from(ids).map((id) => classById.get(id)?.name).filter(Boolean);
+    return names.length ? names.join("、") : (student.className || "未加入班级");
+  };
+  const eventsForStudent = (studentId) => events
+    .filter((event) => event.studentId === studentId)
+    .sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")));
+
+  const anonymousStudents = students.map((student) => {
+    const profile = profileByUserId.get(student.id) || {};
+    const studentEvents = eventsForStudent(student.id);
+    const masteryItems = Object.values(profile.mastery || {});
+    const averageMastery = masteryItems.length
+      ? `${Math.round(masteryItems.reduce((sum, item) => sum + Number(item.score || 0), 0) / masteryItems.length * 100)}%`
+      : "未诊断";
+    return {
+      匿名编号: aliasByStudentId.get(student.id),
+      班级: classNamesForStudent(student),
+      学习事件数: studentEvents.length,
+      AI对话数: (db.conversations || []).filter((conv) => conv.userId === student.id).length,
+      作业提交数: (db.submissions || []).filter((item) => item.studentId === student.id).length,
+      错题数: (db.wrongNotes || []).filter((item) => item.userId === student.id).length,
+      平均掌握度: averageMastery,
+      最近活动: reportDate(studentEvents.at(-1)?.occurredAt || profile.updatedAt || student.updatedAt || student.createdAt)
+    };
+  });
+
+  const learningTimeline = events
+    .sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")))
+    .map((event) => ({
+      匿名编号: aliasByStudentId.get(event.studentId),
+      时间: reportDate(event.occurredAt || event.createdAt),
+      类型: reportEventLabel(event.eventType),
+      学科: event.subject || "",
+      知识点: event.knowledgePoint || "",
+      分数: event.score === null || event.score === undefined ? "" : `${reportScorePercent(event.score)}%`,
+      来源: event.source || "",
+      摘要: reportCompactText(event.payload?.prompt || event.payload?.question || event.payload?.homeworkTitle || event.payload?.evidence || event.payload?.analysis || "", 140)
+    }));
+
+  const prePostScores = students.map((student) => {
+    const scored = [];
+    eventsForStudent(student.id).forEach((event) => {
+      if (event.score !== null && event.score !== undefined) scored.push({ at: event.occurredAt || event.createdAt, score: event.score, source: reportEventLabel(event.eventType), topic: event.knowledgePoint || "" });
+    });
+    (db.submissions || []).filter((item) => item.studentId === student.id && item.score !== undefined).forEach((submission) => {
+      const homework = homeworkById.get(submission.homeworkId);
+      scored.push({ at: submission.gradedAt || submission.confirmedAt || submission.updatedAt || submission.createdAt, score: submission.score, source: "作业成绩", topic: homework?.title || "" });
+    });
+    (db.diagnosisResults || []).filter((item) => item.studentId === student.id && item.masteryScore !== null && item.masteryScore !== undefined).forEach((result) => {
+      scored.push({ at: result.createdAt, score: result.masteryScore, source: result.modelOrWorkflow || "诊断结果", topic: result.topic || "" });
+    });
+    scored.sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+    const first = scored[0];
+    const last = scored.at(-1);
+    const pre = reportScorePercent(first?.score);
+    const post = reportScorePercent(last?.score);
+    return {
+      匿名编号: aliasByStudentId.get(student.id),
+      前测时间: reportDate(first?.at),
+      前测来源: first?.source || "",
+      前测知识点: first?.topic || "",
+      前测成绩: pre === "" ? "" : `${pre}%`,
+      后测时间: reportDate(last?.at),
+      后测来源: last?.source || "",
+      后测知识点: last?.topic || "",
+      后测成绩: post === "" ? "" : `${post}%`,
+      变化: pre === "" || post === "" ? "暂无成对数据" : `${post - pre >= 0 ? "+" : ""}${post - pre}%`,
+      记录数: scored.length
+    };
+  });
+
+  const aiConversationSummary = (db.conversations || [])
+    .filter((conv) => studentIds.has(conv.userId))
+    .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
+    .map((conv) => {
+      const messages = Array.isArray(conv.messages) ? conv.messages : [];
+      const userMessages = messages.filter((message) => message.role === "user");
+      const assistantMessages = messages.filter((message) => message.role === "assistant");
+      return {
+        匿名编号: aliasByStudentId.get(conv.userId),
+        对话标题: conv.title || "新的对话",
+        模式: conv.mode || "",
+        开始时间: reportDate(conv.createdAt),
+        最近更新: reportDate(conv.updatedAt),
+        轮次数: Math.max(userMessages.length, assistantMessages.length),
+        学生问题摘要: reportCompactText(userMessages.map((message) => message.content).join("；"), 180),
+        AI回答摘要: reportCompactText(assistantMessages.map((message) => message.content).join("；"), 180)
+      };
+    });
+
+  const masteryGroups = new Map();
+  events.filter((event) => event.knowledgePoint && event.score !== null && event.score !== undefined).forEach((event) => {
+    const key = `${event.studentId}:${event.subject || ""}:${event.knowledgePoint}`;
+    const items = masteryGroups.get(key) || [];
+    items.push(event);
+    masteryGroups.set(key, items);
+  });
+  (db.studentMastery || []).filter((item) => studentIds.has(item.studentId)).forEach((item) => {
+    const key = `${item.studentId}:${item.subject || ""}:${item.knowledgePoint}`;
+    if (!masteryGroups.has(key)) masteryGroups.set(key, [{ ...item, eventType: "student_mastery_snapshot", occurredAt: item.updatedAt }]);
+  });
+  const masteryChanges = Array.from(masteryGroups.values()).map((items) => {
+    items.sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")));
+    const first = items[0];
+    const last = items.at(-1);
+    const start = reportScorePercent(first?.score);
+    const end = reportScorePercent(last?.score);
+    return {
+      匿名编号: aliasByStudentId.get(last.studentId),
+      学科: last.subject || first.subject || "",
+      知识点: last.knowledgePoint || first.knowledgePoint || "",
+      关联图谱: graphById.get(last.graphId || first.graphId)?.title || "",
+      初始掌握度: start === "" ? "" : `${start}%`,
+      当前掌握度: end === "" ? "" : `${end}%`,
+      变化: start === "" || end === "" ? "暂无变化" : `${end - start >= 0 ? "+" : ""}${end - start}%`,
+      最近证据: reportEventLabel(last.eventType),
+      最近更新时间: reportDate(last.occurredAt || last.createdAt)
+    };
+  });
+
+  const homeworkResults = (db.submissions || [])
+    .filter((submission) => studentIds.has(submission.studentId))
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))
+    .map((submission) => {
+      const homework = homeworkById.get(submission.homeworkId);
+      const klass = homework ? classById.get(homework.classId) : null;
+      const teacher = homework ? userById.get(homework.teacherId) : null;
+      return {
+        匿名编号: aliasByStudentId.get(submission.studentId),
+        班级: klass?.name || "",
+        作业或测验: homework?.title || submission.homeworkId || "",
+        学科: homework?.subject || klass?.subject || "",
+        教师: teacher?.name || "",
+        状态: reportStatusLabel(submission.status),
+        分数: submission.score === undefined ? "" : `${reportScorePercent(submission.score)}%`,
+        AI建议分: submission.aiSuggestedScore === undefined ? "" : `${reportScorePercent(submission.aiSuggestedScore)}%`,
+        提交时间: reportDate(submission.createdAt || submission.updatedAt),
+        批改时间: reportDate(submission.gradedAt || submission.confirmedAt),
+        反馈摘要: reportCompactText(submission.comment || submission.aiComment || submission.feedback?.reliability || "", 160)
+      };
+    });
+
+  const testResults = events
+    .filter((event) => event.eventType === "knowledge_test_evaluate")
+    .sort((a, b) => String(b.occurredAt || b.createdAt || "").localeCompare(String(a.occurredAt || a.createdAt || "")))
+    .map((event) => ({
+      匿名编号: aliasByStudentId.get(event.studentId),
+      时间: reportDate(event.occurredAt || event.createdAt),
+      学科: event.subject || "",
+      知识点: event.knowledgePoint || "",
+      题目ID: event.payload?.questionId || "",
+      本题正确率: event.payload?.accuracy === undefined ? "" : `${Math.round(Number(event.payload.accuracy || 0))}%`,
+      整体正确率: event.payload?.overall?.accuracy === undefined ? (event.score === undefined ? "" : `${reportScorePercent(event.score)}%`) : `${Math.round(Number(event.payload.overall.accuracy || 0))}%`,
+      掌握判断: event.payload?.overall?.masteryLevel || "",
+      缺失要点: Array.isArray(event.payload?.missing) ? event.payload.missing.join("、") : ""
+    }));
+
+  const wrongNoteChanges = (db.wrongNotes || [])
+    .filter((note) => studentIds.has(note.userId))
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+    .map((note) => ({
+      匿名编号: aliasByStudentId.get(note.userId),
+      时间: reportDate(note.createdAt),
+      来源: note.source || "",
+      知识点: note.topic || "",
+      错题摘要: reportCompactText(note.question, 160),
+      错答摘要: reportCompactText(note.answer, 120),
+      错因分析: reportCompactText(note.analysis, 160),
+      改进建议: reportCompactText(note.recommendation, 160)
+    }));
+
+  const reflectionPattern = /反思|复盘|总结|心得|收获|困惑|计划|自评/;
+  const studentReflections = [];
+  (db.conversations || []).filter((conv) => studentIds.has(conv.userId)).forEach((conv) => {
+    (conv.messages || []).filter((message) => message.role === "user" && reflectionPattern.test(String(message.content || ""))).forEach((message) => {
+      studentReflections.push({ 匿名编号: aliasByStudentId.get(conv.userId), 时间: reportDate(message.createdAt || conv.updatedAt), 来源: conv.title || "AI 对话", 摘要: reportCompactText(message.content, 220) });
+    });
+  });
+  wrongNoteChanges.forEach((note) => {
+    if (reflectionPattern.test(`${note.错题摘要} ${note.错答摘要} ${note.错因分析}`)) {
+      studentReflections.push({ 匿名编号: note.匿名编号, 时间: note.时间, 来源: `错题反思：${note.知识点}`, 摘要: reportCompactText([note.错题摘要, note.错因分析, note.改进建议].filter(Boolean).join("；"), 220) });
+    }
+  });
+  studentReflections.sort((a, b) => String(b.时间 || "").localeCompare(String(a.时间 || "")));
+
+  const teacherGuidance = [];
+  (db.submissions || []).filter((submission) => studentIds.has(submission.studentId) && (submission.comment || submission.aiComment || submission.feedback)).forEach((submission) => {
+    const homework = homeworkById.get(submission.homeworkId);
+    const teacher = homework ? userById.get(homework.teacherId) : null;
+    teacherGuidance.push({
+      匿名编号: aliasByStudentId.get(submission.studentId),
+      时间: reportDate(submission.confirmedAt || submission.gradedAt || submission.aiGradedAt || submission.updatedAt),
+      教师: teacher?.name || "",
+      类型: submission.comment ? "教师评价" : "AI批改建议",
+      关联任务: homework?.title || submission.homeworkId || "",
+      记录摘要: reportCompactText(submission.comment || submission.aiComment || submission.feedback?.reliability || "", 220)
+    });
+  });
+  (db.conversations || []).filter((conv) => ["teacher", "admin"].includes(userById.get(conv.userId)?.role)).forEach((conv) => {
+    const owner = userById.get(conv.userId);
+    const messages = Array.isArray(conv.messages) ? conv.messages : [];
+    teacherGuidance.push({ 匿名编号: "全班/备课", 时间: reportDate(conv.updatedAt || conv.createdAt), 教师: owner?.name || "", 类型: "教师 AI 指导记录", 关联任务: conv.title || "教师对话", 记录摘要: reportCompactText(messages.map((message) => message.content).join("；"), 220) });
+  });
+  teacherGuidance.sort((a, b) => String(b.时间 || "").localeCompare(String(a.时间 || "")));
+
+  const sections = [
+    { key: "anonymousStudents", title: "匿名学生列表", rows: anonymousStudents },
+    { key: "learningTimeline", title: "学习周期时间线", rows: learningTimeline },
+    { key: "prePostScores", title: "前测/后测成绩", rows: prePostScores },
+    { key: "aiConversationSummary", title: "AI 对话摘要", rows: aiConversationSummary },
+    { key: "masteryChanges", title: "知识图谱掌握度变化", rows: masteryChanges },
+    { key: "homeworkResults", title: "作业结果", rows: homeworkResults },
+    { key: "testResults", title: "测验结果", rows: testResults },
+    { key: "wrongNoteChanges", title: "错题变化", rows: wrongNoteChanges },
+    { key: "studentReflections", title: "学生反思摘录", rows: studentReflections },
+    { key: "teacherGuidance", title: "教师评价或指导记录", rows: teacherGuidance }
+  ].map((section) => ({ ...section, columns: sectionColumns(section.rows) }));
+
+  return {
+    generatedAt: now(),
+    scope: "管理员端匿名学习数据导出",
+    summary: {
+      students: students.length,
+      classes: (db.classes || []).length,
+      learningEvents: learningTimeline.length,
+      aiConversations: aiConversationSummary.length,
+      homeworkResults: homeworkResults.length,
+      testResults: testResults.length,
+      wrongNotes: wrongNoteChanges.length,
+      reflections: studentReflections.length,
+      teacherGuidance: teacherGuidance.length
+    },
+    sections
+  };
+}
+
+function adminReportJson(report) {
+  return JSON.stringify(report, null, 2);
+}
+
+function adminReportCsv(report) {
+  const rows = [["区块", "序号", "字段", "值"]];
+  report.sections.forEach((section) => {
+    if (!section.rows.length) rows.push([section.title, "", "状态", "暂无数据"]);
+    section.rows.forEach((row, index) => {
+      Object.entries(row).forEach(([key, value]) => rows.push([section.title, index + 1, key, value]));
+    });
+  });
+  return `\uFEFF${rows.map((row) => row.map(csvCell).join(",")).join("\r\n")}`;
+}
+
+function adminReportHtml(report, { print = false } = {}) {
+  const summaryCards = Object.entries(report.summary || {}).map(([key, value]) => `
+    <article><span>${reportHtmlEscape(key)}</span><strong>${reportHtmlEscape(value)}</strong></article>
+  `).join("");
+  const sections = report.sections.map((section) => {
+    const columns = section.columns.length ? section.columns : ["状态"];
+    const rows = section.rows.length ? section.rows : [{ 状态: "暂无数据" }];
+    return `
+      <section>
+        <h2>${reportHtmlEscape(section.title)}</h2>
+        <table>
+          <thead><tr>${columns.map((column) => `<th>${reportHtmlEscape(column)}</th>`).join("")}</tr></thead>
+          <tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${reportHtmlEscape(row[column] ?? "")}</td>`).join("")}</tr>`).join("")}</tbody>
+        </table>
+      </section>
+    `;
+  }).join("");
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>管理员匿名学习数据导出</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; color: #132033; background: #f5f8fb; }
+    header { margin-bottom: 22px; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    h2 { margin: 28px 0 12px; font-size: 18px; }
+    p { margin: 0; color: #627086; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
+    .summary article { padding: 14px; border: 1px solid #dbe5ee; border-radius: 8px; background: #fff; }
+    .summary span { display: block; color: #627086; font-size: 12px; }
+    .summary strong { display: block; margin-top: 6px; color: #145f85; font-size: 24px; }
+    section { page-break-inside: avoid; margin-bottom: 18px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid #dbe5ee; padding: 8px 10px; text-align: left; vertical-align: top; font-size: 12px; line-height: 1.55; }
+    th { background: #eaf3f8; color: #16354a; font-weight: 700; }
+    @media print { body { padding: 14mm; background: #fff; } th, td { font-size: 10px; } }
+  </style>
+</head>
+<body>
+  <header><h1>管理员匿名学习数据导出</h1><p>生成时间：${reportHtmlEscape(reportDate(report.generatedAt))}</p></header>
+  <div class="summary">${summaryCards}</div>
+  ${sections}
+  ${print ? "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 300));</script>" : ""}
+</body>
+</html>`;
+}
+
+function buildAdminExportPayload(db, format = "json") {
+  const report = buildAdminExportReport(db);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const normalizedFormat = ["json", "csv", "html", "pdf"].includes(format) ? format : "json";
+  if (normalizedFormat === "csv") return { format: "csv", fileName: `admin-learning-export-${stamp}.csv`, mime: "text/csv;charset=utf-8", content: adminReportCsv(report), report };
+  if (normalizedFormat === "html" || normalizedFormat === "pdf") {
+    return {
+      format: normalizedFormat,
+      fileName: normalizedFormat === "pdf" ? `admin-learning-export-${stamp}-print.html` : `admin-learning-export-${stamp}.html`,
+      mime: "text/html;charset=utf-8",
+      content: adminReportHtml(report, { print: normalizedFormat === "pdf" }),
+      report
+    };
+  }
+  return { format: "json", fileName: `admin-learning-export-${stamp}.json`, mime: "application/json;charset=utf-8", content: adminReportJson(report), report };
+}
+
 async function handleApi(req, res, pathname, searchParams) {
   const method = req.method;
   const db = readDb();
 
   if (method === "GET" && pathname === "/api/healthz") {
+    const storage = dbStorageMetadata();
     return send(res, 200, {
       ok: true,
       status: "ok",
       version: process.env.npm_package_version || "1.0.0",
       time: now(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing"
+      storage: storage.label,
+      storageDriver: storage.driver,
+      storagePath: storage.path
     });
   }
 
   if (method === "GET" && pathname === "/api/readyz") {
+    const storage = dbStorageMetadata();
     const checks = {
       dataDirWritable: checkDataDirWritable(),
       runtimeDirWritable: checkRuntimeDirWritable(),
@@ -8016,7 +8716,9 @@ async function handleApi(req, res, pathname, searchParams) {
       difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
       difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
       difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
+      storage: storage.label,
+      storageDriver: storage.driver,
+      storagePath: storage.path,
       uploadSessions: uploadSessions.size,
       graphJobs: graphJobs.size
     };
@@ -8045,77 +8747,18 @@ async function handleApi(req, res, pathname, searchParams) {
     });
   }
 
-  if (method === "GET" && pathname === "/api/admin/overview") {
+  if (method === "GET" && pathname === "/api/admin/export") {
     const actor = requireActor(req, db);
     requireRole(actor, ["admin"]);
-    cleanupGraphJobs();
-    const checks = {
-      dataDirWritable: checkDataDirWritable(),
-      runtimeDirWritable: checkRuntimeDirWritable(),
-      sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
-      cookieSecure: process.env.COOKIE_SECURE === "true",
-      difyWorkflowConfigured: isDifyWorkflowConfigured(),
-      difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
-      difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
-      difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
-      uploadSessions: uploadSessions.size,
-      graphJobs: graphJobs.size
-    };
-    const warnings = [];
-    if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
-    if (!checks.difyStudentWorkflowConfigured) warnings.push("未配置有效 DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY，学生端 AI 助教会返回配置错误");
-    if (!checks.difyTeacherWorkflowConfigured) warnings.push("未配置有效 DIFY_TEACHER_WORKFLOW_API_KEY，教师端教学 AI 助教会返回配置错误");
-    if (!checks.difyCallbackTokenConfigured) warnings.push("未配置强随机 DIFY_CALLBACK_TOKEN，Dify 回调接口将拒绝默认令牌");
-    if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
-    const recentUsers = (db.users || [])
-      .map(publicUser)
-      .sort((a, b) => new Date(b.lastLoginAt || b.createdAt || 0) - new Date(a.lastLoginAt || a.createdAt || 0))
-      .slice(0, 12);
-    const graphJobList = Array.from(graphJobs.values())
-      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
-      .slice(0, 20)
-      .map(publicGraphJob);
-    const counts = {
-      users: db.users.length,
-      teachers: db.users.filter((user) => user.role === "teacher").length,
-      students: db.users.filter((user) => user.role === "student").length,
-      materials: db.courseMaterials.length,
-      publicMaterials: db.courseMaterials.filter((item) => item.global).length,
-      graphs: db.knowledgeGraphs.length,
-      publicGraphs: db.knowledgeGraphs.filter((item) => item.global).length,
-      classes: db.classes.length,
-      homework: db.homework.length,
-      submissions: db.submissions.length,
-      failedJobs: graphJobList.filter((job) => job.status === "failed").length
-    };
-    return send(res, 200, {
-      ok: true,
-      overview: {
-        counts,
-        checks,
-        warnings,
-        health: { status: "ok", storage: checks.storage },
-        ready: { status: warnings.length ? "warning" : "ready" },
-        recentUsers,
-        graphJobs: graphJobList,
-        auditLogs: (db.auditLogs || []).slice(0, 80)
-      }
-    });
-  }
-
-  if (method === "POST" && pathname === "/api/admin/backup") {
-    const actor = requireActor(req, db);
-    requireRole(actor, ["admin"]);
-    ensureDataDir();
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const fileName = `db-backup-${stamp}.json`;
-    const target = path.join(BACKUP_DIR, fileName);
-    fs.copyFileSync(DB_PATH, target);
-    recordAudit(db, actor, "admin.backup", { resourceType: "backup", resourceId: fileName }, req);
+    const format = String(searchParams.get("format") || "json").toLowerCase();
+    const payload = buildAdminExportPayload(db, format);
+    recordAudit(db, actor, "admin.export", {
+      resourceType: "adminExport",
+      resourceId: payload.fileName,
+      meta: { format: payload.format, summary: payload.report.summary }
+    }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, fileName, path: target });
+    return send(res, 200, { ok: true, ...payload });
   }
 
   if (method === "POST" && pathname === "/api/auth/register") {
@@ -8284,6 +8927,48 @@ async function handleApi(req, res, pathname, searchParams) {
       materialId: String(body.materialId || body.material_id || ""),
       attempts: body.attempts || [],
       questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions
+    });
+    const learningEvent = recordLearningEvent(db, {
+      studentId: userId,
+      eventType: "knowledge_test_evaluate",
+      source: "knowledge-test",
+      subject: String(body.subject || body.question?.subject || ""),
+      knowledgePoint: result.topic,
+      graphId: String(body.question?.graphId || ""),
+      nodeId: String(body.question?.nodeId || ""),
+      score: result.overall?.masteryScore ?? result.overall?.accuracy ?? result.accuracy,
+      payload: {
+        quizId: String(body.quizId || body.quiz_id || ""),
+        questionId: String(body.question?.id || ""),
+        prompt: body.question?.prompt || "",
+        answer: body.answer || "",
+        accuracy: result.accuracy,
+        overall: result.overall,
+        matched: result.matched,
+        missing: result.missing
+      },
+      idempotencyKey: String(body.quizId || body.quiz_id || "") && String(body.question?.id || "")
+        ? `knowledge-test:${body.quizId || body.quiz_id}:${body.question.id}:${result.overall?.answered || ""}`
+        : ""
+    });
+    recordDiagnosisResult(db, {
+      studentId: userId,
+      eventId: learningEvent?.id || "",
+      topic: result.topic,
+      masteryScore: result.overall?.masteryScore ?? result.overall?.accuracy ?? result.accuracy,
+      masteryLevel: result.overall?.masteryLevel || result.masteryLevel || "",
+      errorTags: [],
+      missingPoints: result.missing || [],
+      evidence: body.question?.citations || [],
+      finalAnswer: result.feedback || "",
+      modelOrWorkflow: "knowledge-test",
+      idempotencyKey: learningEvent?.id ? `knowledge-test-diagnosis:${learningEvent.id}` : ""
+    });
+    syncStudentMasteryFromProfile(db, userId, [result.topic], {
+      subject: String(body.subject || body.question?.subject || ""),
+      graphId: String(body.question?.graphId || ""),
+      nodeId: String(body.question?.nodeId || ""),
+      lastEventId: learningEvent?.id || ""
     });
     recordAudit(db, actor, "knowledge_test.evaluate", {
       resourceType: "knowledgeTest",
@@ -8705,6 +9390,20 @@ async function handleApi(req, res, pathname, searchParams) {
       analysis: String(body.analysis || "").slice(0, 500),
       recommendation: String(body.recommendation || "").slice(0, 500)
     });
+    recordLearningEvent(db, {
+      studentId: body.userId,
+      eventType: "wrong_note",
+      source: note.source,
+      knowledgePoint: note.topic,
+      payload: {
+        wrongNoteId: note.id,
+        question: note.question,
+        answer: note.answer,
+        analysis: note.analysis,
+        recommendation: note.recommendation
+      },
+      idempotencyKey: `wrong-note:${note.id}`
+    });
     recordAudit(db, actor, "wrong_note.create", { resourceType: "wrongNote", resourceId: note.id, meta: { topic: note.topic } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, wrongNote: note, learningAnalytics: learningAnalytics(db, body.userId) });
@@ -8716,6 +9415,23 @@ async function handleApi(req, res, pathname, searchParams) {
     const topics = Array.isArray(body.topics) ? body.topics.map(String) : [String(body.topic || "")];
     const delta = Number.isFinite(Number(body.delta)) ? Number(body.delta) : 0.08;
     const profile = updateTopicMastery(db, body.userId, topics, delta, String(body.evidence || "用户在对话中标记掌握"));
+    const learningEvent = recordLearningEvent(db, {
+      studentId: body.userId,
+      eventType: "manual_mastery_update",
+      source: "user-action",
+      subject: String(body.subject || ""),
+      knowledgePoint: topics[0] || "",
+      score: profile.mastery?.[topics[0]]?.score,
+      payload: {
+        topics,
+        delta,
+        evidence: String(body.evidence || "")
+      }
+    });
+    syncStudentMasteryFromProfile(db, body.userId, topics, {
+      subject: String(body.subject || ""),
+      lastEventId: learningEvent?.id || ""
+    });
     recordAudit(db, actor, "mastery.update", { resourceType: "learningProfile", resourceId: body.userId, meta: { topics } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, profile, learningAnalytics: learningAnalytics(db, body.userId) });
@@ -8819,6 +9535,7 @@ async function handleApi(req, res, pathname, searchParams) {
       mode: body.mode || "ideal",
       components: Array.isArray(body.components) ? body.components : [],
       notes: String(body.notes || ""),
+      experiment: sanitizeExperimentRecord(body.experiment),
       updatedAt: now()
     };
     if (existing) {
@@ -8842,13 +9559,15 @@ async function handleApi(req, res, pathname, searchParams) {
     const prompt = String(body.prompt || "").trim();
     if (!prompt) return sendError(res, 400, "算法需求不能为空");
     if (prompt.length > 1200) return sendError(res, 400, "算法需求不能超过 1200 字");
+    const codeMode = String(body.codeMode || "teaching").slice(0, 40);
+    const difficulty = String(body.difficulty || "standard").slice(0, 40);
     const hits = searchCourseKnowledge(db, body.userId, prompt, { subject, limit: 5 });
     const relevantHits = hits.filter((hit) => Number(hit.score || 0) >= 0.8);
     let rawGenerated = null;
     let openAiError = null;
     if (isConfiguredSecret(OPENAI_API_KEY)) {
       try {
-        rawGenerated = await generateAlgorithmWithOpenAI(prompt, subject, null, relevantHits);
+        rawGenerated = await generateAlgorithmWithOpenAI(prompt + "\nCode mode: " + codeMode + "\nDifficulty: " + difficulty, subject, null, relevantHits);
       } catch (error) {
         openAiError = error;
       }
@@ -8860,6 +9579,9 @@ async function handleApi(req, res, pathname, searchParams) {
       rawGenerated = localAlgorithmGeneration(prompt, subject, openAiError ? publicGenerationFallbackReason(openAiError) : "OpenAI API Key 未配置");
     }
     const generated = await verifyGeneratedAlgorithm(rawGenerated, prompt, subject);
+    if (!generated.explanation) generated.explanation = simpleAlgorithmExplanation(prompt, generated, relevantHits, { codeMode, difficulty });
+    const workflow = buildModelCodeWorkflow({ hits: relevantHits, generated });
+    const experiment = buildExperimentRecord({ userId: body.userId, subject, prompt, codeMode, difficulty, generated: { ...generated, workflow }, hits: relevantHits });
     recordAudit(db, actor, "model.code_generate", {
       resourceType: "modelCode",
       resourceId: "",
@@ -8871,13 +9593,17 @@ async function handleApi(req, res, pathname, searchParams) {
       }
     }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, ...generated });
+    return send(res, 200, { ok: true, ...generated, agentName: "ML Lab Code Agent", codeMode, difficulty, workflow, experiment });
   }
 
   if (method === "POST" && pathname === "/api/model-code/run") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "code"]);
-    const result = await runModelCodeSnippet(body.code);
+    const subject = normalizeSubject(body.subject || "machine learning");
+    const prompt = String(body.prompt || body.title || "repair and run machine learning lab code").slice(0, 1200);
+    const contextHits = body.autoRepair ? searchCourseKnowledge(db, body.userId, prompt, { subject, limit: 5 }).filter((hit) => Number(hit.score || 0) >= 0.8) : [];
+    const result = body.autoRepair ? await runModelCodeWithAutoRepair({ code: body.code, prompt, subject, contextHits }) : await runModelCodeSnippet(body.code);
+    const workflow = buildModelCodeWorkflow({ hits: contextHits, generated: { sourceType: "manual", repairAttempts: result.repairAttempts || 0, verifiedRun: result }, run: result, repairHistory: result.repairHistory || [] });
     recordAudit(db, actor, "model.code_run", {
       resourceType: "modelCode",
       resourceId: "",
@@ -8887,11 +9613,13 @@ async function handleApi(req, res, pathname, searchParams) {
         success: result.success,
         exitCode: result.exitCode,
         timedOut: result.timedOut,
-        durationMs: result.durationMs
+        durationMs: result.durationMs,
+        autoRepair: Boolean(body.autoRepair),
+        repairAttempts: result.repairAttempts || 0
       }
     }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, ...result });
+    return send(res, 200, { ok: true, ...result, workflow });
   }
 
   params = routePattern(pathname, "/api/models/:id");
@@ -9482,6 +10210,43 @@ async function handleApi(req, res, pathname, searchParams) {
       topics,
       score: submission.score,
       minutes: 5
+    });
+    const learningEvent = recordLearningEvent(db, {
+      studentId: submission.studentId,
+      classId: homework.classId,
+      teacherId: homework.teacherId,
+      eventType: "homework_grade_confirmed",
+      source: "teacher-confirmed-grade",
+      subject: homework.subject || "",
+      knowledgePoint: topics[0] || "",
+      homeworkId: homework.id,
+      submissionId: submission.id,
+      score: submission.score,
+      payload: {
+        homeworkTitle: homework.title,
+        topics,
+        comment: submission.comment,
+        gradeType: submission.gradeType,
+        feedback: submission.feedback || null
+      },
+      idempotencyKey: `homework-grade:${submission.id}:${submission.confirmedAt}`
+    });
+    recordDiagnosisResult(db, {
+      studentId: submission.studentId,
+      eventId: learningEvent?.id || "",
+      topic: topics[0] || homework.title || "",
+      masteryScore: submission.score,
+      masteryLevel: profile.mastery?.[topics[0]]?.status || "",
+      errorTags: [],
+      missingPoints: submission.feedback?.missing || [],
+      evidence: submission.feedback?.rubricResults || [],
+      finalAnswer: submission.comment || submission.aiComment || "",
+      modelOrWorkflow: "teacher-confirmed-grade",
+      idempotencyKey: learningEvent?.id ? `homework-grade-diagnosis:${learningEvent.id}` : ""
+    });
+    syncStudentMasteryFromProfile(db, submission.studentId, topics, {
+      subject: homework.subject || "",
+      lastEventId: learningEvent?.id || ""
     });
     if (submission.score < 75 && topics[0]) {
       addWrongNote(db, submission.studentId, {
