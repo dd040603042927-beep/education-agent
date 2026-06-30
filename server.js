@@ -358,6 +358,13 @@ function createInitialDb() {
     learningEvents: [],
     diagnosisResults: [],
     studentMastery: [],
+    studentReflections: [],
+    knowledgeCorrections: [],
+    aiAnswerReviews: [],
+    learningCycles: [],
+    studentNodeAnnotations: [],
+    studentEthicsSettings: [],
+    studentDataDeletionRequests: [],
     agentRuns: [],
     auditLogs: [],
     friendRequests: [],
@@ -673,6 +680,13 @@ function ensureDbShape(db) {
     "learningEvents",
     "diagnosisResults",
     "studentMastery",
+    "studentReflections",
+    "knowledgeCorrections",
+    "aiAnswerReviews",
+    "learningCycles",
+    "studentNodeAnnotations",
+    "studentEthicsSettings",
+    "studentDataDeletionRequests",
     "agentRuns",
     "submissions",
     "auditLogs",
@@ -5469,6 +5483,117 @@ function findGraphContext(db, userId, subject, prompt, topics = [], hits = []) {
   };
 }
 
+function normalizedTopicKey(topic) {
+  return String(topic || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[（）()《》「」'"]/g, "");
+}
+
+function mlTermPatternForTopic(topic) {
+  const text = String(topic || "");
+  if (!text.trim()) return null;
+  return ML_TERM_PATTERNS.find((item) => (
+    item.label === text
+    || item.label.includes(text)
+    || text.includes(item.label)
+    || item.pattern.test(text)
+  )) || null;
+}
+
+function topicDirectHit(text, topic) {
+  const source = String(text || "");
+  const label = String(topic || "").trim();
+  if (!source.trim() || !label) return false;
+  if (textContainsKeyword(source, label)) return true;
+  const term = mlTermPatternForTopic(label);
+  return term ? term.pattern.test(source) : false;
+}
+
+function normalizeTopicProbability(value, fallback = 0.45) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? fallback : normalized;
+}
+
+function buildTopicLocalization({ prompt = "", knowledgePoint = "", graphContext = {}, agent = {}, workflowResult = {} }) {
+  const evidenceText = [
+    prompt,
+    knowledgePoint,
+    graphContext?.focusNode?.label,
+    ...(Array.isArray(agent.topics) ? agent.topics : []),
+    workflowResult.topic_label || workflowResult.topicLabel || ""
+  ].filter(Boolean).join("\n");
+  const candidateMap = new Map();
+  const addCandidate = (topic, score, source, evidence = "") => {
+    const label = String(topic || "").trim();
+    if (!label) return;
+    const key = normalizedTopicKey(label);
+    if (!key) return;
+    const direct = topicDirectHit(prompt, label) || topicDirectHit(knowledgePoint, label);
+    let adjusted = Number(score || 0);
+    if (direct) adjusted = Math.max(adjusted + 0.22, 0.92);
+    if (!direct && source === "图谱焦点") adjusted = Math.min(adjusted, 0.58);
+    adjusted = Math.max(0.05, Math.min(1, adjusted));
+    const existing = candidateMap.get(key);
+    const item = {
+      topic: label,
+      probability: Number(adjusted.toFixed(4)),
+      source,
+      evidence: evidence || (direct ? "学生问题或手动上下文直接命中该知识点" : "由工作流、图谱或检索证据推断"),
+      direct
+    };
+    if (!existing || item.probability > existing.probability) candidateMap.set(key, item);
+  };
+
+  if (knowledgePoint) addCandidate(knowledgePoint, 0.82, "手动上下文", "学生或页面上下文已指定知识点");
+  const workflowTopic = workflowResult.topic_label || workflowResult.topicLabel || "";
+  if (workflowTopic) addCandidate(workflowTopic, normalizeTopicProbability(workflowResult.topic_probability ?? workflowResult.topicProbability, agent.confidence === "dify" ? 0.68 : 0.54), "Dify 工作流", "工作流结构化输出的 topic_label");
+  const workflowCandidates = Array.isArray(workflowResult.top_topic_candidates || workflowResult.topTopicCandidates)
+    ? (workflowResult.top_topic_candidates || workflowResult.topTopicCandidates)
+    : [];
+  workflowCandidates.forEach((item, index) => {
+    const topic = typeof item === "string" ? item : item.topic || item.label || item.name || "";
+    const probability = typeof item === "string" ? Math.max(0.42, 0.58 - index * 0.06) : normalizeTopicProbability(item.probability ?? item.score, Math.max(0.42, 0.62 - index * 0.07));
+    addCandidate(topic, probability, "Dify 候选", "工作流返回的候选知识点");
+  });
+  (Array.isArray(agent.topics) ? agent.topics : []).forEach((topic, index) => {
+    addCandidate(topic, Math.max(0.32, 0.54 - index * 0.04), "智能体候选", "智能体综合检索与回答生成得到");
+  });
+  if (graphContext?.focusNode?.label) {
+    addCandidate(graphContext.focusNode.label, 0.52, "图谱焦点", graphContext.graphTitle ? `命中图谱「${graphContext.graphTitle}」节点` : "命中知识图谱节点");
+  }
+  ML_TERM_PATTERNS.forEach((item) => {
+    if (item.pattern.test(evidenceText)) addCandidate(item.label, 0.88, "问题文本命中", `问题文本命中「${item.label}」别名或关键词`);
+  });
+
+  const candidates = Array.from(candidateMap.values())
+    .sort((a, b) => b.probability - a.probability)
+    .slice(0, 5);
+  const best = candidates[0] || {
+    topic: knowledgePoint || workflowTopic || "待确认知识点",
+    probability: 0.35,
+    source: "待确认",
+    evidence: "没有足够的题面、上下文或图谱证据",
+    direct: false
+  };
+  const second = candidates[1];
+  const margin = second ? best.probability - second.probability : best.probability;
+  const needsConfirmation = best.probability < 0.62 || (!best.direct && second && margin < 0.12);
+  const confidenceLabel = best.probability >= 0.82
+    ? "高"
+    : best.probability >= 0.62 ? "中" : "低";
+  return {
+    selectedTopic: best.topic,
+    confidence: best.probability,
+    confidenceLabel,
+    needsConfirmation,
+    candidates,
+    basis: best.evidence,
+    policy: needsConfirmation ? "低置信度或候选接近，仅记录为待确认，不更新掌握度。" : "定位证据充足，本轮可写入学习画像。",
+    corrected: false
+  };
+}
+
 function profileMasterySummary(profile) {
   const entries = Object.entries(profile.mastery || {})
     .filter(([, item]) => Array.isArray(item?.evidence) && item.evidence.length > 0)
@@ -5629,6 +5754,73 @@ function buildAgentActions(mode, topics) {
   ]);
 }
 
+function metacognitivePromptsForTopic(topic = "当前知识点", mode = "qa") {
+  const label = String(topic || "当前知识点").trim() || "当前知识点";
+  const common = [
+    `你为什么会这样理解「${label}」？请写出依据，而不是只写结论。`,
+    `你能不能举一个反例或边界场景，检验自己是否真的理解「${label}」？`,
+    "你现在最不确定的一步是什么？下一次准备怎么验证？",
+    "这次你使用 AI 是为了获得提示、核对证据，还是直接替代思考？"
+  ];
+  if (mode === "grade") {
+    return [
+      `你这次错误更像是概念误解、条件遗漏、步骤跳跃，还是表达不完整？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  if (mode === "practice") {
+    return [
+      `作答前，你准备先用哪个知识点或公式？为什么？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  if (mode === "guided") {
+    return [
+      `在看下一条提示前，你能先说出自己已经确定的部分吗？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  return common;
+}
+
+function buildGraphProfileRecommendations({ topics = [], graphContext = {}, profile = {}, mastery = [] }) {
+  const focus = graphContext?.focusNode;
+  const topic = topics[0] || focus?.label || "当前知识点";
+  const weakTopics = mastery.filter((item) => item.score === null || item.score < 0.58).map((item) => item.topic).slice(0, 4);
+  const prerequisites = (graphContext?.prerequisiteNodes || []).map((node) => node.label).filter(Boolean).slice(0, 4);
+  const related = (graphContext?.relatedNodes || []).map((node) => node.label).filter(Boolean).slice(0, 4);
+  const profileEvidence = profile.mastery?.[topic]?.evidence || [];
+  const nextPath = [
+    prerequisites.length ? `先补前置：${prerequisites.join("、")}` : "",
+    `聚焦节点：${focus?.label || topic}`,
+    weakTopics.length ? `修正薄弱：${weakTopics.join("、")}` : "完成一次变式测试",
+    "写结构化反思并进入学习档案"
+  ].filter(Boolean);
+  return {
+    title: "GraphRAG + 学习画像推荐路径",
+    topic,
+    graphNode: focus ? {
+      graphId: graphContext.graphId || "",
+      graphTitle: graphContext.graphTitle || "",
+      nodeId: focus.id || "",
+      label: focus.label || topic,
+      path: graphContext.path || []
+    } : null,
+    weakTopics,
+    prerequisites,
+    related,
+    nextPath,
+    evidenceIndex: {
+      profileEvidenceCount: Array.isArray(profileEvidence) ? profileEvidence.length : 0,
+      graphEvidence: focus ? "知识图谱节点作为证据索引" : "未命中图谱节点",
+      ragEvidence: "引用来源与图谱节点共同约束 AI 回答"
+    },
+    rationale: focus
+      ? "AI 回答绑定课程资料和图谱节点，本轮行为回写画像，画像再反向影响复习路径。"
+      : "当前没有稳定图谱焦点，建议先用知识点纠错或图谱定位确认节点后再更新画像。"
+  };
+}
+
 function buildLearningPanel({ citations, topics, graphContext, profile, mode, strategy, answerDepth }) {
   const mastery = masteryItemsForTopics(profile, topics);
   const prerequisites = (graphContext?.prerequisiteNodes || []).map((node) => ({
@@ -5659,6 +5851,8 @@ function buildLearningPanel({ citations, topics, graphContext, profile, mode, st
     prerequisites,
     misconceptions,
     recommendedExercises: buildRecommendedExercises(mode, topics, graphContext),
+    metacognitivePrompts: metacognitivePromptsForTopic(topics[0] || graphContext?.focusNode?.label || "当前知识点", mode),
+    profileDrivenPath: buildGraphProfileRecommendations({ topics, graphContext, profile, mastery }),
     mastery,
     suggestions,
     graphFocus: graphContext?.focusNode ? {
@@ -6710,7 +6904,9 @@ function buildDifyAssistantContext({ user, mode, teaching, subject, chapter, kno
     answer_depth: answerDepth,
     target_level: difyTargetLevel(answerDepth),
     diagnosis_depth: difyDiagnosisDepth(answerDepth),
-    has_student_answer: Boolean(hasStudentAnswer)
+    has_student_answer: Boolean(hasStudentAnswer),
+    metacognitive_prompts: metacognitivePromptsForTopic(knowledgePoint || subject || "当前知识点", mode),
+    metacognitive_instruction: "回答后必须引导学生解释依据、检验反例、标记不确定点，并反思是否过度依赖 AI。"
   };
 }
 
@@ -7330,41 +7526,58 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     throw Object.assign(new Error(`学生 Dify 工作流调用失败：${error.message || error}`), { status: 502 });
   }
   const graphContext = findGraphContext(db, user.id, subject, retrievalQuery, agent.topics, hits);
+  const workflowResult = agent.workflowResult || {};
+  const topicLocalization = buildTopicLocalization({ prompt, knowledgePoint, graphContext, agent, workflowResult });
   const topics = Array.from(new Set([
+    topicLocalization.selectedTopic,
     knowledgePoint,
-    graphContext.focusNode?.label,
-    ...(agent.topics || [])
+    ...(agent.topics || []),
+    graphContext.focusNode?.label
   ].filter(Boolean))).slice(0, 8);
+  const masteryTopics = topicLocalization.needsConfirmation ? [] : topics;
   const evidenceDelta = ["high", "dify"].includes(agent.confidence) ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
   let updatedProfile = profile;
-  updatedProfile = updateTopicMastery(db, user.id, topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  if (masteryTopics.length) {
+    updatedProfile = updateTopicMastery(db, user.id, masteryTopics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  }
   recordLearningActivity(db, user.id, {
     kind: mode === "practice" ? "practice" : "question",
     mode,
     prompt: prompt.slice(0, 120),
     topics,
     confidence: agent.confidence,
+    topicLocalization,
     minutes: mode === "plan" ? 6 : 3
   });
-  const workflowResult = agent.workflowResult || {};
+  const enrichedWorkflowResult = {
+    ...workflowResult,
+    topic_label: topicLocalization.selectedTopic || workflowResult.topic_label || topics[0] || knowledgePoint,
+    topic_probability: topicLocalization.confidence,
+    top_topic_candidates: topicLocalization.candidates,
+    topic_localization: topicLocalization,
+    mastery_update_skipped: topicLocalization.needsConfirmation
+  };
   const workflowRequestId = String(workflowResult.request_id || workflowResult.requestId || "").trim();
   const workflowScore = Number(workflowResult.mastery_score ?? workflowResult.masteryScore);
+  const acceptedWorkflowScore = topicLocalization.needsConfirmation ? null : (Number.isFinite(workflowScore) ? workflowScore : null);
   const learningEvent = recordLearningEvent(db, {
     studentId: user.id,
     classId: String(body.classId || body.class_id || user.classIds?.[0] || ""),
-    eventType: hasStudentAnswer || mode === "grade" ? "ai_diagnosis" : "ai_question",
+    eventType: topicLocalization.needsConfirmation ? "ai_topic_pending" : (hasStudentAnswer || mode === "grade" ? "ai_diagnosis" : "ai_question"),
     source: agent.workflowSource || "dify-api",
     subject,
-    knowledgePoint: topics[0] || knowledgePoint,
+    knowledgePoint: topicLocalization.selectedTopic || topics[0] || knowledgePoint,
     graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
     nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
-    score: Number.isFinite(workflowScore) ? workflowScore : null,
+    score: acceptedWorkflowScore,
     payload: {
       requestId: workflowRequestId,
       mode,
       prompt,
       studentAnswer,
       topics,
+      topicLocalization,
+      masteryUpdated: Boolean(masteryTopics.length),
       confidence: agent.confidence,
       workflowRunId: workflowResult.workflow_run_id || "",
       taskId: workflowResult.task_id || ""
@@ -7375,9 +7588,9 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     recordDiagnosisResult(db, {
       studentId: user.id,
       eventId: learningEvent?.id || "",
-      topic: workflowResult.topic_label || topics[0] || knowledgePoint,
-      masteryScore: Number.isFinite(workflowScore) ? workflowScore : null,
-      masteryLevel: workflowResult.mastery_level || workflowResult.masteryLevel || "",
+      topic: topicLocalization.selectedTopic || workflowResult.topic_label || topics[0] || knowledgePoint,
+      masteryScore: acceptedWorkflowScore,
+      masteryLevel: topicLocalization.needsConfirmation ? "待确认" : (workflowResult.mastery_level || workflowResult.masteryLevel || ""),
       errorTags: Array.isArray(workflowResult.error_tags) ? workflowResult.error_tags : [],
       missingPoints: Array.isArray(workflowResult.missing_points) ? workflowResult.missing_points : [],
       evidence: Array.isArray(workflowResult.rag_evidence) ? workflowResult.rag_evidence : [],
@@ -7386,12 +7599,14 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
       idempotencyKey: workflowRequestId ? `dify-diagnosis:${workflowRequestId}` : ""
     });
   }
-  syncStudentMasteryFromProfile(db, user.id, topics, {
-    subject,
-    graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
-    nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
-    lastEventId: learningEvent?.id || ""
-  });
+  if (masteryTopics.length) {
+    syncStudentMasteryFromProfile(db, user.id, masteryTopics, {
+      subject,
+      graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
+      nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
+      lastEventId: learningEvent?.id || ""
+    });
+  }
   if (mode === "grade" && topics[0]) {
     addWrongNote(db, user.id, {
       source: "批改反馈",
@@ -7410,6 +7625,7 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     strategy: teaching.strategy,
     answerDepth
   });
+  learningPanel.topicLocalization = topicLocalization;
   const workflow = buildMlDiagnosisWorkflowTrace({ retrieval, citations, mode, topics, hasStudentAnswer });
   return {
     ...agent,
@@ -7424,7 +7640,7 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     actions: buildAgentActions(mode, topics),
     learningPanel,
     workflow,
-    workflowResult: agent.workflowResult,
+    workflowResult: enrichedWorkflowResult,
     retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter, ragChannel: hit.ragChannel || "" })),
     tools: [
       "intent_router",
@@ -7564,6 +7780,1860 @@ function learningAnalytics(db, userId) {
     wrongNotes,
     recommendations
   };
+}
+
+function scorePercentNumber(value) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? null : Math.round(normalized * 100);
+}
+
+function scorePercentText(value, fallback = "未记录") {
+  const score = scorePercentNumber(value);
+  return score === null ? fallback : `${score}%`;
+}
+
+function eventTimeValue(item) {
+  return new Date(item?.occurredAt || item?.createdAt || item?.updatedAt || item?.submittedAt || item?.gradedAt || 0).getTime() || 0;
+}
+
+function sortNewest(items = []) {
+  return items.slice().sort((a, b) => eventTimeValue(b) - eventTimeValue(a));
+}
+
+function classNamesForUser(db, user) {
+  const ids = new Set(Array.isArray(user.classIds) ? user.classIds : []);
+  (db.classes || []).forEach((klass) => {
+    if ((klass.studentIds || []).includes(user.id)) ids.add(klass.id);
+  });
+  return Array.from(ids).map((id) => (db.classes || []).find((klass) => klass.id === id)?.name).filter(Boolean);
+}
+
+function inferPortfolioSubject(db, userId, events = []) {
+  const profile = ensureLearningProfile(db, userId);
+  const user = getUser(db, userId) || {};
+  const subjectCounts = new Map();
+  const add = (subject, weight = 1) => {
+    const label = normalizeSubject(subject || "");
+    if (!label || label === "通用") return;
+    subjectCounts.set(label, (subjectCounts.get(label) || 0) + weight);
+  };
+  events.forEach((event) => add(event.subject, 2));
+  Object.keys(profile.mastery || {}).forEach((topic) => {
+    if (/KNN|K\s*近邻|逻辑回归|支持向量机|SVM|机器学习|监督学习|特征工程/i.test(topic)) add("机器学习", 3);
+  });
+  (db.courseMaterials || []).filter((item) => item.ownerId === userId || item.global).forEach((item) => add(item.subject, 0.5));
+  add(user.subject || user.className, 1);
+  const ranked = Array.from(subjectCounts.entries()).sort((a, b) => b[1] - a[1]);
+  return ranked[0]?.[0] || user.subject || "机器学习";
+}
+
+function portfolioGoalsForSubject(subject) {
+  if (/机器学习|machine learning|ML/i.test(subject)) {
+    return ["理解 KNN、逻辑回归、支持向量机等核心算法", "能解释算法适用条件、关键参数和常见误区", "能用测验、代码实验和反思证明学习改进"];
+  }
+  return [`理解${subject || "本课程"}核心概念`, "能用资料引用和练习结果解释学习过程", "能形成错因修正、作品证据和个人反思"];
+}
+
+function portfolioStage(evidence = {}) {
+  const stages = [
+    { key: "pretest", label: "前测诊断", done: evidence.knowledgeTests > 0 || evidence.masteryChanges > 0 },
+    { key: "goals", label: "学习目标设定", done: evidence.learningCycles > 0 || evidence.nodeAnnotations > 0 },
+    { key: "aiGraph", label: "AI + 知识图谱学习", done: evidence.aiDialogues > 0 && evidence.nodeAnnotations > 0 },
+    { key: "practice", label: "节点练习/作业", done: evidence.knowledgeTests > 1 || evidence.learningOutputs > 0 },
+    { key: "fix", label: "错因修正", done: evidence.wrongNotes > 0 },
+    { key: "posttest", label: "后测与反思", done: evidence.knowledgeTests >= 2 && evidence.reflections > 0 }
+  ];
+  const active = stages.find((stage) => !stage.done) || stages[stages.length - 1];
+  return {
+    label: stages.map((stage) => stage.label).join(" → "),
+    activeKey: active.key,
+    activeLabel: active.label,
+    stages,
+    progress: Math.round(stages.filter((stage) => stage.done).length / stages.length * 100)
+  };
+}
+
+function buildMasteryComparison(events = [], mastery = []) {
+  const groups = new Map();
+  events
+    .filter((event) => event.knowledgePoint && event.score !== null && event.score !== undefined)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b))
+    .forEach((event) => {
+      const key = event.knowledgePoint;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(event);
+    });
+  mastery.forEach((item) => {
+    const key = item.knowledgePoint;
+    if (!key) return;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({
+      knowledgePoint: key,
+      subject: item.subject,
+      score: item.score,
+      eventType: "student_mastery_snapshot",
+      source: "studentMastery",
+      occurredAt: item.updatedAt,
+      createdAt: item.updatedAt
+    });
+  });
+  return Array.from(groups.entries()).map(([topic, rows]) => {
+    const sorted = rows.sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+    const first = sorted.find((item) => item.score !== null && item.score !== undefined);
+    const last = sorted.slice().reverse().find((item) => item.score !== null && item.score !== undefined);
+    const start = normalizeLearningScore(first?.score);
+    const current = normalizeLearningScore(last?.score);
+    const change = start !== null && current !== null ? Number((current - start).toFixed(4)) : null;
+    return {
+      topic,
+      subject: last?.subject || first?.subject || "",
+      start,
+      current,
+      change,
+      startText: scorePercentText(start),
+      currentText: scorePercentText(current),
+      changeText: change === null ? "未计算" : `${change >= 0 ? "+" : ""}${Math.round(change * 100)}%`,
+      evidenceCount: sorted.length,
+      firstAt: first?.occurredAt || first?.createdAt || "",
+      lastAt: last?.occurredAt || last?.createdAt || ""
+    };
+  }).sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0)).slice(0, 24);
+}
+
+const DEFAULT_LEARNING_CYCLE_REQUIREMENTS = {
+  aiDialogues: 3,
+  knowledgeTests: 2,
+  reflections: 1,
+  learningOutputs: 1,
+  wrongFixes: 1
+};
+
+const LEARNING_CYCLE_TEMPLATES = [
+  {
+    key: "knn_intro",
+    name: "KNN 入门周期",
+    title: "机器学习 KNN 入门学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 2 周",
+    goals: ["理解 KNN 核心思想", "掌握距离度量与 K 值选择", "能用测试和错因订正解释 KNN 的适用边界"],
+    focusNodes: ["KNN", "距离度量", "K 值选择", "特征缩放", "分类边界"],
+    recommendedTestNodes: ["KNN", "距离度量", "K 值选择"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测与概念建构", tasks: ["完成 KNN 前测", "阅读 KNN 图谱节点", "先写自己的 KNN 理解再让 AI 诊断"] },
+      { week: "第 2 周", title: "变式测试与反思", tasks: ["完成距离度量测试", "订正 K 值选择误区", "写一次结构化反思并形成学习卡片"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "logistic_regression",
+    name: "逻辑回归专题周期",
+    title: "机器学习逻辑回归专题学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 3 周",
+    goals: ["理解逻辑回归基本思想", "说明 sigmoid、损失函数和决策边界", "能比较逻辑回归与 KNN 的适用场景"],
+    focusNodes: ["逻辑回归", "Sigmoid 函数", "损失函数", "决策边界", "分类评估"],
+    recommendedTestNodes: ["逻辑回归", "损失函数", "分类评估"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测与函数理解", tasks: ["完成逻辑回归前测", "标注 Sigmoid 节点", "向 AI 提交原始理解"] },
+      { week: "第 2 周", title: "损失函数与训练", tasks: ["完成损失函数测试", "整理常见误区", "用自己的话解释参数更新"] },
+      { week: "第 3 周", title: "后测与迁移", tasks: ["完成同知识点后测", "比较 KNN 与逻辑回归", "提交一份小实验或笔记"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "svm_compare",
+    name: "SVM 对比学习周期",
+    title: "机器学习 SVM 对比学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 3 周",
+    goals: ["理解支持向量机的间隔思想", "比较 SVM、KNN 与逻辑回归的差异", "能识别核函数和超参数相关误区"],
+    focusNodes: ["支持向量机", "最大间隔", "核函数", "KNN", "逻辑回归"],
+    recommendedTestNodes: ["支持向量机", "最大间隔", "核函数"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "概念定位", tasks: ["完成 SVM 前测", "阅读最大间隔节点", "纠正 KNN/SVM 混淆点"] },
+      { week: "第 2 周", title: "对比学习", tasks: ["完成核函数测试", "用表格比较三类算法", "让 AI 检查比较依据"] },
+      { week: "第 3 周", title: "后测与反思", tasks: ["完成后测", "提交错因图谱或学习卡片", "写一次 AI 使用边界反思"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "ml_review",
+    name: "机器学习综合复习周期",
+    title: "机器学习核心算法综合复习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 4 周",
+    goals: ["串联 KNN、逻辑回归、SVM 等核心算法", "用图谱路径定位薄弱点", "形成前后测对比、错因修正和学习产出"],
+    focusNodes: ["KNN", "逻辑回归", "支持向量机", "特征缩放", "模型评估"],
+    recommendedTestNodes: ["KNN", "逻辑回归", "支持向量机", "模型评估"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测诊断", tasks: ["完成综合前测", "选出 3 个薄弱节点", "设置本轮证据要求"] },
+      { week: "第 2 周", title: "图谱路径学习", tasks: ["按图谱路径复习 KNN 与逻辑回归", "完成一次 AI 诊断", "保存学习卡片"] },
+      { week: "第 3 周", title: "错因修正", tasks: ["完成阶段测", "订正错因标签", "上传笔记或代码实验"] },
+      { week: "第 4 周", title: "后测与档案", tasks: ["完成后测", "写周期总结反思", "生成匿名申报证据包"] }
+    ],
+    evidenceRequirements: { aiDialogues: 4, knowledgeTests: 3, reflections: 2, learningOutputs: 1, wrongFixes: 2 }
+  }
+];
+
+const LEARNING_CYCLE_TASK_STATUS_LABELS = {
+  not_started: "未开始",
+  in_progress: "进行中",
+  submitted: "已提交",
+  archived: "已入档",
+  needs_reflection: "需反思",
+  done: "已完成"
+};
+
+function normalizeStringItems(value, max = 12) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, max);
+  }
+  return String(value || "")
+    .split(/[\n,，;；、]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, max);
+}
+
+function normalizeWeeklyPlanItems(value, max = 8) {
+  const raw = Array.isArray(value) ? value : String(value || "")
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return raw.slice(0, max).map((item, index) => {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      return {
+        week: String(item.week || item.label || `第 ${index + 1} 周`).trim().slice(0, 40),
+        title: String(item.title || item.name || "").trim().slice(0, 80),
+        tasks: normalizeStringItems(item.tasks || item.task || "", 8)
+      };
+    }
+    const text = String(item || "").trim();
+    const parts = text.split(/[:：]/);
+    return {
+      week: parts.length > 1 ? parts[0].trim().slice(0, 40) : `第 ${index + 1} 周`,
+      title: parts.length > 1 ? parts[1].trim().slice(0, 80) : text.slice(0, 80),
+      tasks: parts.length > 2 ? normalizeStringItems(parts.slice(2).join("："), 8) : []
+    };
+  }).filter((item) => item.week || item.title || item.tasks.length);
+}
+
+function learningCycleTemplateLibrary() {
+  return LEARNING_CYCLE_TEMPLATES.map((template) => JSON.parse(JSON.stringify(template)));
+}
+
+function findLearningCycleTemplate(templateKey = "") {
+  return learningCycleTemplateLibrary().find((template) => template.key === String(templateKey || "").trim()) || null;
+}
+
+function learningCycleDefaultsForSubject(subject = "机器学习") {
+  const isMachineLearning = /机器学习|machine learning|ML|KNN|逻辑回归/i.test(subject || "");
+  const defaultTemplate = LEARNING_CYCLE_TEMPLATES[0];
+  return {
+    title: isMachineLearning ? "机器学习 KNN 与逻辑回归专题学习" : `${subject || "课程"}专题学习周期`,
+    subject: subject || "机器学习",
+    startLabel: isMachineLearning ? defaultTemplate.startLabel : "第 1 周",
+    endLabel: isMachineLearning ? "第 4 周" : "第 4 周",
+    goals: isMachineLearning
+      ? ["掌握 KNN 原理、距离度量与 K 值选择", "理解逻辑回归基本思想与适用场景", "能用测试、错因订正、反思和学习产出证明理解变化"]
+      : [`掌握${subject || "本课程"}核心概念`, "能用 AI 诊断和图谱路径修正误区", "形成可导出的学习证据档案"],
+    focusNodes: isMachineLearning ? ["KNN", "距离度量", "K 值选择", "逻辑回归", "损失函数"] : [],
+    weeklyPlan: isMachineLearning ? LEARNING_CYCLE_TEMPLATES[3].weeklyPlan : [],
+    recommendedTestNodes: isMachineLearning ? ["KNN", "距离度量", "K 值选择", "逻辑回归"] : [],
+    evidenceRequirements: { ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS }
+  };
+}
+
+function normalizeLearningCycleRecord(cycle = {}, userId = "", subject = "") {
+  const template = findLearningCycleTemplate(cycle.templateKey);
+  const defaults = {
+    ...learningCycleDefaultsForSubject(cycle.subject || subject),
+    ...(template || {})
+  };
+  const requirements = {
+    ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS,
+    ...(defaults.evidenceRequirements && typeof defaults.evidenceRequirements === "object" ? defaults.evidenceRequirements : {}),
+    ...(cycle.evidenceRequirements && typeof cycle.evidenceRequirements === "object" ? cycle.evidenceRequirements : {})
+  };
+  Object.keys(requirements).forEach((key) => {
+    requirements[key] = Math.max(0, Math.min(99, Number(requirements[key] || 0)));
+  });
+  return {
+    id: cycle.id || uid("cycle"),
+    studentId: cycle.studentId || userId,
+    title: String(cycle.title || defaults.title).trim().slice(0, 120),
+    subject: normalizeSubject(cycle.subject || defaults.subject || subject || ""),
+    startLabel: String(cycle.startLabel || defaults.startLabel).trim().slice(0, 40),
+    endLabel: String(cycle.endLabel || defaults.endLabel).trim().slice(0, 40),
+    startDate: String(cycle.startDate || "").trim().slice(0, 30),
+    endDate: String(cycle.endDate || "").trim().slice(0, 30),
+    goals: normalizeStringItems(cycle.goals && cycle.goals.length ? cycle.goals : defaults.goals, 8),
+    templateKey: String(cycle.templateKey || template?.key || "").trim().slice(0, 80),
+    focusNodes: normalizeStringItems(cycle.focusNodes && cycle.focusNodes.length ? cycle.focusNodes : defaults.focusNodes, 12),
+    weeklyPlan: normalizeWeeklyPlanItems(cycle.weeklyPlan && cycle.weeklyPlan.length ? cycle.weeklyPlan : defaults.weeklyPlan, 8),
+    recommendedTestNodes: normalizeStringItems(cycle.recommendedTestNodes && cycle.recommendedTestNodes.length ? cycle.recommendedTestNodes : defaults.recommendedTestNodes, 12),
+    viewMode: ["stage", "week"].includes(cycle.viewMode) ? cycle.viewMode : "stage",
+    evidenceRequirements: requirements,
+    status: ["draft", "active", "completed", "archived"].includes(cycle.status) ? cycle.status : "active",
+    manualTaskStatus: cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {},
+    createdAt: cycle.createdAt || now(),
+    updatedAt: cycle.updatedAt || cycle.createdAt || now()
+  };
+}
+
+function activeLearningCycle(db, userId, subject = "") {
+  db.learningCycles = Array.isArray(db.learningCycles) ? db.learningCycles : [];
+  const cycles = sortNewest(db.learningCycles.filter((item) => item.studentId === userId && item.status !== "archived"));
+  const selected = cycles.find((item) => item.status === "active") || cycles[0];
+  if (selected) return normalizeLearningCycleRecord(selected, userId, subject);
+  const defaults = learningCycleDefaultsForSubject(subject);
+  return normalizeLearningCycleRecord({
+    ...defaults,
+    id: `virtual_cycle_${userId}`,
+    studentId: userId,
+    virtual: true
+  }, userId, subject);
+}
+
+function buildLearningCycleTaskProgress(cycle = {}, evidenceCounts = {}) {
+  const requirements = {
+    ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS,
+    ...(cycle.evidenceRequirements || {})
+  };
+  const knowledgeTests = Number(evidenceCounts.knowledgeTests || 0);
+  const wrongFixes = Number(evidenceCounts.wrongNotes || 0) + Number(evidenceCounts.corrections || 0);
+  const learningOutputs = Number(evidenceCounts.learningOutputs || 0);
+  const aiTarget = Math.max(1, Number(requirements.aiDialogues || 1));
+  const practiceTarget = Math.max(1, Number(requirements.knowledgeTests || 1)) + (Number(requirements.learningOutputs || 0) > 0 ? 1 : 0);
+  const reflectionTarget = Math.max(1, Number(requirements.reflections || 1));
+  const hasSavedCyclePlan = !String(cycle.id || "").startsWith("virtual_cycle_")
+    && (cycle.goals || []).length >= 2
+    && ((cycle.focusNodes || []).length || (cycle.recommendedTestNodes || []).length);
+  const values = {
+    pretest: Math.min(knowledgeTests, 1),
+    goals: hasSavedCyclePlan ? 1 : 0,
+    aiGraph: Math.min(Number(evidenceCounts.aiDialogues || 0), aiTarget) + Math.min(1, Number(evidenceCounts.nodeAnnotations || 0) + Number(evidenceCounts.learningCards || 0)),
+    practice: knowledgeTests + Math.min(1, learningOutputs),
+    wrongFix: wrongFixes,
+    postReflection: Math.min(1, Math.max(0, knowledgeTests - 1)) + Math.min(Number(evidenceCounts.reflections || 0), reflectionTarget)
+  };
+  const defs = [
+    {
+      key: "pretest",
+      label: "前测诊断",
+      shortLabel: "前测",
+      target: 1,
+      value: values.pretest,
+      page: "graph",
+      evidenceType: "前测证据",
+      evidence: "知识点掌握度、典型误区和原始理解会进入学习档案",
+      nextAction: "生成前测题并独立作答",
+      evidenceChecklist: ["前测分数", "薄弱知识点", "原始理解", "典型误区"]
+    },
+    {
+      key: "goals",
+      label: "学习目标设定",
+      shortLabel: "目标",
+      target: 1,
+      value: values.goals,
+      page: "home",
+      evidenceType: "目标证据",
+      evidence: "保存本周期要解决的 2-3 个具体难点和验证节点",
+      nextAction: "设置本轮学习周期、目标和重点节点",
+      evidenceChecklist: ["周期主题", "2-3 个难点", "目标节点", "证据要求"]
+    },
+    {
+      key: "aiGraph",
+      label: "AI + 知识图谱学习",
+      shortLabel: "AI+图谱",
+      target: aiTarget + 1,
+      value: values.aiGraph,
+      page: "ai",
+      evidenceType: "AI 与图谱证据",
+      evidence: "带着原始答案向 AI 追问，保留引用资料和图谱节点路径",
+      nextAction: "先写自己的理解，再让 AI 诊断并打开图谱焦点",
+      evidenceChecklist: ["AI 对话次数", "引用资料", "图谱路径", "AI 审辩记录"]
+    },
+    {
+      key: "practice",
+      label: "节点练习/作业",
+      shortLabel: "练习",
+      target: practiceTarget,
+      value: values.practice,
+      page: "graph",
+      evidenceType: "练习验证证据",
+      evidence: "知识测试、作业提交、代码实验或节点产出会写入学习画像",
+      nextAction: "完成一次同知识点变式测试或提交学习产出",
+      evidenceChecklist: ["正确率", "提交记录", "模型实验", "节点学习卡片"]
+    },
+    {
+      key: "wrongFix",
+      label: "错因修正",
+      shortLabel: "修正",
+      target: Math.max(1, Number(requirements.wrongFixes || 1)),
+      value: values.wrongFix,
+      page: "portfolio",
+      evidenceType: "错因修正证据",
+      evidence: "记录错题、误区、修正解释和二次验证方式",
+      nextAction: "补充错因、修正后理解和验证题",
+      evidenceChecklist: ["错题", "误区标签", "修正解释", "二次验证"]
+    },
+    {
+      key: "postReflection",
+      label: "后测与反思",
+      shortLabel: "后测反思",
+      target: reflectionTarget + 1,
+      value: values.postReflection,
+      page: "portfolio",
+      evidenceType: "后测反思证据",
+      evidence: "后测掌握度变化、学习策略变化和 AI 使用反思共同入档",
+      nextAction: "完成后测，并填写结构化反思卡",
+      evidenceChecklist: ["后测掌握度", "学习策略变化", "AI 使用反思", "下一步验证计划"]
+    }
+  ];
+  const manual = cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {};
+  const tasks = defs.map((task) => {
+    const target = Math.max(1, Number(task.target || 1));
+    const value = Math.max(0, Number(task.value || 0));
+    const manualStatus = manual[task.key] || {};
+    const evidenceDone = value >= target;
+    const manualStatusKey = LEARNING_CYCLE_TASK_STATUS_LABELS[manualStatus.status] ? manualStatus.status : "";
+    let statusKey = manualStatusKey || (value > 0 ? "in_progress" : "not_started");
+    if (evidenceDone) statusKey = "archived";
+    if (manualStatus.done || manualStatusKey === "done") statusKey = "done";
+    if (manualStatusKey === "submitted" && !evidenceDone) statusKey = "submitted";
+    if (manualStatusKey === "needs_reflection") statusKey = "needs_reflection";
+    if (["aiGraph", "practice", "wrongFix"].includes(task.key) && evidenceDone && Number(evidenceCounts.reflections || 0) < reflectionTarget) {
+      statusKey = "needs_reflection";
+    }
+    const done = Boolean(["archived", "done"].includes(statusKey));
+    const gapValue = Math.max(0, target - value);
+    return {
+      ...task,
+      target,
+      value,
+      done,
+      manualDone: Boolean(manualStatus.done),
+      statusKey,
+      statusLabel: LEARNING_CYCLE_TASK_STATUS_LABELS[statusKey] || "进行中",
+      note: manualStatus.note || "",
+      gap: gapValue ? `还差 ${gapValue} ${task.evidenceType.includes("对话") ? "次" : task.evidenceType.includes("反思") ? "份" : task.evidenceType.includes("产出") ? "个" : "次"}` : "证据已形成",
+      progress: Math.round(Math.min(1, value / target) * 100),
+      statusText: done ? "已入档" : `${LEARNING_CYCLE_TASK_STATUS_LABELS[statusKey] || "进行中"} · ${value}/${target}`
+    };
+  });
+  const current = tasks.find((task) => !task.done) || tasks[tasks.length - 1];
+  const completedRatio = tasks.reduce((sum, task) => sum + Math.min(1, Number(task.value || 0) / Math.max(1, Number(task.target || 1))), 0) / Math.max(1, tasks.length);
+  const stages = tasks.slice(0, 6).map((task) => ({
+    key: task.key,
+    label: task.shortLabel,
+    done: task.done,
+    statusKey: task.statusKey
+  }));
+  const evidenceGaps = tasks
+    .filter((task) => !task.done)
+    .map((task) => ({
+      key: task.key,
+      label: task.label,
+      evidenceType: task.evidenceType,
+      gap: task.gap,
+      nextAction: task.nextAction,
+      page: task.page,
+      statusKey: task.statusKey,
+      statusLabel: task.statusLabel
+    }));
+  return {
+    tasks,
+    evidenceGaps,
+    nextTask: tasks.find((task) => !task.done) || null,
+    currentStage: {
+      label: stages.map((stage) => stage.label).join(" → "),
+      activeKey: current.key,
+      activeLabel: current.shortLabel || current.label,
+      stages,
+      progress: Math.round(completedRatio * 100)
+    },
+    requiredEvidenceText: [
+      "1 个学习目标设定",
+      `至少 ${requirements.aiDialogues} 次 AI 对话`,
+      `${requirements.knowledgeTests} 次测试`,
+      `${requirements.wrongFixes} 条错因修正`,
+      `${requirements.reflections} 份反思`,
+      `${requirements.learningOutputs} 个学习产出`
+    ].join("、")
+  };
+}
+
+function buildLearningCycleView(db, userId, subject = "", evidenceCounts = {}) {
+  const cycle = activeLearningCycle(db, userId, subject);
+  const progress = buildLearningCycleTaskProgress(cycle, evidenceCounts);
+  return {
+    ...cycle,
+    virtual: String(cycle.id || "").startsWith("virtual_cycle_"),
+    rangeText: [cycle.startLabel, cycle.endLabel].filter(Boolean).join(" 到 "),
+    templateLibrary: learningCycleTemplateLibrary(),
+    evidenceCounts,
+    evidenceLoop: ["学习目标", "前测诊断", "图谱路径", "AI 对话", "知识测试", "错因修正", "反思", "后测", "学习档案"],
+    ...progress
+  };
+}
+
+function buildLearningCycleCompletionReport({ cycle = {}, comparison = [], wrongNotes = [], reflections = [], citations = [], counts = {}, ethicsSettings = {} }) {
+  const progress = Number(cycle.currentStage?.progress || 0);
+  const ready = progress >= 100;
+  const improvedTopics = comparison.filter((item) => Number(item.change || 0) > 0);
+  const weakTopics = comparison.filter((item) => Number(item.current || 0) < 0.58);
+  const reflectionSamples = reflections.slice(0, 5).map((item) => ({
+    time: item.createdAt,
+    topic: item.knowledgePoint || item.contextTitle || "学习反思",
+    text: reportCompactText([item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；"), 220)
+  }));
+  return {
+    ready,
+    statusText: ready ? "已生成周期完成报告" : `周期进度 ${progress}%，完成后自动生成报告`,
+    title: `${cycle.title || "学习周期"}完成报告`,
+    generatedAt: ready ? now() : "",
+    summary: ready
+      ? `本周期完成 ${Number(counts.aiDialogues || 0)} 次 AI 对话、${Number(counts.knowledgeTests || 0)} 次测试、${Number(counts.reflections || 0)} 份反思和 ${Number(counts.learningOutputs || 0)} 个学习产出。`
+      : "完成前测、AI 学习、知识测试、错因修正、反思、后测和学习产出后，系统会自动生成周期总结。",
+    prePostComparison: comparison.slice(0, 8).map((item) => ({
+      topic: item.topic,
+      startText: item.startText,
+      currentText: item.currentText,
+      changeText: item.changeText
+    })),
+    masteryChange: {
+      improvedTopics: improvedTopics.length,
+      weakTopics: weakTopics.length,
+      highlights: improvedTopics.slice(0, 5).map((item) => `${item.topic} ${item.changeText}`)
+    },
+    misconceptionChange: {
+      wrongNotes: wrongNotes.length,
+      corrections: Number(counts.corrections || 0),
+      summary: wrongNotes.length ? `已形成 ${wrongNotes.length} 条错因记录，可用于展示从误解到修正后理解的轨迹。` : "暂无错因记录，建议完成一次错因订正。"
+    },
+    reflectionSamples,
+    aiUseStatement: ethicsSettings.aiUseDisclosure
+      ? "AI 用于诊断、引用、追问和学习建议；学生保留原始作答、最终判断和反思记录。"
+      : "建议开启 AI 使用声明，明确 AI 辅助内容与学生原创内容边界。",
+    citationSummary: {
+      count: citations.length,
+      sources: citations.slice(0, 8).map((item) => item.sourceName || item.title || item.id).filter(Boolean)
+    },
+    anonymousPackage: ready
+      ? "可生成匿名申报包：隐藏学生姓名、ID 和敏感对话，仅保留过程证据、统计摘要、引用来源和反思摘录。"
+      : "周期完成后可一键生成匿名申报包。"
+  };
+}
+
+function suggestLearningCycleFromProfile(db, userId, body = {}) {
+  const portfolio = buildStudentPortfolio(db, userId);
+  const currentCycle = portfolio.learningCycle || {};
+  const requestedTemplate = findLearningCycleTemplate(body.templateKey) || null;
+  const weakByMastery = (portfolio.masteryComparison || [])
+    .filter((item) => Number(item.current || 0) < 0.68)
+    .map((item) => item.topic);
+  const weakByAnnotation = (portfolio.nodeAnnotations || [])
+    .filter((item) => ["weak", "uncertain", "learning"].includes(item.status))
+    .map((item) => item.nodeLabel || item.knowledgePoint)
+    .filter(Boolean);
+  const focusNodes = Array.from(new Set([
+    ...normalizeStringItems(body.focusNodes || "", 8),
+    ...weakByMastery,
+    ...weakByAnnotation,
+    ...(requestedTemplate?.focusNodes || currentCycle.focusNodes || []),
+    "KNN",
+    "逻辑回归"
+  ].filter(Boolean))).slice(0, 6);
+  const primary = focusNodes[0] || "KNN";
+  const secondary = focusNodes[1] || "逻辑回归";
+  const suggestion = {
+    templateKey: requestedTemplate?.key || currentCycle.templateKey || "ml_review",
+    title: `${currentCycle.subject || portfolio.summary?.subject || "机器学习"} ${primary} 与 ${secondary} 学习周期`,
+    subject: currentCycle.subject || portfolio.summary?.subject || requestedTemplate?.subject || "机器学习",
+    startLabel: body.startLabel || "第 1 周",
+    endLabel: body.endLabel || "第 4 周",
+    goals: [
+      `补齐 ${primary} 的核心概念、适用条件和常见误区`,
+      `围绕 ${focusNodes.slice(0, 4).join("、")} 完成图谱路径学习和测试诊断`,
+      "用前后测、错因订正、结构化反思和学习产出证明理解变化"
+    ],
+    focusNodes,
+    recommendedTestNodes: focusNodes.slice(0, 4),
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测诊断", tasks: [`完成 ${primary} 前测`, "标注薄弱图谱节点", "设置证据要求"] },
+      { week: "第 2 周", title: "AI 学习与图谱路径", tasks: ["先作答再求助", `围绕 ${primary} 向 AI 追问`, "把 AI 回答转成学习卡片"] },
+      { week: "第 3 周", title: "知识测试与错因修正", tasks: [`完成 ${secondary} 或相关节点测试`, "订正错因标签", "补充我的理解"] },
+      { week: "第 4 周", title: "后测与学习档案", tasks: ["完成同知识点后测", "写周期总结反思", "生成匿名申报证据包"] }
+    ],
+    evidenceRequirements: {
+      aiDialogues: Math.max(3, Number(currentCycle.evidenceRequirements?.aiDialogues || 0)),
+      knowledgeTests: Math.max(2, Number(currentCycle.evidenceRequirements?.knowledgeTests || 0)),
+      reflections: Math.max(1, Number(currentCycle.evidenceRequirements?.reflections || 0)),
+      learningOutputs: Math.max(1, Number(currentCycle.evidenceRequirements?.learningOutputs || 0)),
+      wrongFixes: Math.max(1, Number(currentCycle.evidenceRequirements?.wrongFixes || 0))
+    },
+    rationale: [
+      weakByMastery.length ? `根据掌握度低于 68% 的知识点推荐：${weakByMastery.slice(0, 4).join("、")}` : "当前掌握度数据不足，优先使用机器学习核心节点模板。",
+      weakByAnnotation.length ? `结合学生图谱标注：${weakByAnnotation.slice(0, 4).join("、")}` : "建议在图谱中标注薄弱/不确定节点，以便后续生成更精准周期。",
+      "证据要求覆盖 AI 对话、测试、错因修正、反思和学习产出，可直接进入学习档案。"
+    ],
+    generatedAt: now()
+  };
+  return normalizeLearningCycleRecord(suggestion, userId, suggestion.subject);
+}
+
+function upsertStudentLearningCycle(db, userId, body = {}) {
+  db.learningCycles = Array.isArray(db.learningCycles) ? db.learningCycles : [];
+  const template = findLearningCycleTemplate(body.templateKey);
+  const subject = normalizeSubject(body.subject || template?.subject || "");
+  let cycle = body.id
+    ? db.learningCycles.find((item) => item.id === String(body.id) && item.studentId === userId)
+    : db.learningCycles.find((item) => item.studentId === userId && item.status === "active");
+  if (!cycle) {
+    cycle = normalizeLearningCycleRecord({ ...(template || {}), studentId: userId, subject, createdAt: now() }, userId, subject);
+    db.learningCycles.unshift(cycle);
+  }
+  const source = template && body.applyTemplate ? { ...template } : {};
+  const next = normalizeLearningCycleRecord({
+    ...source,
+    ...cycle,
+    title: body.title !== undefined ? body.title : source.title || cycle.title,
+    subject: body.subject !== undefined ? body.subject : source.subject || cycle.subject,
+    startLabel: body.startLabel !== undefined ? body.startLabel : source.startLabel || cycle.startLabel,
+    endLabel: body.endLabel !== undefined ? body.endLabel : source.endLabel || cycle.endLabel,
+    startDate: body.startDate !== undefined ? body.startDate : cycle.startDate,
+    endDate: body.endDate !== undefined ? body.endDate : cycle.endDate,
+    goals: body.goals !== undefined ? body.goals : source.goals || cycle.goals,
+    templateKey: body.templateKey !== undefined ? body.templateKey : source.key || cycle.templateKey,
+    focusNodes: body.focusNodes !== undefined ? body.focusNodes : source.focusNodes || cycle.focusNodes,
+    weeklyPlan: body.weeklyPlan !== undefined ? body.weeklyPlan : source.weeklyPlan || cycle.weeklyPlan,
+    recommendedTestNodes: body.recommendedTestNodes !== undefined ? body.recommendedTestNodes : source.recommendedTestNodes || cycle.recommendedTestNodes,
+    viewMode: body.viewMode !== undefined ? body.viewMode : cycle.viewMode,
+    evidenceRequirements: body.evidenceRequirements !== undefined ? body.evidenceRequirements : source.evidenceRequirements || cycle.evidenceRequirements,
+    status: body.status !== undefined ? body.status : cycle.status,
+    manualTaskStatus: cycle.manualTaskStatus,
+    updatedAt: now()
+  }, userId, subject || cycle.subject);
+  Object.assign(cycle, next);
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "learning_cycle_update",
+    source: "learning-cycle",
+    subject: cycle.subject,
+    knowledgePoint: cycle.title,
+    payload: {
+      title: cycle.title,
+      range: [cycle.startLabel, cycle.endLabel].filter(Boolean).join(" 到 "),
+      goals: cycle.goals,
+      templateKey: cycle.templateKey,
+      focusNodes: cycle.focusNodes,
+      weeklyPlan: cycle.weeklyPlan,
+      recommendedTestNodes: cycle.recommendedTestNodes,
+      evidenceRequirements: cycle.evidenceRequirements
+    }
+  });
+  return cycle;
+}
+
+function updateLearningCycleTask(db, userId, body = {}) {
+  const cycle = upsertStudentLearningCycle(db, userId, { id: body.cycleId, subject: body.subject });
+  const key = String(body.taskKey || body.key || "").trim();
+  if (!key) throw Object.assign(new Error("请提供任务标识"), { status: 400 });
+  cycle.manualTaskStatus = cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {};
+  const status = LEARNING_CYCLE_TASK_STATUS_LABELS[body.status] ? body.status : "";
+  cycle.manualTaskStatus[key] = {
+    done: body.done === true || body.done === "true" || body.done === "1" || status === "done",
+    status: status || (body.done === true || body.done === "true" || body.done === "1" ? "done" : "not_started"),
+    note: String(body.note || "").trim().slice(0, 300),
+    updatedAt: now()
+  };
+  cycle.updatedAt = now();
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "learning_cycle_task",
+    source: "learning-cycle",
+    subject: cycle.subject,
+    knowledgePoint: cycle.title,
+    payload: { taskKey: key, ...cycle.manualTaskStatus[key] }
+  });
+  return cycle;
+}
+
+function nodeAnnotationScore(status = "") {
+  return {
+    mastered: 0.86,
+    uncertain: 0.55,
+    weak: 0.32,
+    learning: 0.62,
+    not_started: 0.18
+  }[status] ?? null;
+}
+
+function nodeAnnotationStatusLabel(status = "") {
+  return {
+    mastered: "已掌握",
+    uncertain: "不确定",
+    weak: "易错/薄弱",
+    learning: "正在学习",
+    not_started: "未开始"
+  }[status] || "正在学习";
+}
+
+function createStudentNodeAnnotation(db, userId, body = {}) {
+  db.studentNodeAnnotations = Array.isArray(db.studentNodeAnnotations) ? db.studentNodeAnnotations : [];
+  const graphId = String(body.graphId || "").trim();
+  const nodeId = String(body.nodeId || "").trim();
+  const nodeLabel = String(body.nodeLabel || body.knowledgePoint || "").trim().slice(0, 120);
+  if (!graphId || !nodeId || !nodeLabel) throw Object.assign(new Error("请先选择知识图谱节点"), { status: 400 });
+  const status = ["mastered", "uncertain", "weak", "learning", "not_started"].includes(body.status) ? body.status : "learning";
+  let annotation = db.studentNodeAnnotations.find((item) => item.studentId === userId && item.graphId === graphId && item.nodeId === nodeId);
+  if (!annotation) {
+    annotation = {
+      id: uid("nodeann"),
+      studentId: userId,
+      graphId,
+      nodeId,
+      createdAt: now()
+    };
+    db.studentNodeAnnotations.unshift(annotation);
+  }
+  Object.assign(annotation, {
+    subject: String(body.subject || "").trim().slice(0, 80),
+    graphTitle: String(body.graphTitle || "").trim().slice(0, 120),
+    nodeLabel,
+    favorite: body.favorite === true || body.favorite === "true" || body.favorite === "1",
+    status,
+    statusLabel: nodeAnnotationStatusLabel(status),
+    explanation: String(body.explanation || "").trim().slice(0, 1200),
+    evidenceType: String(body.evidenceType || "note").trim().slice(0, 40),
+    evidenceTitle: String(body.evidenceTitle || "").trim().slice(0, 120),
+    evidenceUrl: String(body.evidenceUrl || "").trim().slice(0, 300),
+    fromAiAnswer: body.fromAiAnswer === true || body.fromAiAnswer === "true" || body.fromAiAnswer === "1",
+    updatedAt: now()
+  });
+  db.studentNodeAnnotations = db.studentNodeAnnotations.slice(0, 2000);
+  const score = nodeAnnotationScore(status);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "graph_node_annotation",
+    source: "student-graph-construction",
+    subject: annotation.subject,
+    knowledgePoint: nodeLabel,
+    graphId,
+    nodeId,
+    score,
+    payload: {
+      status,
+      favorite: annotation.favorite,
+      explanation: annotation.explanation,
+      evidenceType: annotation.evidenceType,
+      evidenceTitle: annotation.evidenceTitle,
+      fromAiAnswer: annotation.fromAiAnswer
+    }
+  });
+  if (score !== null) {
+    setTopicMasteryScore(db, userId, nodeLabel, score, `学生图谱标注：${annotation.statusLabel}`);
+    syncStudentMasteryFromProfile(db, userId, [nodeLabel], {
+      subject: annotation.subject,
+      graphId,
+      nodeId,
+      lastEventId: learningEvent.id
+    });
+  }
+  return { annotation, learningEvent };
+}
+
+function defaultStudentEthicsSettings(userId) {
+  return {
+    studentId: userId,
+    aiUseDisclosure: true,
+    citationRequired: true,
+    uncertaintyNotice: true,
+    dataConsent: true,
+    anonymousExportDefault: true,
+    requireOriginalAnswerFirst: true,
+    allowTeacherPrivateConversationAccess: false,
+    aiFinalAnswerBlocked: true,
+    updatedAt: ""
+  };
+}
+
+function getStudentEthicsSettings(db, userId) {
+  db.studentEthicsSettings = Array.isArray(db.studentEthicsSettings) ? db.studentEthicsSettings : [];
+  return {
+    ...defaultStudentEthicsSettings(userId),
+    ...(db.studentEthicsSettings.find((item) => item.studentId === userId) || {})
+  };
+}
+
+function updateStudentEthicsSettings(db, userId, body = {}) {
+  db.studentEthicsSettings = Array.isArray(db.studentEthicsSettings) ? db.studentEthicsSettings : [];
+  let settings = db.studentEthicsSettings.find((item) => item.studentId === userId);
+  if (!settings) {
+    settings = defaultStudentEthicsSettings(userId);
+    db.studentEthicsSettings.unshift(settings);
+  }
+  [
+    "aiUseDisclosure",
+    "citationRequired",
+    "uncertaintyNotice",
+    "dataConsent",
+    "anonymousExportDefault",
+    "requireOriginalAnswerFirst",
+    "allowTeacherPrivateConversationAccess",
+    "aiFinalAnswerBlocked"
+  ].forEach((key) => {
+    if (body[key] !== undefined) settings[key] = body[key] === true || body[key] === "true" || body[key] === "1";
+  });
+  settings.updatedAt = now();
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "ethics_settings_update",
+    source: "ethics-settings",
+    subject: "",
+    knowledgePoint: "AI 使用规范与学术诚信",
+    payload: settings
+  });
+  return settings;
+}
+
+function requestStudentDataDeletion(db, userId, body = {}) {
+  db.studentDataDeletionRequests = Array.isArray(db.studentDataDeletionRequests) ? db.studentDataDeletionRequests : [];
+  const scopes = normalizeStringItems(body.scopes || body.scope || "learningEvents,studentReflections,aiAnswerReviews,studentNodeAnnotations", 12);
+  const request = {
+    id: uid("delreq"),
+    studentId: userId,
+    scopes,
+    reason: String(body.reason || "").trim().slice(0, 300),
+    status: "requested",
+    createdAt: now()
+  };
+  db.studentDataDeletionRequests.unshift(request);
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "data_deletion_request",
+    source: "privacy-center",
+    knowledgePoint: "个人学习数据管理",
+    payload: { scopes, reason: request.reason }
+  });
+  return request;
+}
+
+function buildPortfolioTimeline({ events = [], reflections = [], wrongNotes = [], submissions = [], conversations = [], agentRuns = [], aiReviews = [], nodeAnnotations = [] }) {
+  const items = [];
+  events.forEach((event) => {
+    items.push({
+      id: event.id,
+      type: reportEventLabel(event.eventType),
+      rawType: event.eventType,
+      time: event.occurredAt || event.createdAt,
+      title: event.knowledgePoint || reportEventLabel(event.eventType),
+      summary: reportCompactText(event.payload?.prompt || event.payload?.question || event.payload?.answer || event.payload?.evidence || event.payload?.analysis || event.source || "", 160),
+      score: scorePercentText(event.score, ""),
+      source: event.source || ""
+    });
+  });
+  reflections.forEach((item) => {
+    items.push({
+      id: item.id,
+      type: "结构化反思",
+      rawType: "structured_reflection",
+      time: item.createdAt,
+      title: item.knowledgePoint || item.contextTitle || "学习反思",
+      summary: reportCompactText([item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；"), 180),
+      score: "",
+      source: item.contextType || "reflection"
+    });
+  });
+  wrongNotes.forEach((note) => {
+    items.push({
+      id: note.id,
+      type: "错因修正",
+      rawType: "wrong_note",
+      time: note.createdAt,
+      title: note.topic || "错题",
+      summary: reportCompactText(note.analysis || note.recommendation || note.question || "", 160),
+      score: "",
+      source: note.source || "wrong-note"
+    });
+  });
+  submissions.forEach((submission) => {
+    items.push({
+      id: submission.id,
+      type: "作品/作业",
+      rawType: "homework_submission",
+      time: submission.submittedAt || submission.createdAt,
+      title: submission.title || submission.homeworkTitle || "作业提交",
+      summary: reportCompactText(submission.content || submission.answer || submission.feedback?.comment || "", 160),
+      score: scorePercentText(submission.score, ""),
+      source: reportStatusLabel(submission.status)
+    });
+  });
+  conversations.slice(0, 12).forEach((conv) => {
+    const latestUserMessage = [...(conv.messages || [])].reverse().find((message) => message.role === "user");
+    if (!latestUserMessage) return;
+    items.push({
+      id: conv.id,
+      type: "AI 对话",
+      rawType: "ai_conversation",
+      time: conv.updatedAt || latestUserMessage.createdAt,
+      title: conv.title || "AI 对话",
+      summary: reportCompactText(latestUserMessage.content || "", 150),
+      score: "",
+      source: conv.mode || ""
+    });
+  });
+  agentRuns.slice(0, 12).forEach((run) => {
+    items.push({
+      id: run.id,
+      type: "AI 工作流",
+      rawType: "agent_run",
+      time: run.createdAt,
+      title: (run.knowledgePoints || [])[0] || run.intent || "AI 工作流",
+      summary: reportCompactText(run.prompt || run.strategy || "", 150),
+      score: "",
+      source: run.confidence || ""
+    });
+  });
+  aiReviews.forEach((review) => {
+    items.push({
+      id: review.id,
+      type: "AI 审辩记录",
+      rawType: "ai_answer_review",
+      time: review.createdAt,
+      title: review.topic || review.reviewType || "AI 可信度评价",
+      summary: reportCompactText([review.reviewType, review.comment, review.finalJudgment, review.studentAction].filter(Boolean).join("；"), 160),
+      score: review.trustScore === null || review.trustScore === undefined ? "" : `${Math.round(Number(review.trustScore || 0) * 100)}%`,
+      source: review.accepted ? "采纳" : "待修正"
+    });
+  });
+  nodeAnnotations.forEach((annotation) => {
+    items.push({
+      id: annotation.id,
+      type: annotation.fromAiAnswer ? "AI 回答学习卡片" : "图谱节点标注",
+      rawType: "graph_node_annotation",
+      time: annotation.updatedAt || annotation.createdAt,
+      title: annotation.nodeLabel || "图谱节点",
+      summary: reportCompactText([annotation.statusLabel, annotation.explanation, annotation.evidenceTitle].filter(Boolean).join("；"), 180),
+      score: scorePercentText(nodeAnnotationScore(annotation.status), ""),
+      source: annotation.favorite ? "已收藏" : annotation.evidenceType || "node"
+    });
+  });
+  return sortNewest(items).slice(0, 120);
+}
+
+function buildInnovationSummary(subject = "课程", evidence = {}) {
+  const counts = evidence.counts || {};
+  const cycle = evidence.cycle || {};
+  const comparison = evidence.comparison || [];
+  const citationCount = Number(evidence.citationCount || 0);
+  const nodeAnnotationCount = Number(counts.nodeAnnotations || 0);
+  const learningOutputCount = Number(counts.learningOutputs || (Number(counts.homeworkOutputs || 0) + Number(counts.modelExperiments || 0) + nodeAnnotationCount));
+  const loopEvidence = [
+    `${Number(counts.aiDialogues || 0)} 次 AI 对话`,
+    `${Number(counts.knowledgeTests || 0)} 次知识测试`,
+    `${Number(counts.wrongNotes || 0) + Number(counts.corrections || 0)} 条错因/纠错`,
+    `${Number(counts.reflections || 0)} 份结构化反思`
+  ];
+  const points = [
+    {
+      key: "evidence_loop",
+      title: "证据驱动的 AI 自主学习闭环",
+      summary: "学生不是简单问 AI，而是在系统中完成“诊断-学习-测试-修正-反思-再诊断”的完整周期，每一步都形成可追踪证据。",
+      evidence: loopEvidence,
+      evaluationValue: "对应学习过程记录、学习成效证据和个人反思，能证明一个完整实施周期真实发生。"
+    },
+    {
+      key: "graph_path",
+      title: "知识图谱驱动的个性化学习路径",
+      summary: "系统把课程资料、知识点关系、常见误区和学生掌握度结合起来，围绕具体知识节点推荐学习路径，而不是泛泛聊天。",
+      evidence: [
+        `${citationCount} 条课程/图谱引用`,
+        `${nodeAnnotationCount} 条学生节点标注`,
+        `${(cycle.tasks || []).filter((task) => task.done).length}/${(cycle.tasks || []).length || 7} 个周期任务完成`
+      ],
+      evaluationValue: "把知识结构、学习画像和路径推荐连成闭环，突出学生在具体知识节点上的成长。"
+    },
+    {
+      key: "metacognition",
+      title: "AI 诊断与学生反思结合的元认知培养",
+      summary: "AI 不只给答案，还帮助学生发现误区、表达不确定性、制定下一步学习计划，推动学生从“获得答案”转向“管理自己的学习”。",
+      evidence: [
+        `${Number(counts.reflections || 0)} 份反思`,
+        `${Number(counts.aiWorkflowRuns || 0)} 次 AI 诊断/工作流`,
+        `${comparison.filter((item) => Number(item.change || 0) > 0).length} 个知识点出现掌握度提升`
+      ],
+      evaluationValue: "反思字段直接记录原理解、AI 发现、策略变化、不确定点和下一步计划，体现元认知发展。"
+    },
+    {
+      key: "critical_ai",
+      title: "学生参与校验 AI 的批判性学习机制",
+      summary: "学生可以纠正 AI 的知识点定位、标注回答是否可靠、查看引用来源，体现 Beyond AI：不是依赖 AI，而是学会审慎使用 AI。",
+      evidence: [
+        `${Number(counts.corrections || 0)} 条知识点纠正`,
+        `${Number(counts.aiReviews || 0)} 条 AI 审辩记录`,
+        `${citationCount} 条可追溯引用`
+      ],
+      evaluationValue: "把 AI 的不确定性、引用和学生校验显式纳入学习档案，回应规范性和可信度评审。"
+    },
+    {
+      key: "auto_portfolio",
+      title: "自动生成学习证据档案",
+      summary: "系统自动把 AI 对话、测试结果、错题、图谱节点、反思、作业和成果组织成学习档案，直接支持学习评价和案例申报。",
+      evidence: [
+        `${Number(counts.aiDialogues || 0) + Number(counts.knowledgeTests || 0) + Number(counts.reflections || 0) + learningOutputCount} 条核心证据`,
+        `${learningOutputCount} 个学习产出/节点证据`,
+        "支持 HTML/PDF/CSV/JSON 与匿名导出"
+      ],
+      evaluationValue: "减少人工整理申报材料的成本，让学习过程、成效变化和个人反思自动形成证据包。"
+    }
+  ];
+  return {
+    title: "证据驱动的 AI 学习闭环",
+    thesis: "不是让 AI 直接替学生学习，而是让 AI 在诊断、路径推荐、证据记录和反思引导中支持学生形成可持续的自主学习能力。",
+    loop: ["前测诊断", "学习目标设定", "AI + 知识图谱学习", "节点练习/作业", "错因修正", "后测与反思"],
+    positioning: "创新点不表述为“用了大模型、知识图谱或 Dify”，而表述为 AI 环境下学生自主学习能力、元认知和证据化评价方式的改变。",
+    points,
+    differentiators: points.map((point) => point.title),
+    subject
+  };
+}
+
+function averageNormalizedScore(values = []) {
+  const normalized = values.map(normalizeLearningScore).filter((value) => value !== null);
+  if (!normalized.length) return null;
+  return Number((normalized.reduce((sum, value) => sum + value, 0) / normalized.length).toFixed(4));
+}
+
+function effectPercentText(value, empty = "待形成") {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? empty : scorePercentText(normalized);
+}
+
+function learningGainText(start, current) {
+  if (start === null || current === null) return "待形成";
+  const gain = Number((current - start).toFixed(4));
+  return `${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%`;
+}
+
+function buildLearningEffectPanel({ comparison = [], events = [], wrongNotes = [], corrections = [], aiReviews = [], works = [], reflections = [], cycle = {} }) {
+  const comparable = comparison.filter((item) => item.start !== null && item.current !== null);
+  const startAverage = averageNormalizedScore(comparable.map((item) => item.start));
+  const currentAverage = averageNormalizedScore(comparable.map((item) => item.current));
+  const knowledgeTestEvents = events
+    .filter((event) => event.eventType === "knowledge_test_evaluate" && event.score !== null && event.score !== undefined)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+  const firstPracticeScore = normalizeLearningScore(knowledgeTestEvents[0]?.score);
+  const latestPracticeScore = normalizeLearningScore(knowledgeTestEvents[knowledgeTestEvents.length - 1]?.score);
+  const durationEvents = events
+    .filter((event) => Number.isFinite(Number(event.durationSeconds)) && Number(event.durationSeconds) > 0)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+  const firstDuration = durationEvents[0]?.durationSeconds ? Math.round(Number(durationEvents[0].durationSeconds) / 60) : null;
+  const latestDuration = durationEvents[durationEvents.length - 1]?.durationSeconds ? Math.round(Number(durationEvents[durationEvents.length - 1].durationSeconds) / 60) : null;
+  const strategyEvidence = reflections.filter((item) => item.originalUnderstanding && item.aiDiscovery && item.strategyChange);
+  const auditEvidence = aiReviews.filter((item) => /question|error|citation|partial|challenge|质疑|错误|引用|部分/.test(String(item.reviewType || item.comment || item.studentAction || "")));
+  const reviewTypeCounts = aiReviews.reduce((acc, item) => {
+    const key = item.reviewType || "未分类";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const resolvedMisconceptions = corrections.length;
+  const unresolvedMisconceptions = Math.max(0, wrongNotes.length - corrections.length);
+  const gain = startAverage !== null && currentAverage !== null ? Number((currentAverage - startAverage).toFixed(4)) : null;
+  const metrics = [
+    {
+      key: "mastery",
+      label: "知识点掌握度",
+      before: effectPercentText(startAverage),
+      after: effectPercentText(currentAverage),
+      change: learningGainText(startAverage, currentAverage),
+      evidence: `${comparable.length} 个知识点有前后记录`,
+      source: "前测/后测、AI 诊断、作业批改与掌握度快照"
+    },
+    {
+      key: "accuracy",
+      label: "正确率",
+      before: effectPercentText(firstPracticeScore),
+      after: effectPercentText(latestPracticeScore),
+      change: learningGainText(firstPracticeScore, latestPracticeScore),
+      evidence: `${knowledgeTestEvents.length} 次知识测试或练习验证`,
+      source: "知识测试提交记录"
+    },
+    {
+      key: "misconception",
+      label: "错因数量",
+      before: `${wrongNotes.length} 条记录`,
+      after: `${resolvedMisconceptions} 条已修正`,
+      change: unresolvedMisconceptions ? `仍有 ${unresolvedMisconceptions} 条待验证` : "已形成修正闭环",
+      evidence: `${wrongNotes.length} 条错因，${corrections.length} 条纠正`,
+      source: "错题本、知识点纠正、结构化反思"
+    },
+    {
+      key: "efficiency",
+      label: "学习效率",
+      before: firstDuration === null ? "待记录" : `${firstDuration} 分钟`,
+      after: latestDuration === null ? "待记录" : `${latestDuration} 分钟`,
+      change: firstDuration !== null && latestDuration !== null ? `${latestDuration <= firstDuration ? "减少" : "增加"} ${Math.abs(latestDuration - firstDuration)} 分钟` : "需要带时长的任务记录",
+      evidence: `${durationEvents.length} 条带时长学习事件`,
+      source: "测验、作业或学习事件 durationSeconds"
+    },
+    {
+      key: "strategy",
+      label: "学习策略",
+      before: "直接问答/等待解释",
+      after: `${strategyEvidence.length} 次先写原理解再让 AI 诊断`,
+      change: auditEvidence.length ? `${auditEvidence.length} 次质疑/核验 AI` : "审辩记录待补充",
+      evidence: `${reflections.length} 份反思，${aiReviews.length} 条 AI 审辩`,
+      source: "结构化反思、AI 审辩表单"
+    },
+    {
+      key: "output",
+      label: "作品产出",
+      before: "周期开始前待归档",
+      after: `${works.length} 个作品/实验/学习卡片`,
+      change: works.length ? "已有可展示产出" : "建议提交代码实验、学习笔记或项目报告",
+      evidence: works.slice(0, 4).map((item) => item.title).filter(Boolean).join("；") || "暂无作品证据",
+      source: "作业、模型实验、图谱节点卡片"
+    }
+  ];
+  return {
+    title: "前后对比学习成效",
+    learningGain: gain,
+    learningGainText: gain === null ? "待形成" : `${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%`,
+    summary: gain === null
+      ? "完成前测、后测和反思后自动计算学习增益。"
+      : `本周期平均掌握度从 ${effectPercentText(startAverage)} 到 ${effectPercentText(currentAverage)}，学习增益 ${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%。`,
+    metrics,
+    reviewTypeCounts,
+    evidenceSources: [
+      "前测/后测掌握度记录",
+      "练习与作业正确率",
+      "错题和知识点纠正",
+      "结构化反思",
+      "AI 审辩记录",
+      "代码实验、学习笔记和项目报告"
+    ],
+    cycleTitle: cycle.title || ""
+  };
+}
+
+function buildDeclarationApplicationSections(portfolio = {}) {
+  const cycle = portfolio.learningCycle || {};
+  const effect = portfolio.effectPanel || {};
+  const showcase = portfolio.showcase || {};
+  const graphPath = portfolio.graphRagProfileCoupling?.recommendedPath || [];
+  const reflectionSamples = portfolio.reflectionExcerpts || [];
+  return [
+    {
+      key: "problem",
+      title: "学习问题",
+      summary: showcase.background || `${portfolio.summary?.student?.name || "学生"} 在 ${portfolio.summary?.subject || "本课程"} 中需要把薄弱知识点、错因和学习策略变化变成可验证证据。`,
+      evidence: [
+        `${cycle.focusNodes?.length || 0} 个重点节点`,
+        `${cycle.evidenceCounts?.wrongNotes || 0} 条错因记录`,
+        `${portfolio.masteryComparison?.length || 0} 个掌握度对比点`
+      ]
+    },
+    {
+      key: "intervention",
+      title: "AI介入方案",
+      summary: showcase.intervention || "通过 GraphRAG 引用、知识图谱路径、AI 诊断、审辩记录和结构化反思支持学生自主学习。",
+      evidence: [
+        `${cycle.evidenceCounts?.aiDialogues || 0} 次 AI 对话`,
+        `${portfolio.graphRagProfileCoupling?.ragCitationCount || 0} 条 RAG/图谱引用`,
+        `${portfolio.aiReviews?.length || 0} 条 AI 审辩`
+      ]
+    },
+    {
+      key: "cycle",
+      title: "完整学习周期",
+      summary: `${cycle.title || "学习周期"}：${cycle.rangeText || "第 1 周 到 第 4 周"}；${cycle.requiredEvidenceText || "前测、目标、AI 学习、练习、修正、后测反思"}`,
+      evidence: (cycle.tasks || []).map((task) => `${task.label}：${task.statusText || task.statusLabel}`).slice(0, 6)
+    },
+    {
+      key: "effect",
+      title: "成效数据",
+      summary: effect.summary || "系统按前后测、正确率、错因修正、效率、学习策略和作品产出自动汇总成效。",
+      evidence: (effect.metrics || []).slice(0, 6).map((metric) => `${metric.label}：${metric.before} -> ${metric.after}（${metric.change}）`)
+    },
+    {
+      key: "reflection",
+      title: "个人反思",
+      summary: reflectionSamples[0]?.text || "学生记录原始理解、AI 发现、是否采纳、策略变化、下一步验证和避免过度依赖 AI 的做法。",
+      evidence: reflectionSamples.slice(0, 5).map((item) => `${item.topic}：${item.text}`)
+    },
+    {
+      key: "transfer",
+      title: "推广价值",
+      summary: showcase.transfer || "同一证据链可迁移到其他课程和小组协作场景，用统一模板记录学习周期、成效和规范使用 AI。",
+      evidence: [
+        `${portfolio.collaboration?.chatThreads || 0} 个协作会话`,
+        `${portfolio.works?.length || 0} 个作品证据`,
+        graphPath[0] ? `示例路径：${graphPath.slice(0, 3).map((item) => item.topic).join(" -> ")}` : "路径待生成"
+      ]
+    },
+    {
+      key: "ethics",
+      title: "伦理规范",
+      summary: [portfolio.ethics?.aiStatement, portfolio.ethics?.citationPolicy, portfolio.ethics?.privacyPolicy].filter(Boolean).join(" "),
+      evidence: [
+        portfolio.ethics?.settings?.anonymousExportDefault ? "默认匿名导出" : "可手动匿名导出",
+        portfolio.ethics?.settings?.citationRequired ? "要求引用来源" : "建议开启引用来源",
+        portfolio.ethics?.settings?.requireOriginalAnswerFirst ? "先作答再求助" : "建议开启先作答再求助"
+      ]
+    }
+  ];
+}
+
+function buildVideoScriptOutline(portfolio = {}) {
+  const cycle = portfolio.learningCycle || {};
+  const effect = portfolio.effectPanel || {};
+  return [
+    { time: "0:00-0:25", shot: "学生端学习周期驾驶舱", narration: `说明学习问题和本周期主题：${cycle.title || "完整学习周期"}`, evidence: cycle.focusNodes?.slice(0, 4).join("、") || "学习目标" },
+    { time: "0:25-1:05", shot: "前测诊断与目标设定", narration: "展示前测掌握度、典型误区、学生原始理解和 2-3 个学习目标。", evidence: cycle.tasks?.slice(0, 2).map((task) => task.statusText).join("；") || "" },
+    { time: "1:05-1:55", shot: "AI 三栏学习工作台", narration: "展示知识图谱路径、AI 诊断回答、引用来源、学生审辩和最终判断。", evidence: `${cycle.evidenceCounts?.aiDialogues || 0} 次 AI 对话，${cycle.evidenceCounts?.aiReviews || 0} 条审辩` },
+    { time: "1:55-2:35", shot: "节点练习/作业与错因修正", narration: "展示练习正确率、错题、误区修正解释和二次验证。", evidence: `${cycle.evidenceCounts?.knowledgeTests || 0} 次测试，${cycle.evidenceCounts?.wrongNotes || 0} 条错因` },
+    { time: "2:35-3:15", shot: "前后对比成效面板", narration: `展示学习增益、正确率变化、策略变化和作品产出。${effect.learningGainText ? `学习增益 ${effect.learningGainText}` : ""}`, evidence: effect.summary || "" },
+    { time: "3:15-3:45", shot: "个人反思与伦理规范", narration: "展示学生如何判断 AI、如何避免过度依赖、如何保留引用和匿名导出。", evidence: `${portfolio.reflections?.length || 0} 份反思，${portfolio.aiReviews?.length || 0} 条审辩` },
+    { time: "3:45-4:30", shot: "学习周期申报页与导出", narration: "打开固定七段申报页，导出匿名证据包、申报表素材和视频脚本。", evidence: "学习问题 -> AI介入方案 -> 完整学习周期 -> 成效数据 -> 个人反思 -> 推广价值 -> 伦理规范" }
+  ];
+}
+
+function buildDeclarationEvidencePack({ portfolio, events = [], citations = [], aiReviews = [] }) {
+  const comparison = portfolio.masteryComparison || [];
+  const counts = portfolio.learningCycle?.evidenceCounts || {};
+  const masteryChart = comparison.slice(0, 8).map((item) => ({
+    topic: item.topic,
+    start: item.start,
+    current: item.current,
+    change: item.change,
+    startText: item.startText,
+    currentText: item.currentText,
+    changeText: item.changeText
+  }));
+  const eventTypeCounts = {};
+  events.forEach((event) => {
+    const label = reportEventLabel(event.eventType);
+    eventTypeCounts[label] = (eventTypeCounts[label] || 0) + 1;
+  });
+  const citationSources = {};
+  citations.forEach((citation) => {
+    const key = citation.sourceName || citation.title || citation.id || "未知来源";
+    citationSources[key] = (citationSources[key] || 0) + 1;
+  });
+  return {
+    title: "个人学习档案自动生成申报证据包",
+    ready: Boolean((portfolio.timeline || []).length || comparison.length || (portfolio.reflections || []).length),
+    processTimeline: (portfolio.timeline || []).slice(0, 20),
+    masteryChart,
+    eventTypeCounts,
+    evidenceCounts: counts,
+    cycleTasks: (portfolio.learningCycle?.tasks || []).map((task) => ({
+      key: task.key,
+      label: task.label,
+      statusText: task.statusText,
+      statusLabel: task.statusLabel,
+      done: task.done,
+      evidenceType: task.evidenceType,
+      evidence: task.evidence
+    })),
+    cycleCompletionReport: portfolio.learningCycle?.completionReport || {},
+    cycleRequirements: portfolio.learningCycle?.evidenceRequirements || {},
+    innovationPoints: (portfolio.innovation?.points || []).map((point) => ({
+      title: point.title,
+      summary: point.summary,
+      evidence: point.evidence,
+      evaluationValue: point.evaluationValue
+    })),
+    aiDialogueSummary: (portfolio.aiSupportRecords || []).slice(0, 8).map((item) => ({
+      topic: item.topic,
+      prompt: item.prompt,
+      citations: item.citations,
+      confidence: item.confidence
+    })),
+    reflectionSamples: (portfolio.reflectionExcerpts || []).slice(0, 5),
+    correctionRecords: (portfolio.corrections || []).slice(0, 8),
+    aiReviewRecords: aiReviews.slice(0, 8),
+    applicationSections: buildDeclarationApplicationSections(portfolio),
+    videoScriptOutline: buildVideoScriptOutline(portfolio),
+    effectPanel: portfolio.effectPanel || {},
+    citationSources: Object.entries(citationSources).map(([source, count]) => ({ source, count })).slice(0, 12),
+    anonymization: "可导出匿名版，隐藏学生姓名、ID 和真实班级，仅保留过程证据与统计摘要。",
+    exportMaterials: ["学习过程时间线", "前后测对比图", "错因修正记录", "AI 对话与引用摘要", "学生反思摘录", "匿名化学习档案", "申报表素材 JSON/HTML/PDF", "3-5 分钟视频脚本提纲"]
+  };
+}
+
+function buildStudentPortfolio(db, userId, options = {}) {
+  const user = ensureUser(db, userId);
+  const anonymous = Boolean(options.anonymous);
+  const events = sortNewest((db.learningEvents || []).filter((event) => event.studentId === userId));
+  const diagnoses = sortNewest((db.diagnosisResults || []).filter((item) => item.studentId === userId));
+  const mastery = sortNewest((db.studentMastery || []).filter((item) => item.studentId === userId));
+  const reflections = sortNewest((db.studentReflections || []).filter((item) => item.studentId === userId));
+  const corrections = sortNewest((db.knowledgeCorrections || []).filter((item) => item.studentId === userId));
+  const aiReviews = sortNewest((db.aiAnswerReviews || []).filter((item) => item.studentId === userId));
+  const nodeAnnotations = sortNewest((db.studentNodeAnnotations || []).filter((item) => item.studentId === userId));
+  const ethicsSettings = getStudentEthicsSettings(db, userId);
+  const wrongNotes = sortNewest((db.wrongNotes || []).filter((item) => item.userId === userId));
+  const conversations = sortNewest((db.conversations || []).filter((item) => item.userId === userId));
+  const submissions = sortNewest((db.submissions || []).filter((item) => item.studentId === userId).map((submission) => {
+    const homework = (db.homework || []).find((item) => item.id === submission.homeworkId);
+    return { ...submission, title: homework?.title || submission.title || "作业提交", homeworkTitle: homework?.title || "" };
+  }));
+  const agentRuns = sortNewest((db.agentRuns || []).filter((item) => item.userId === userId));
+  const models = sortNewest((db.models || []).filter((item) => item.ownerId === userId));
+  const subject = inferPortfolioSubject(db, userId, events);
+  const comparison = buildMasteryComparison(events, mastery);
+  const evidenceCounts = {
+    aiDialogues: conversations.length,
+    aiWorkflowRuns: agentRuns.length,
+    knowledgeTests: events.filter((event) => event.eventType === "knowledge_test_evaluate").length,
+    masteryChanges: comparison.filter((item) => item.change !== null && item.change !== 0).length,
+    wrongNotes: wrongNotes.length,
+    reflections: reflections.length,
+    homeworkOutputs: submissions.length,
+    modelExperiments: models.length,
+    corrections: corrections.length,
+    aiReviews: aiReviews.length,
+    nodeAnnotations: nodeAnnotations.length,
+    learningCycles: (db.learningCycles || []).filter((item) => item.studentId === userId && item.status !== "archived").length,
+    learningCards: nodeAnnotations.filter((item) => item.fromAiAnswer).length,
+    learningOutputs: submissions.length + models.length + nodeAnnotations.length
+  };
+  const cycleView = buildLearningCycleView(db, userId, subject, evidenceCounts);
+  const stage = cycleView.currentStage || portfolioStage(evidenceCounts);
+  const timeline = buildPortfolioTimeline({ events, reflections, wrongNotes, submissions, conversations, agentRuns, aiReviews, nodeAnnotations });
+  const latestDiagnosis = diagnoses[0] || null;
+  const aiSupportRecords = agentRuns.slice(0, 10).map((run) => ({
+    id: run.id,
+    time: run.createdAt,
+    topic: (run.knowledgePoints || [])[0] || run.intent || "待定位",
+    prompt: reportCompactText(run.prompt || "", 140),
+    help: run.strategy || "课程资料 + 图谱 + 诊断工作流",
+    citations: Array.isArray(run.citations) ? run.citations.slice(0, 5).map((item) => item.sourceName || item.title || item.id).filter(Boolean) : [],
+    adopted: "已归档到学习事件，可在反思卡中记录是否采纳。",
+    confidence: run.workflowResult?.topic_localization?.confidenceLabel || run.confidence || ""
+  }));
+  const allCitations = agentRuns.flatMap((run) => Array.isArray(run.citations) ? run.citations : []);
+  const works = submissions.slice(0, 10).map((submission) => ({
+    id: submission.id,
+    type: "作业/项目",
+    title: submission.title || "作业提交",
+    time: submission.submittedAt || submission.createdAt,
+    status: reportStatusLabel(submission.status),
+    score: scorePercentText(submission.score, "未评分"),
+    summary: reportCompactText(submission.content || submission.answer || submission.feedback?.comment || "", 160)
+  })).concat(models.slice(0, 8).map((model) => ({
+    id: model.id,
+    type: "代码实验",
+    title: model.name || "模型实验",
+    time: model.updatedAt || model.createdAt,
+    status: model.mode || "实验记录",
+    score: "",
+    summary: reportCompactText(model.notes || model.experiment?.summary || "", 160)
+  }))).concat(nodeAnnotations.slice(0, 12).map((annotation) => ({
+    id: annotation.id,
+    type: annotation.fromAiAnswer ? "AI 学习卡片" : "图谱标注",
+    title: annotation.nodeLabel || annotation.evidenceTitle || "节点证据",
+    time: annotation.updatedAt || annotation.createdAt,
+    status: [annotation.statusLabel, annotation.favorite ? "已收藏" : ""].filter(Boolean).join(" · "),
+    score: scorePercentText(nodeAnnotationScore(annotation.status), ""),
+    summary: reportCompactText(annotation.explanation || annotation.evidenceTitle || "学生主动建构的节点证据", 160)
+  })));
+  const misconceptionTrajectory = wrongNotes.slice(0, 12).map((note) => {
+    const relatedDiagnosis = diagnoses.find((item) => item.topic === note.topic || (item.missingPoints || []).some((point) => String(point).includes(note.topic)));
+    return {
+      topic: note.topic || "待归类",
+      before: reportCompactText(note.question || relatedDiagnosis?.finalAnswer || "原始理解存在缺口", 120),
+      issue: reportCompactText(note.analysis || (relatedDiagnosis?.missingPoints || []).join("；") || "等待补充错因", 140),
+      after: reportCompactText(note.recommendation || "完成同类题、重写解释并在反思中记录修正策略。", 140),
+      time: note.createdAt
+    };
+  });
+  const userChatThreads = (db.chatThreads || []).filter((thread) => (thread.memberIds || []).includes(userId));
+  const collaborationMessages = userChatThreads.flatMap((thread) => (thread.messages || []).map((message) => ({ ...message, threadTitle: thread.title || thread.name || "小组讨论" })));
+  const collaboration = {
+    classes: classNamesForUser(db, user),
+    chatThreads: userChatThreads.length,
+    messages: collaborationMessages.filter((msg) => msg.senderId === userId).length,
+    contributionHint: "可用于小组共学任务、共享图谱、成员贡献和共识总结。",
+    groupSpace: {
+      title: "小组共学最小闭环",
+      graphCoBuild: `${nodeAnnotations.length} 条本人图谱标注/学习卡片，可作为小组共建知识图谱的贡献记录。`,
+      questionPool: wrongNotes.slice(0, 6).map((note) => note.topic || note.question || "待归类问题"),
+      roles: [
+        { role: "提问者", evidence: conversations.length ? `${conversations.length} 次学习对话` : "待通过问题池补充" },
+        { role: "验证者", evidence: aiReviews.length ? `${aiReviews.length} 条 AI 审辩` : "待补充引用核验" },
+        { role: "总结者", evidence: reflections.length ? `${reflections.length} 份结构化反思` : "待补充小组总结" },
+        { role: "代码实验者", evidence: models.length ? `${models.length} 个模型实验` : "可由模型实验室补充" }
+      ],
+      aiDiscussionSummary: collaborationMessages.length
+        ? reportCompactText(collaborationMessages.slice(-8).map((msg) => msg.content || msg.text || "").join("；"), 220)
+        : "暂无小组讨论消息，可在班级或站内消息中围绕问题池开展轻量协作。",
+      peerReview: submissions.length ? `${submissions.length} 次作业/项目提交可用于同伴互评。` : "可在作业提交后加入同伴互评与贡献记录。",
+      timeline: collaborationMessages.slice(-8).map((msg) => ({
+        time: msg.createdAt || msg.time || "",
+        title: msg.threadTitle || "小组讨论",
+        summary: reportCompactText(msg.content || msg.text || "", 120)
+      }))
+    }
+  };
+  const reflectionExcerpts = reflections.slice(0, 5).map((item) => ({
+    time: item.createdAt,
+    topic: item.knowledgePoint || item.contextTitle || "学习反思",
+    text: reportCompactText(item.strategyChange || item.aiAgreement || item.aiDiscovery || item.aiLimitation || item.nextPlan || item.originalUnderstanding || "", 180)
+  }));
+  const summary = {
+    student: anonymous ? { id: "S001", name: "匿名学生", classes: classNamesForUser(db, user).map((_, index) => `班级${index + 1}`) } : { id: user.id, name: user.name, classes: classNamesForUser(db, user) },
+    subject,
+    generatedAt: now(),
+    latestActivity: timeline[0]?.time || "",
+    averageMastery: mastery.length
+      ? Number((mastery.reduce((sum, item) => sum + Number(normalizeLearningScore(item.score) || 0), 0) / mastery.length).toFixed(4))
+      : null,
+    latestDiagnosis: latestDiagnosis ? {
+      topic: latestDiagnosis.topic,
+      score: latestDiagnosis.masteryScore,
+      level: latestDiagnosis.masteryLevel,
+      time: latestDiagnosis.createdAt
+    } : null
+  };
+  const innovation = buildInnovationSummary(subject, {
+    counts: evidenceCounts,
+    cycle: cycleView,
+    comparison,
+    citationCount: allCitations.length
+  });
+  const pathSource = comparison.length
+    ? comparison
+    : (cycleView.focusNodes || []).map((topic) => ({
+      topic,
+      current: null,
+      currentText: "未诊断",
+      changeText: "待形成"
+    }));
+  const recommendedPath = pathSource.slice(0, 6).map((item, index) => {
+    const current = item.current === null || item.current === undefined ? null : Number(item.current);
+    const weak = current === null || current < 0.58;
+    const previous = (cycleView.focusNodes || [])[Math.max(0, index - 1)] || "本章基础概念";
+    const next = (cycleView.focusNodes || [])[index + 1] || (cycleView.recommendedTestNodes || [])[0] || "同知识点变式题";
+    return {
+      topic: item.topic,
+      current,
+      action: weak ? "先补前置并完成同类题" : "做变式后测并写反思",
+      why: weak
+        ? `当前掌握度${item.currentText || "未诊断"}，应优先补齐该节点再进入后续任务。`
+        : `该节点已有学习证据，适合作为后测或迁移任务的验证点。`,
+      misconceptionRelation: wrongNotes.some((note) => {
+        const noteTopic = String(note.topic || "").trim();
+        const pathTopic = String(item.topic || "").trim();
+        return Boolean(noteTopic && pathTopic && (noteTopic.includes(pathTopic) || pathTopic.includes(noteTopic)));
+      })
+        ? "错题本中已有相关误区，学习时需要对照修正解释。"
+        : "暂无显式错题，可通过前测或 AI 诊断确认是否存在隐性误区。",
+      prerequisites: [previous].filter(Boolean),
+      verification: weak ? "完成一道同知识点变式题，并写下修正后的解释。" : "完成一次后测题或小型代码/笔记产出。",
+      fallback: `仍未掌握时，回到「${previous}」或补学「${next}」。`,
+      evidenceSource: item.evidenceCount ? `${item.evidenceCount} 条掌握度证据` : "学习周期目标与图谱节点"
+    };
+  });
+  const graphRagProfileCoupling = {
+    title: "GraphRAG + 学习画像双向驱动",
+    description: "AI 回答绑定课程资料和知识图谱；学习行为回写学生画像；画像反过来影响路径推荐；图谱节点成为学习证据索引。",
+    graphEvidenceCount: allCitations.filter((item) => item.type === "graph" || item.graphId || item.nodeId).length,
+    ragCitationCount: allCitations.length,
+    profileEvidenceCount: mastery.reduce((sum, item) => sum + Number(item.evidenceCount || 0), 0) + nodeAnnotations.length,
+    weakDrivenTopics: comparison.filter((item) => Number(item.current || 0) < 0.58).slice(0, 6).map((item) => item.topic),
+    recommendedPath
+  };
+  const cycleCompletionReport = buildLearningCycleCompletionReport({
+    cycle: cycleView,
+    comparison,
+    wrongNotes,
+    reflections,
+    citations: allCitations,
+    counts: evidenceCounts,
+    ethicsSettings
+  });
+  const effectPanel = buildLearningEffectPanel({
+    comparison,
+    events,
+    wrongNotes,
+    corrections,
+    aiReviews,
+    works,
+    reflections,
+    cycle: cycleView
+  });
+  const portfolio = {
+    summary,
+    learningCycle: {
+      ...cycleView,
+      subject: cycleView.subject || subject,
+      goals: cycleView.goals?.length ? cycleView.goals : portfolioGoalsForSubject(subject),
+      currentStage: stage,
+      evidenceCounts,
+      evidenceLoop: innovation.loop,
+      completionReport: cycleCompletionReport
+    },
+    innovation,
+    graphRagProfileCoupling,
+    effectPanel,
+    timeline,
+    masteryComparison: comparison,
+    aiSupportRecords,
+    works,
+    misconceptionTrajectory,
+    reflections,
+    reflectionExcerpts,
+    corrections,
+    aiReviews,
+    nodeAnnotations,
+    collaboration,
+    ethics: {
+      settings: ethicsSettings,
+      aiStatement: ethicsSettings.aiUseDisclosure
+        ? "对话、诊断、资料引用和学习建议由 AI 辅助生成；最终答案、反思与作品提交由学生确认。"
+        : "学生尚未开启 AI 使用声明展示，建议在参赛材料中显式说明 AI 辅助边界。",
+      citationPolicy: ethicsSettings.citationRequired
+        ? "AI 回答必须展示引用来源；没有引用或低置信度时仅作为待确认学习事件。"
+        : "当前允许不强制引用，建议比赛演示时开启引用来源记录。",
+      privacyPolicy: ethicsSettings.dataConsent
+        ? "导出时可匿名化学生姓名、ID 和班级；教师端默认以统计和证据摘要为主。"
+        : "学生尚未授权将个人学习数据用于档案展示，只保留本地个人可见记录。",
+      integrityMode: ethicsSettings.requireOriginalAnswerFirst
+        ? "推荐先作答再求助，诊断时要求保留学生原始理解，AI 生成内容不直接作为最终答案。"
+        : "当前未强制先作答再求助，建议在正式实施周期中启用。"
+    },
+    showcase: {
+      background: `${summary.student.name} 在 ${subject} 学习中围绕核心概念、错因修正和反思形成证据链。`,
+      intervention: "知识图谱、GraphRAG 引用、AI 诊断、知识测试、错题修正、结构化反思和学习档案导出。",
+      period: "4 周学习周期，可用于小样本深描或班级推广。",
+      effect: {
+        prePostTopics: comparison.length,
+        masteryImproved: comparison.filter((item) => Number(item.change || 0) > 0).length,
+        wrongNotes: wrongNotes.length,
+        reflections: reflections.length,
+        evidenceEvents: events.length,
+        learningGain: effectPanel.learningGain,
+        learningGainText: effectPanel.learningGainText
+      },
+      reflectionExcerpts,
+      transfer: "同一证据链可迁移到其他课程：前测、AI 学习、图谱节点、测试、错因、反思、后测、导出。",
+      norms: "保留引用、不确定性提示、学生授权、匿名导出和知识点定位纠错。"
+    },
+    exports: ["html", "pdf", "csv", "json", "application", "script"]
+  };
+  portfolio.declarationEvidencePack = buildDeclarationEvidencePack({ portfolio, events, citations: allCitations, aiReviews });
+  return portfolio;
+}
+
+function studentPortfolioJson(portfolio) {
+  return JSON.stringify(portfolio, null, 2);
+}
+
+function studentPortfolioCsv(portfolio) {
+  const rows = [
+    ["section", "time", "type", "topic", "score", "summary"],
+    ...portfolio.timeline.map((item) => ["timeline", reportDate(item.time), item.type, item.title, item.score, item.summary]),
+    ...portfolio.masteryComparison.map((item) => ["mastery", reportDate(item.lastAt), "前后测对比", item.topic, item.currentText, `起始 ${item.startText}，变化 ${item.changeText}`]),
+    ...portfolio.reflections.map((item) => ["reflection", reportDate(item.createdAt), "结构化反思", item.knowledgePoint || item.contextTitle || "", "", [item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；")]),
+    ...(portfolio.aiReviews || []).map((item) => ["ai_review", reportDate(item.createdAt), item.reviewType, item.topic || "", item.trustScore === null || item.trustScore === undefined ? "" : `${Math.round(Number(item.trustScore || 0) * 100)}%`, item.comment || item.studentAction || ""]),
+    ...((portfolio.innovation?.points || []).map((item) => ["innovation", reportDate(portfolio.summary.generatedAt), "教育创新点", item.title, "", [item.summary, ...(item.evidence || []), item.evaluationValue].filter(Boolean).join("；")])),
+    ...((portfolio.declarationEvidencePack?.exportMaterials || []).map((item) => ["evidence_pack", reportDate(portfolio.summary.generatedAt), "申报材料", item, "", portfolio.declarationEvidencePack?.anonymization || ""]))
+  ];
+  return rows.map((row) => row.map(csvCell).join(",")).join("\n");
+}
+
+function studentPortfolioHtml(portfolio, options = {}) {
+  const printScript = options.print ? `<script>window.addEventListener("load",()=>setTimeout(()=>window.print(),300));</script>` : "";
+  const stats = portfolio.learningCycle.evidenceCounts;
+  const statRows = [
+    ["AI 对话", stats.aiDialogues],
+    ["知识测试", stats.knowledgeTests],
+    ["掌握变化", stats.masteryChanges],
+    ["错题", stats.wrongNotes],
+    ["反思", stats.reflections],
+    ["作品/实验", stats.learningOutputs || (stats.homeworkOutputs + stats.modelExperiments)]
+  ];
+  const tableRows = (rows, columns) => rows.length
+    ? rows.map((row) => `<tr>${columns.map((column) => `<td>${reportHtmlEscape(row[column] ?? "")}</td>`).join("")}</tr>`).join("")
+    : `<tr><td colspan="${columns.length}">暂无记录</td></tr>`;
+  const innovationRows = (portfolio.innovation?.points || []).map((point, index) => ({
+    序号: index + 1,
+    创新点: point.title,
+    教育价值: point.summary,
+    证据指标: (point.evidence || []).join("；"),
+    申报对应: point.evaluationValue || ""
+  }));
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>学生学习证据档案</title>
+  <style>
+    body{font-family:"Microsoft YaHei",Arial,sans-serif;margin:0;color:#172033;background:#f6f8fb;}
+    main{max-width:1080px;margin:0 auto;padding:34px;}
+    section{background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px;margin:0 0 18px;}
+    h1,h2,h3,p{margin:0;} h1{font-size:30px;} h2{font-size:20px;margin-bottom:12px;} p{line-height:1.7;color:#536476;}
+    .hero{display:grid;grid-template-columns:1.4fr .8fr;gap:18px;align-items:start;}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px;}
+    .stat{border:1px solid #edf2f7;border-radius:8px;padding:12px;background:#f8fafc;} .stat strong{display:block;font-size:24px;}
+    table{width:100%;border-collapse:collapse;font-size:14px;} th,td{border-bottom:1px solid #edf2f7;text-align:left;vertical-align:top;padding:10px;} th{color:#536476;background:#f8fafc;}
+    .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;} .chips span{border:1px solid #dfe7f1;border-radius:999px;padding:7px 10px;background:#f8fafc;}
+    @media print{body{background:#fff;} main{padding:0;} section{break-inside:avoid;box-shadow:none;}}
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <div>
+      <h1>${reportHtmlEscape(portfolio.summary.student.name)}学习证据档案</h1>
+      <p>${reportHtmlEscape(portfolio.learningCycle.title)} · 当前阶段：${reportHtmlEscape(portfolio.learningCycle.currentStage.activeLabel)} · 生成时间：${reportDate(portfolio.summary.generatedAt)}</p>
+      <div class="chips">${portfolio.learningCycle.goals.map((goal) => `<span>${reportHtmlEscape(goal)}</span>`).join("")}</div>
+    </div>
+    <div class="stats">${statRows.map(([label, value]) => `<div class="stat"><strong>${reportHtmlEscape(value)}</strong><span>${reportHtmlEscape(label)}</span></div>`).join("")}</div>
+  </section>
+  <section><h2>${reportHtmlEscape(portfolio.innovation?.title || "证据驱动的 AI 学习闭环")}</h2><p>${reportHtmlEscape(portfolio.innovation?.thesis || "")}</p><p>${reportHtmlEscape(portfolio.innovation?.positioning || "")}</p><div class="chips">${(portfolio.innovation?.loop || []).map((item) => `<span>${reportHtmlEscape(item)}</span>`).join("")}</div></section>
+  <section><h2>五个教育创新点</h2><table><thead><tr><th>序号</th><th>创新点</th><th>教育价值</th><th>证据指标</th><th>申报对应</th></tr></thead><tbody>${tableRows(innovationRows, ["序号", "创新点", "教育价值", "证据指标", "申报对应"])}</tbody></table></section>
+  <section><h2>GraphRAG + 学习画像</h2><p>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.description || "")}</p><div class="stats"><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.ragCitationCount || 0)}</strong><span>RAG 引用</span></div><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.graphEvidenceCount || 0)}</strong><span>图谱证据</span></div><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.profileEvidenceCount || 0)}</strong><span>画像证据</span></div></div></section>
+  <section><h2>学习时间线</h2><table><thead><tr><th>时间</th><th>类型</th><th>主题</th><th>分数</th><th>摘要</th></tr></thead><tbody>${tableRows(portfolio.timeline.slice(0, 60).map((item) => ({ 时间: reportDate(item.time), 类型: item.type, 主题: item.title, 分数: item.score, 摘要: item.summary })), ["时间", "类型", "主题", "分数", "摘要"])}</tbody></table></section>
+  <section><h2>前测/后测与掌握度变化</h2><table><thead><tr><th>知识点</th><th>起始</th><th>当前</th><th>变化</th><th>证据数</th></tr></thead><tbody>${tableRows(portfolio.masteryComparison.map((item) => ({ 知识点: item.topic, 起始: item.startText, 当前: item.currentText, 变化: item.changeText, 证据数: item.evidenceCount })), ["知识点", "起始", "当前", "变化", "证据数"])}</tbody></table></section>
+  <section><h2>AI 支持记录</h2><table><thead><tr><th>时间</th><th>知识点</th><th>帮助方式</th><th>引用</th><th>采纳</th></tr></thead><tbody>${tableRows(portfolio.aiSupportRecords.map((item) => ({ 时间: reportDate(item.time), 知识点: item.topic, 帮助方式: item.help, 引用: item.citations.join("、"), 采纳: item.adopted })), ["时间", "知识点", "帮助方式", "引用", "采纳"])}</tbody></table></section>
+  <section><h2>AI 审辩记录</h2><table><thead><tr><th>时间</th><th>知识点</th><th>类型</th><th>可信度</th><th>说明</th></tr></thead><tbody>${tableRows((portfolio.aiReviews || []).map((item) => ({ 时间: reportDate(item.createdAt), 知识点: item.topic, 类型: item.reviewType, 可信度: item.trustScore === null || item.trustScore === undefined ? "" : `${Math.round(Number(item.trustScore || 0) * 100)}%`, 说明: item.comment || item.studentAction || "" })), ["时间", "知识点", "类型", "可信度", "说明"])}</tbody></table></section>
+  <section><h2>作品证据</h2><table><thead><tr><th>时间</th><th>类型</th><th>标题</th><th>状态</th><th>摘要</th></tr></thead><tbody>${tableRows(portfolio.works.map((item) => ({ 时间: reportDate(item.time), 类型: item.type, 标题: item.title, 状态: [item.status, item.score].filter(Boolean).join(" · "), 摘要: item.summary })), ["时间", "类型", "标题", "状态", "摘要"])}</tbody></table></section>
+  <section><h2>错因变化与个人反思</h2><table><thead><tr><th>时间</th><th>主题</th><th>原理解/发现/判断/策略/计划</th></tr></thead><tbody>${tableRows(portfolio.reflections.map((item) => ({ 时间: reportDate(item.createdAt), 主题: item.knowledgePoint || item.contextTitle || "学习反思", "原理解/发现/判断/策略/计划": [item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；") })), ["时间", "主题", "原理解/发现/判断/策略/计划"])}</tbody></table></section>
+  <section><h2>申报证据包</h2><p>${reportHtmlEscape(portfolio.declarationEvidencePack?.anonymization || "")}</p><div class="chips">${(portfolio.declarationEvidencePack?.exportMaterials || []).map((item) => `<span>${reportHtmlEscape(item)}</span>`).join("")}</div></section>
+  <section><h2>规范机制</h2><p>${reportHtmlEscape(portfolio.ethics.aiStatement)}</p><p>${reportHtmlEscape(portfolio.ethics.citationPolicy)}</p><p>${reportHtmlEscape(portfolio.ethics.privacyPolicy)}</p></section>
+</main>${printScript}</body></html>`;
+}
+
+function studentPortfolioApplicationJson(portfolio) {
+  return JSON.stringify({
+    title: `${portfolio.learningCycle?.title || "学习周期"}申报表素材`,
+    generatedAt: portfolio.summary?.generatedAt || now(),
+    student: portfolio.summary?.student,
+    subject: portfolio.summary?.subject,
+    sections: portfolio.declarationEvidencePack?.applicationSections || buildDeclarationApplicationSections(portfolio),
+    effectPanel: portfolio.effectPanel,
+    evidencePack: portfolio.declarationEvidencePack,
+    exports: portfolio.exports
+  }, null, 2);
+}
+
+function studentPortfolioVideoScript(portfolio) {
+  const outline = portfolio.declarationEvidencePack?.videoScriptOutline || buildVideoScriptOutline(portfolio);
+  const lines = [
+    `# 3-5 分钟展示视频脚本提纲`,
+    "",
+    `案例：${portfolio.learningCycle?.title || "AI 支持的完整学习周期"}`,
+    `学生：${portfolio.summary?.student?.name || "匿名学生"} · 学科：${portfolio.summary?.subject || ""}`,
+    "",
+    ...outline.flatMap((item, index) => [
+      `## ${index + 1}. ${item.time} ${item.shot}`,
+      `旁白：${item.narration}`,
+      `证据：${item.evidence || "待补充"}`,
+      ""
+    ])
+  ];
+  return lines.join("\n");
+}
+
+function buildStudentPortfolioExportPayload(db, userId, format = "json", options = {}) {
+  const portfolio = buildStudentPortfolio(db, userId, options);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const normalizedFormat = ["json", "csv", "html", "pdf", "application", "script"].includes(String(format).toLowerCase()) ? String(format).toLowerCase() : "json";
+  const anonymized = options.anonymous ? "-anonymous" : "";
+  if (normalizedFormat === "csv") return { format: "csv", fileName: `student-portfolio${anonymized}-${stamp}.csv`, mime: "text/csv;charset=utf-8", content: studentPortfolioCsv(portfolio), portfolio };
+  if (normalizedFormat === "application") return { format: "application", fileName: `application-material${anonymized}-${stamp}.json`, mime: "application/json;charset=utf-8", content: studentPortfolioApplicationJson(portfolio), portfolio };
+  if (normalizedFormat === "script") return { format: "script", fileName: `video-script${anonymized}-${stamp}.md`, mime: "text/markdown;charset=utf-8", content: studentPortfolioVideoScript(portfolio), portfolio };
+  if (normalizedFormat === "html" || normalizedFormat === "pdf") {
+    return {
+      format: normalizedFormat,
+      fileName: normalizedFormat === "pdf" ? `student-portfolio${anonymized}-${stamp}-print.html` : `student-portfolio${anonymized}-${stamp}.html`,
+      mime: "text/html;charset=utf-8",
+      content: studentPortfolioHtml(portfolio, { print: normalizedFormat === "pdf" }),
+      portfolio
+    };
+  }
+  return { format: "json", fileName: `student-portfolio${anonymized}-${stamp}.json`, mime: "application/json;charset=utf-8", content: studentPortfolioJson(portfolio), portfolio };
+}
+
+function createStudentReflection(db, userId, body = {}) {
+  db.studentReflections = Array.isArray(db.studentReflections) ? db.studentReflections : [];
+  const reflection = {
+    id: uid("refl"),
+    studentId: userId,
+    subject: String(body.subject || "").slice(0, 80),
+    knowledgePoint: String(body.knowledgePoint || body.topic || "").slice(0, 120),
+    contextType: String(body.contextType || "learning").slice(0, 60),
+    contextId: String(body.contextId || "").slice(0, 120),
+    contextTitle: String(body.contextTitle || body.title || "").slice(0, 160),
+    originalUnderstanding: String(body.originalUnderstanding || "").slice(0, 1200),
+    aiDiscovery: String(body.aiDiscovery || "").slice(0, 1200),
+    aiAgreement: String(body.aiAgreement || "").slice(0, 800),
+    strategyChange: String(body.strategyChange || body.changes || "").slice(0, 1200),
+    uncertainty: String(body.uncertainty || "").slice(0, 1200),
+    aiLimitation: String(body.aiLimitation || "").slice(0, 1000),
+    nextPlan: String(body.nextPlan || "").slice(0, 1200),
+    antiOverreliance: String(body.antiOverreliance || "").slice(0, 1000),
+    aiUseBoundary: String(body.aiUseBoundary || "AI 用于提示、引用和诊断；最终理解、作答和反思由学生确认。").slice(0, 800),
+    createdAt: now()
+  };
+  db.studentReflections.unshift(reflection);
+  db.studentReflections = db.studentReflections.slice(0, 1200);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "structured_reflection",
+    source: "reflection-card",
+    subject: reflection.subject,
+    knowledgePoint: reflection.knowledgePoint,
+    payload: {
+      reflectionId: reflection.id,
+      contextType: reflection.contextType,
+      contextId: reflection.contextId,
+      originalUnderstanding: reflection.originalUnderstanding,
+      aiDiscovery: reflection.aiDiscovery,
+      strategyChange: reflection.strategyChange,
+      uncertainty: reflection.uncertainty,
+      nextPlan: reflection.nextPlan
+    },
+    idempotencyKey: `reflection:${reflection.id}`
+  });
+  return { reflection, learningEvent };
+}
+
+function applyKnowledgeCorrection(db, userId, body = {}) {
+  db.knowledgeCorrections = Array.isArray(db.knowledgeCorrections) ? db.knowledgeCorrections : [];
+  const correctedTopic = String(body.correctedTopic || body.topic || "").trim().slice(0, 120);
+  if (!correctedTopic) throw Object.assign(new Error("请填写纠正后的知识点"), { status: 400 });
+  const eventId = String(body.eventId || "").trim();
+  const diagnosisId = String(body.diagnosisId || "").trim();
+  const messageId = String(body.messageId || "").trim();
+  const event = eventId ? (db.learningEvents || []).find((item) => item.id === eventId && item.studentId === userId) : null;
+  const diagnosis = diagnosisId
+    ? (db.diagnosisResults || []).find((item) => item.id === diagnosisId && item.studentId === userId)
+    : eventId ? (db.diagnosisResults || []).find((item) => item.eventId === eventId && item.studentId === userId) : null;
+  const fromTopic = String(body.fromTopic || event?.knowledgePoint || diagnosis?.topic || "").trim();
+  const correction = {
+    id: uid("corr"),
+    studentId: userId,
+    eventId,
+    diagnosisId: diagnosis?.id || diagnosisId,
+    messageId,
+    fromTopic,
+    correctedTopic,
+    confidence: normalizeLearningScore(body.confidence) ?? null,
+    reason: String(body.reason || "").slice(0, 800),
+    candidates: Array.isArray(body.candidates) ? body.candidates.slice(0, 8) : [],
+    createdAt: now()
+  };
+  db.knowledgeCorrections.unshift(correction);
+  db.knowledgeCorrections = db.knowledgeCorrections.slice(0, 1000);
+  if (event) {
+    event.knowledgePoint = correctedTopic;
+    event.payload = compactLearningPayload({
+      ...(event.payload || {}),
+      correctedTopic,
+      previousTopic: fromTopic,
+      correctionId: correction.id,
+      topicLocalization: {
+        ...(event.payload?.topicLocalization || {}),
+        selectedTopic: correctedTopic,
+        corrected: true,
+        needsConfirmation: false,
+        policy: "学生已手动纠正知识点，学习事件已重新归档。"
+      }
+    });
+  }
+  if (diagnosis) {
+    diagnosis.topic = correctedTopic;
+    diagnosis.correctedTopic = correctedTopic;
+    diagnosis.previousTopic = fromTopic;
+  }
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "knowledge_point_corrected",
+    source: "student-correction",
+    subject: String(body.subject || event?.subject || "").trim(),
+    knowledgePoint: correctedTopic,
+    graphId: String(event?.graphId || body.graphId || "").trim(),
+    nodeId: String(event?.nodeId || body.nodeId || "").trim(),
+    payload: {
+      correctionId: correction.id,
+      eventId,
+      diagnosisId: correction.diagnosisId,
+      messageId,
+      fromTopic,
+      correctedTopic,
+      reason: correction.reason,
+      candidates: correction.candidates
+    },
+    idempotencyKey: `knowledge-correction:${correction.id}`
+  });
+  syncStudentMasteryFromProfile(db, userId, [correctedTopic], {
+    subject: String(body.subject || event?.subject || "").trim(),
+    graphId: String(event?.graphId || body.graphId || "").trim(),
+    nodeId: String(event?.nodeId || body.nodeId || "").trim(),
+    lastEventId: learningEvent?.id || ""
+  });
+  return { correction, learningEvent, event, diagnosis };
+}
+
+function createAiAnswerReview(db, userId, body = {}) {
+  db.aiAnswerReviews = Array.isArray(db.aiAnswerReviews) ? db.aiAnswerReviews : [];
+  const reviewType = String(body.reviewType || body.type || "trust_review").trim().slice(0, 80);
+  const topic = String(body.topic || body.knowledgePoint || "").trim().slice(0, 120);
+  const trustScore = normalizeLearningScore(body.trustScore);
+  const accepted = ["accepted", "partial_accept"].includes(reviewType) || body.accepted === true || body.accepted === "1";
+  const issueTags = Array.isArray(body.issueTags) ? body.issueTags.map(String).filter(Boolean).slice(0, 12) : [];
+  if (reviewType && !issueTags.includes(reviewType)) issueTags.unshift(reviewType);
+  const review = {
+    id: uid("airev"),
+    studentId: userId,
+    conversationId: String(body.conversationId || "").slice(0, 120),
+    messageId: String(body.messageId || "").slice(0, 120),
+    topic,
+    reviewType,
+    trustScore,
+    accepted,
+    issueTags: issueTags.slice(0, 12),
+    comment: String(body.comment || "").slice(0, 1200),
+    studentAction: String(body.studentAction || "").slice(0, 800),
+    finalJudgment: String(body.finalJudgment || body.studentAction || "").slice(0, 1000),
+    citationIssue: String(body.citationIssue || "").slice(0, 800),
+    verificationNeed: String(body.verificationNeed || "").slice(0, 800),
+    createdAt: now()
+  };
+  db.aiAnswerReviews.unshift(review);
+  db.aiAnswerReviews = db.aiAnswerReviews.slice(0, 1200);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "ai_answer_review",
+    source: "student-ai-review",
+    knowledgePoint: review.topic,
+    score: review.trustScore,
+    payload: {
+      reviewId: review.id,
+      conversationId: review.conversationId,
+      messageId: review.messageId,
+      reviewType: review.reviewType,
+      accepted: review.accepted,
+      issueTags: review.issueTags,
+      comment: review.comment,
+      studentAction: review.studentAction,
+      finalJudgment: review.finalJudgment,
+      citationIssue: review.citationIssue,
+      verificationNeed: review.verificationNeed
+    },
+    idempotencyKey: `ai-answer-review:${review.id}`
+  });
+  return { review, learningEvent };
 }
 
 function requestBearerToken(req) {
@@ -8290,7 +10360,15 @@ function getRelevantState(db, userId) {
     courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
     learningProfile: ensureLearningProfile(db, userId),
     wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
+    studentReflections: (db.studentReflections || []).filter((item) => item.studentId === userId).slice(0, 80),
+    knowledgeCorrections: (db.knowledgeCorrections || []).filter((item) => item.studentId === userId).slice(0, 80),
+    aiAnswerReviews: (db.aiAnswerReviews || []).filter((item) => item.studentId === userId).slice(0, 80),
+    learningCycles: (db.learningCycles || []).filter((item) => item.studentId === userId).slice(0, 20),
+    studentNodeAnnotations: (db.studentNodeAnnotations || []).filter((item) => item.studentId === userId).slice(0, 200),
+    studentEthicsSettings: getStudentEthicsSettings(db, userId),
+    studentDataDeletionRequests: (db.studentDataDeletionRequests || []).filter((item) => item.studentId === userId).slice(0, 20),
     learningAnalytics: learningAnalytics(db, userId),
+    studentPortfolio: user.role === "student" ? buildStudentPortfolio(db, userId) : null,
     agentRuns: (db.agentRuns || []).filter((item) => item.userId === userId).slice(0, 30)
   };
 }
@@ -8334,6 +10412,10 @@ function reportEventLabel(type) {
     knowledge_test_evaluate: "知识测验",
     homework_grade_confirmed: "作业批改确认",
     wrong_note: "错题记录",
+    ai_answer_review: "AI 审辩",
+    knowledge_point_corrected: "知识点纠正",
+    student_node_annotation: "图谱节点证据",
+    data_deletion_request: "数据管理",
     manual_mastery_update: "掌握度调整",
     student_mastery_snapshot: "掌握度快照"
   }[String(type || "")] || String(type || "学习事件");
@@ -8898,6 +10980,176 @@ async function handleApi(req, res, pathname, searchParams) {
 
   if (method === "GET" && pathname === "/api/state") {
     return send(res, 200, { ok: true, state: getRelevantState(db, actor.id) });
+  }
+
+  if (method === "GET" && pathname === "/api/student/portfolio") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const anonymous = ["1", "true", "yes"].includes(String(searchParams.get("anonymous") || "").toLowerCase());
+    return send(res, 200, { ok: true, portfolio: buildStudentPortfolio(db, userId, { anonymous }) });
+  }
+
+  if (method === "GET" && pathname === "/api/student/portfolio/export") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const format = String(searchParams.get("format") || "json").toLowerCase();
+    const anonymous = ["1", "true", "yes"].includes(String(searchParams.get("anonymous") || "").toLowerCase());
+    const payload = buildStudentPortfolioExportPayload(db, userId, format, { anonymous });
+    recordAudit(db, actor, "student.portfolio_export", {
+      resourceType: "studentPortfolio",
+      resourceId: userId,
+      meta: { format: payload.format, anonymous, evidence: payload.portfolio.learningCycle.evidenceCounts }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, ...payload });
+  }
+
+  if (method === "GET" && pathname === "/api/student/learning-cycle/templates") {
+    requireRole(actor, ["student", "admin", "teacher"]);
+    return send(res, 200, { ok: true, templates: learningCycleTemplateLibrary() });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle/suggest") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const suggestion = suggestLearningCycleFromProfile(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_suggest", {
+      resourceType: "learningCycle",
+      resourceId: userId,
+      meta: { title: suggestion.title, subject: suggestion.subject, focusNodes: suggestion.focusNodes }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, suggestion, templates: learningCycleTemplateLibrary() });
+  }
+
+  if (method === "GET" && pathname === "/api/student/learning-cycle") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const portfolio = buildStudentPortfolio(db, userId);
+    return send(res, 200, { ok: true, cycle: portfolio.learningCycle, portfolio });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const cycle = upsertStudentLearningCycle(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_upsert", {
+      resourceType: "learningCycle",
+      resourceId: cycle.id,
+      meta: { title: cycle.title, subject: cycle.subject, status: cycle.status }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, cycle: buildStudentPortfolio(db, userId).learningCycle, portfolio: buildStudentPortfolio(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle/tasks") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const cycle = updateLearningCycleTask(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_task", {
+      resourceType: "learningCycle",
+      resourceId: cycle.id,
+      meta: { taskKey: body.taskKey || body.key, done: body.done }
+    }, req);
+    writeDb(db);
+    const portfolio = buildStudentPortfolio(db, userId);
+    return send(res, 200, { ok: true, cycle: portfolio.learningCycle, portfolio, learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/reflections") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createStudentReflection(db, userId, body);
+    recordAudit(db, actor, "student.reflection_create", {
+      resourceType: "studentReflection",
+      resourceId: result.reflection.id,
+      meta: { topic: result.reflection.knowledgePoint, contextType: result.reflection.contextType }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/knowledge-corrections") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = applyKnowledgeCorrection(db, userId, body);
+    recordAudit(db, actor, "student.knowledge_correction", {
+      resourceType: "knowledgeCorrection",
+      resourceId: result.correction.id,
+      meta: { fromTopic: result.correction.fromTopic, correctedTopic: result.correction.correctedTopic }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/ai-answer-reviews") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createAiAnswerReview(db, userId, body);
+    recordAudit(db, actor, "student.ai_answer_review", {
+      resourceType: "aiAnswerReview",
+      resourceId: result.review.id,
+      meta: { topic: result.review.topic, reviewType: result.review.reviewType, accepted: result.review.accepted }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/node-annotations") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createStudentNodeAnnotation(db, userId, body);
+    recordAudit(db, actor, "student.node_annotation", {
+      resourceType: "studentNodeAnnotation",
+      resourceId: result.annotation.id,
+      meta: { graphId: result.annotation.graphId, nodeId: result.annotation.nodeId, status: result.annotation.status }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/ethics-settings") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const settings = updateStudentEthicsSettings(db, userId, body);
+    recordAudit(db, actor, "student.ethics_settings", {
+      resourceType: "studentEthicsSettings",
+      resourceId: userId,
+      meta: settings
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, settings, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/data-deletion-requests") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const request = requestStudentDataDeletion(db, userId, body);
+    recordAudit(db, actor, "student.data_deletion_request", {
+      resourceType: "studentDataDeletionRequest",
+      resourceId: request.id,
+      meta: { scopes: request.scopes }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, request, requests: (db.studentDataDeletionRequests || []).filter((item) => item.studentId === userId).slice(0, 20), portfolio: buildStudentPortfolio(db, userId) });
   }
 
   if (method === "POST" && pathname === "/api/knowledge-tests/generate") {
