@@ -358,6 +358,12 @@ function createInitialDb() {
     learningEvents: [],
     diagnosisResults: [],
     studentMastery: [],
+    misconceptionRecords: [],
+    prePostAssessments: [],
+    learningPathRecommendations: [],
+    nodeMasterySnapshots: [],
+    experimentSubmissions: [],
+    learningEvidence: [],
     studentReflections: [],
     knowledgeCorrections: [],
     aiAnswerReviews: [],
@@ -680,6 +686,12 @@ function ensureDbShape(db) {
     "learningEvents",
     "diagnosisResults",
     "studentMastery",
+    "misconceptionRecords",
+    "prePostAssessments",
+    "learningPathRecommendations",
+    "nodeMasterySnapshots",
+    "experimentSubmissions",
+    "learningEvidence",
     "studentReflections",
     "knowledgeCorrections",
     "aiAnswerReviews",
@@ -3561,6 +3573,13 @@ function validateGraph(raw, fallback) {
       resources: Array.isArray(node.resources) ? node.resources : undefined,
       competencies: Array.isArray(node.competencies) ? node.competencies.map(String) : undefined,
       assessment: node.assessment && typeof node.assessment === "object" ? node.assessment : undefined,
+      prerequisites: Array.isArray(node.prerequisites) ? node.prerequisites.map(String).slice(0, 20) : undefined,
+      learningGoal: node.learningGoal ? String(node.learningGoal).slice(0, 500) : undefined,
+      misconceptions: Array.isArray(node.misconceptions) ? node.misconceptions.map(String).slice(0, 12) : undefined,
+      diagnosticQuestions: Array.isArray(node.diagnosticQuestions) ? node.diagnosticQuestions.map(String).slice(0, 12) : undefined,
+      remediationResources: Array.isArray(node.remediationResources) ? node.remediationResources.map(String).slice(0, 12) : undefined,
+      verificationQuestions: Array.isArray(node.verificationQuestions) ? node.verificationQuestions.map(String).slice(0, 12) : undefined,
+      masteryStandard: node.masteryStandard ? String(node.masteryStandard).slice(0, 500) : undefined,
       learnerState: node.learnerState && typeof node.learnerState === "object" ? node.learnerState : undefined,
       graphRag: node.graphRag && typeof node.graphRag === "object" ? node.graphRag : undefined,
       navigation: node.navigation && typeof node.navigation === "object" ? node.navigation : undefined,
@@ -4143,7 +4162,7 @@ function knowledgeTestMasteryLevel(accuracy) {
   return "精通";
 }
 
-function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = "", count = 4 } = {}) {
+function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = "", count = 4, phase = "diagnostic", nodeId = "" } = {}) {
   const user = ensureUser(db, userId);
   const requestedSubject = normalizeSubject(subject || user.subject || "");
   const requestedMaterialId = String(materialId || "").trim();
@@ -4203,25 +4222,45 @@ function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = ""
   const topicCandidates = knowledgeTestKeywordList([cleanSubject, evidenceText].join("\n"), 12, cleanSubject);
   const topic = String(topicCandidates[0] || cleanSubject || materials[0]?.title || "课程知识点").trim();
   const questionHits = selectedKnowledgeTestHits(hits, count, cleanSubject);
-  const templates = [
+  const phaseKey = ["diagnostic", "remedial", "verify"].includes(String(phase)) ? String(phase) : "diagnostic";
+  const graph = visibleKnowledgeGraphs(db, userId).find((item) => /机器学习|machine learning|动手学机器学习/i.test(`${item.subject || ""} ${item.title || ""}`)) || visibleKnowledgeGraphs(db, userId).find((item) => item.subject === cleanSubject);
+  const graphNodeForTopic = (itemTopic) => {
+    const nodes = graph?.nodes || [];
+    return nodes.slice().sort((a, b) => String(b.label || "").length - String(a.label || "").length)
+      .find((node) => String(itemTopic || "").includes(node.label) || String(node.label || "").includes(itemTopic))
+      || (nodeId ? nodes.find((node) => node.id === nodeId) : null)
+      || nodes.find((node) => String(node.details || "").includes(itemTopic))
+      || null;
+  };
+  const templates = phaseKey === "remedial" ? [
+    { type: "contrast", prompt: (itemTopic) => `辨析「${itemTopic}」与它的相邻概念，说明二者在目标、适用条件和结果解释上的区别，并指出一个常见误区。`, rubric: "完成概念对比，指出边界、条件和错因。" },
+    { type: "steps", prompt: (itemTopic) => `请完成「${itemTopic}」关键公式或算法流程的步骤填空，并解释每一步为什么这样做。`, rubric: "步骤顺序正确，符号或输入输出说明完整。" },
+    { type: "code", prompt: (itemTopic) => `阅读一段与「${itemTopic}」相关的 Python / sklearn 代码，预测运行结果，解释关键参数，并指出一处调试方向。`, rubric: "能联系参数、输入输出和运行结果定位问题。" },
+    { type: "transfer", prompt: (itemTopic) => `给出一个「${itemTopic}」的变式应用场景，说明应如何选择方法、指标或数据处理方式。`, rubric: "能把知识点迁移到新场景并说明判断依据。" }
+  ] : phaseKey === "verify" ? [
+    { type: "contrast", prompt: (itemTopic) => `在一个新的案例中判断「${itemTopic}」是否适用，并与一个相邻概念进行辨析，说明你的依据。`, rubric: "独立迁移到新案例，边界判断准确。" },
+    { type: "process", prompt: (itemTopic) => `不参考原题，重新按步骤说明「${itemTopic}」从输入到输出的完整过程。`, rubric: "过程完整，关键步骤和条件没有遗漏。" },
+    { type: "transfer", prompt: (itemTopic) => `围绕「${itemTopic}」分析一个未见过的机器学习任务，并说明如何验证模型效果。`, rubric: "能选择合理方法、指标并解释验证方式。" },
+    { type: "explain", prompt: (itemTopic) => `用自己的话解释「${itemTopic}」最容易被误解的地方，并给出一个反例。`, rubric: "能识别误区并用反例证明理解。" }
+  ] : [
     {
-      type: "explain",
-      prompt: (itemTopic) => `请根据老师上传的「${cleanSubject}」课程资料，用自己的话解释「${itemTopic}」，并说明它在本节内容中的作用。`,
-      rubric: "覆盖定义、目标问题、关键条件和一个例子。"
+      type: "choice",
+      prompt: (itemTopic) => `选择题：围绕「${itemTopic}」写出你认为最正确的判断，并说明另外一个易混淆选项为什么不成立。`,
+      rubric: "判断正确，并能说明概念边界和易混淆选项。"
     },
     {
-      type: "condition",
-      prompt: (itemTopic) => `结合课程资料说明「${itemTopic}」的关键条件、限制或易错点，并写出判断依据。`,
-      rubric: "说明适用条件、限制、易错点和判断依据。"
+      type: "judgment",
+      prompt: (itemTopic) => `判断题：针对「${itemTopic}」给出一个常见说法，判断正误，并结合课程资料给出依据。`,
+      rubric: "正误判断明确，依据能联系关键条件或限制。"
     },
     {
-      type: "process",
-      prompt: (itemTopic) => `请按步骤描述课程资料中「${itemTopic}」对应的处理流程、解题流程或推理流程。`,
-      rubric: "步骤顺序清晰，能说明输入、处理、输出或结论。"
+      type: "derivation",
+      prompt: (itemTopic) => `公式推导：请按步骤说明「${itemTopic}」的关键公式、符号含义或计算过程，并标出最容易遗漏的一步。`,
+      rubric: "公式或步骤正确，符号说明完整，能识别易错步骤。"
     },
     {
-      type: "transfer",
-      prompt: (itemTopic) => `请基于该学科老师上传的资料，举一个与「${itemTopic}」相关的应用或题目场景，并说明如何分析。`,
+      type: "case",
+      prompt: (itemTopic) => `案例分析：给出一个与「${itemTopic}」相关的机器学习场景，说明应如何分析、选择方法或评价结果。`,
       rubric: "给出具体场景，并把知识点迁移到分析过程。"
     }
   ];
@@ -4238,22 +4277,25 @@ function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = ""
     topic,
     sourceNotice,
     sourceMaterials,
+    phase: phaseKey,
     questions: questionHits.map((hit, index) => {
       const template = templates[index % templates.length];
       const itemTopic = hit.topic || knowledgeTestTopicFromHit(hit, cleanSubject);
       const sourceText = compactWorkflowText(hit.text || hit.quote || "", 760);
       const expectedKeywords = knowledgeTestKeywordList([itemTopic, hit.chapter, sourceText].join("\n"), 14, cleanSubject);
       const companionHits = [hit, ...hits.filter((item) => item.materialId !== hit.materialId || item.chunkId !== hit.chunkId)].slice(0, 3);
+      const graphNode = graphNodeForTopic(itemTopic);
       return {
         id: uid("question"),
         order: index + 1,
         topic: itemTopic,
-        graphId: "",
-        nodeId: "",
+        graphId: graph?.id || "",
+        nodeId: graphNode?.id || "",
         materialId: hit.materialId || requestedMaterialId || "",
         subject: cleanSubject,
         prompt: template.prompt(itemTopic),
         type: template.type,
+        phase: phaseKey,
         rubric: template.rubric,
         referenceAnswer: sourceText || `围绕「${itemTopic}」说明定义、适用条件、关键步骤和常见误区。`,
         expectedKeywords,
@@ -4370,6 +4412,10 @@ function evaluateKnowledgeTestAnswer(db, userId, question, answer, options = {})
     completionRate,
     accuracy: overallAccuracy,
     masteryScore,
+    phase: question?.phase || options.phase || "diagnostic",
+    errorEliminated: String(question?.phase || options.phase || "") === "verify"
+      ? Boolean(Number(options.previousAccuracy || 0) < 60 && accuracy >= 70)
+      : null,
     masteryLevel,
     completed: answeredAttempts.length >= totalQuestions,
     attempts: answeredAttempts
@@ -5179,7 +5225,8 @@ function buildExperimentRecord({ userId, subject, prompt, codeMode, difficulty, 
 
 function sanitizeExperimentRecord(value) {
   if (!value || typeof value !== "object") return null;
-  return { agentName: String(value.agentName || "ML Lab Code Agent").slice(0, 80), userId: String(value.userId || "").slice(0, 80), subject: normalizeSubject(value.subject || "machine learning"), prompt: String(value.prompt || "").slice(0, 1200), codeMode: String(value.codeMode || "teaching").slice(0, 40), difficulty: String(value.difficulty || "standard").slice(0, 40), sourceType: String(value.sourceType || "").slice(0, 40), title: String(value.title || "").slice(0, 160), chapter: String(value.chapter || "").slice(0, 160), citations: Array.isArray(value.citations) ? value.citations.slice(0, 8) : [], explanation: value.explanation && typeof value.explanation === "object" ? value.explanation : null, verifiedRun: value.verifiedRun && typeof value.verifiedRun === "object" ? verifiedRunFromResult(value.verifiedRun) : null, repairAttempts: Math.max(0, Math.min(3, Number(value.repairAttempts || 0))), repairHistory: Array.isArray(value.repairHistory) ? value.repairHistory.slice(0, 4) : [], workflow: Array.isArray(value.workflow) ? value.workflow.slice(0, 8) : [], createdAt: value.createdAt || now(), updatedAt: value.updatedAt || "" };
+  const workshop = value.workshop && typeof value.workshop === "object" ? value.workshop : null;
+  return { agentName: String(value.agentName || "ML Lab Code Agent").slice(0, 80), userId: String(value.userId || "").slice(0, 80), subject: normalizeSubject(value.subject || "machine learning"), prompt: String(value.prompt || "").slice(0, 1200), codeMode: String(value.codeMode || "teaching").slice(0, 40), difficulty: String(value.difficulty || "standard").slice(0, 40), sourceType: String(value.sourceType || "").slice(0, 40), title: String(value.title || "").slice(0, 160), chapter: String(value.chapter || "").slice(0, 160), citations: Array.isArray(value.citations) ? value.citations.slice(0, 8) : [], explanation: value.explanation && typeof value.explanation === "object" ? value.explanation : null, verifiedRun: value.verifiedRun && typeof value.verifiedRun === "object" ? verifiedRunFromResult(value.verifiedRun) : null, repairAttempts: Math.max(0, Math.min(3, Number(value.repairAttempts || 0))), repairHistory: Array.isArray(value.repairHistory) ? value.repairHistory.slice(0, 4) : [], workflow: Array.isArray(value.workflow) ? value.workflow.slice(0, 8) : [], workshop: workshop ? { experimentKey: String(workshop.experimentKey || "").slice(0, 60), title: String(workshop.title || "").slice(0, 160), ability: String(workshop.ability || "").slice(0, 240), dataset: String(workshop.dataset || "").slice(0, 240), nodes: Array.isArray(workshop.nodes) ? workshop.nodes.slice(0, 8).map((item) => String(item).slice(0, 80)) : [], steps: Array.isArray(workshop.steps) ? workshop.steps.slice(0, 8).map((item) => String(item).slice(0, 160)) : [], findings: String(workshop.findings || "").slice(0, 1200), mismatch: String(workshop.mismatch || "").slice(0, 1200), improvement: String(workshop.improvement || "").slice(0, 1200), evidenceFiles: Array.isArray(workshop.evidenceFiles) ? workshop.evidenceFiles.slice(0, 8).map((file) => ({ name: String(file?.name || "").slice(0, 160), type: String(file?.type || "").slice(0, 80), size: Math.max(0, Math.min(2 * 1024 * 1024, Number(file?.size || 0))) })) : [], conclusionCheck: workshop.conclusionCheck && typeof workshop.conclusionCheck === "object" ? { ok: Boolean(workshop.conclusionCheck.ok), title: String(workshop.conclusionCheck.title || "").slice(0, 160), detail: String(workshop.conclusionCheck.detail || "").slice(0, 500), evidence: String(workshop.conclusionCheck.evidence || "").slice(0, 300) } : null, runResult: String(workshop.runResult || "").slice(0, 10000) } : null, createdAt: value.createdAt || now(), updatedAt: value.updatedAt || "" };
 }
 
 function isAcademicMisuse(prompt) {
@@ -5224,6 +5271,25 @@ const ML_DIAGNOSIS_WORKFLOW_INFO = {
   version: "0.6.0",
   source: "dify/ml_learning_diagnosis/ml_learning_diagnosis_assistant_upgraded_0_6_0.yml"
 };
+const ML_AI_WORKFLOW_CONTRACTS = {
+  knowledge_qa: { label: "机器学习知识问答", input: ["问题", "当前知识点", "课程资料"], output: ["分层讲解", "引用资料", "关联节点"] },
+  misconception_classification: { label: "错因分类", input: ["学生答案", "标准答案", "解题过程", "节点信息"], output: ["对错", "错因标签", "错误证据", "掌握度", "补救任务", "复测标记"] },
+  personalized_path: { label: "个性化路径生成", input: ["掌握度", "错因", "前置依赖", "可用时间"], output: ["任务序列", "资源", "练习", "预计时长"] },
+  reflection_evaluation: { label: "反思引导与评价", input: ["学生反思", "学习记录"], output: ["反思质量反馈", "待改进点", "迁移建议"] }
+};
+
+function mlWorkflowType(value = "", mode = "") {
+  const key = String(value || "").trim().toLowerCase();
+  if (["knowledge_qa", "qa", "concept", "derivation", "code", "explain", "guided"].includes(key)) return key === "knowledge_qa" ? key : "knowledge_qa";
+  if (["misconception_classification", "diagnosis", "grade", "grading"].includes(key)) return "misconception_classification";
+  if (["personalized_path", "review", "plan", "class_analysis", "remedial_plan"].includes(key)) return "personalized_path";
+  if (["reflection_evaluation", "reflection"].includes(key)) return "reflection_evaluation";
+  return mode === "grade" ? "misconception_classification" : mode === "plan" ? "personalized_path" : "knowledge_qa";
+}
+
+function graphNodeIdForWorkflow(label = "") {
+  return String(label || "").trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "").slice(0, 100);
+}
 
 const ML_DIAGNOSIS_WORKFLOW_STEP_TITLES = [
   "开始",
@@ -5629,6 +5695,51 @@ function updateTopicMastery(db, userId, topics, delta, evidence) {
   return profile;
 }
 
+function appendLearningEvidence(db, item = {}) {
+  db.learningEvidence = Array.isArray(db.learningEvidence) ? db.learningEvidence : [];
+  const evidence = { id: uid("evidence"), studentId: String(item.studentId || ""), evidenceType: String(item.evidenceType || "learning_event").slice(0, 80), relatedNodeIds: Array.isArray(item.relatedNodeIds) ? item.relatedNodeIds.map(String).slice(0, 20) : [], relatedMisconceptionId: String(item.relatedMisconceptionId || ""), eventId: String(item.eventId || ""), summary: String(item.summary || "").slice(0, 1200), teacherVerified: Boolean(item.teacherVerified), createdAt: now() };
+  if (!evidence.studentId) return null;
+  db.learningEvidence.unshift(evidence); db.learningEvidence = db.learningEvidence.slice(0, 6000);
+  return evidence;
+}
+
+function appendNodeMasterySnapshot(db, studentId, nodeId, masteryScore, source, eventId = "") {
+  if (!nodeId || masteryScore === null || masteryScore === undefined) return null;
+  db.nodeMasterySnapshots = Array.isArray(db.nodeMasterySnapshots) ? db.nodeMasterySnapshots : [];
+  const snapshot = { id: uid("mastery_snap"), studentId, nodeId: String(nodeId), masteryScore: normalizeLearningScore(masteryScore), source: String(source || "learning_activity").slice(0, 100), eventId: String(eventId || ""), recordedAt: now() };
+  db.nodeMasterySnapshots.unshift(snapshot); db.nodeMasterySnapshots = db.nodeMasterySnapshots.slice(0, 10000);
+  return snapshot;
+}
+
+function upsertMisconceptionRecord(db, item = {}) {
+  db.misconceptionRecords = Array.isArray(db.misconceptionRecords) ? db.misconceptionRecords : [];
+  const studentId = String(item.studentId || ""); const type = String(item.misconceptionType || "待归类错因").slice(0, 180); const nodeId = String(item.nodeId || "");
+  if (!studentId) return null;
+  const record = db.misconceptionRecords.find((row) => row.studentId === studentId && row.nodeId === nodeId && row.misconceptionType === type && row.status !== "eliminated");
+  const history = { at: now(), action: String(item.action || "diagnosed").slice(0, 80), detail: String(item.detail || "").slice(0, 600), evidenceId: String(item.evidenceId || "") };
+  if (record) { record.lastSeen = now(); record.evidenceId = history.evidenceId || record.evidenceId; record.status = item.status || record.status || "active"; record.interventionHistory = [...(record.interventionHistory || []), history].slice(-20); return record; }
+  const next = { id: uid("misconception"), studentId, nodeId, misconceptionType: type, evidenceId: history.evidenceId, firstSeen: now(), lastSeen: now(), status: item.status || "active", interventionHistory: [history] };
+  db.misconceptionRecords.unshift(next); db.misconceptionRecords = db.misconceptionRecords.slice(0, 5000); return next;
+}
+
+function createPrePostAssessment(db, item = {}) {
+  db.prePostAssessments = Array.isArray(db.prePostAssessments) ? db.prePostAssessments : [];
+  const assessment = { id: uid("assessment"), studentId: String(item.studentId || ""), cycleId: String(item.cycleId || ""), assessmentType: String(item.assessmentType || "diagnostic").slice(0, 60), score: normalizeLearningScore(item.score), nodeScores: item.nodeScores && typeof item.nodeScores === "object" ? item.nodeScores : {}, completedAt: item.completedAt || now() };
+  db.prePostAssessments.unshift(assessment); db.prePostAssessments = db.prePostAssessments.slice(0, 5000); return assessment;
+}
+
+function createLearningPathRecommendation(db, item = {}) {
+  db.learningPathRecommendations = Array.isArray(db.learningPathRecommendations) ? db.learningPathRecommendations : [];
+  const path = { id: uid("path"), studentId: String(item.studentId || ""), targetNodes: Array.isArray(item.targetNodes) ? item.targetNodes.map(String).slice(0, 20) : [], reason: String(item.reason || "").slice(0, 1000), tasks: Array.isArray(item.tasks) ? item.tasks.slice(0, 12) : [], estimatedMinutes: Math.max(0, Math.min(1440, Number(item.estimatedMinutes || 0))), status: String(item.status || "recommended").slice(0, 40), createdAt: now(), updatedAt: now() };
+  db.learningPathRecommendations.unshift(path); db.learningPathRecommendations = db.learningPathRecommendations.slice(0, 3000); return path;
+}
+
+function createExperimentSubmissionRecord(db, item = {}) {
+  db.experimentSubmissions = Array.isArray(db.experimentSubmissions) ? db.experimentSubmissions : [];
+  const submission = { id: uid("experiment_submission"), studentId: String(item.studentId || ""), experimentId: String(item.experimentId || ""), artifacts: Array.isArray(item.artifacts) ? item.artifacts.slice(0, 12) : [], resultSummary: String(item.resultSummary || "").slice(0, 1500), aiFeedback: String(item.aiFeedback || "").slice(0, 1500), reflection: item.reflection && typeof item.reflection === "object" ? item.reflection : {}, modelId: String(item.modelId || ""), submittedAt: now() };
+  db.experimentSubmissions.unshift(submission); db.experimentSubmissions = db.experimentSubmissions.slice(0, 3000); return submission;
+}
+
 function recordLearningActivity(db, userId, activity) {
   const profile = ensureLearningProfile(db, userId);
   profile.questionCount = Number(profile.questionCount || 0) + (activity.kind === "question" ? 1 : 0);
@@ -5656,6 +5767,8 @@ function addWrongNote(db, userId, note) {
   };
   db.wrongNotes.unshift(wrongNote);
   db.wrongNotes = db.wrongNotes.slice(0, 500);
+  const misconception = upsertMisconceptionRecord(db, { studentId: userId, nodeId: note.nodeId || "", misconceptionType: note.misconceptionType || wrongNote.analysis || wrongNote.topic, action: "diagnosed", detail: wrongNote.analysis, status: "active" });
+  wrongNote.misconceptionId = misconception?.id || "";
   return wrongNote;
 }
 
@@ -6254,6 +6367,17 @@ function assessMlDiagnosisMastery({ question = "", studentAnswer = "", topicLabe
   if (["KNN", "KMeans聚类", "PCA降维", "支持向量机"].includes(topicLabel) && !dimensions["数据预处理"]) errors.push("数据预处理缺失");
 
   const error_tags = Array.from(new Set(errors));
+  const evidenceLines = answer
+    .split(/\r?\n|[。；;！？!?]/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const error_evidence = evidenceLines.find((line) => error_tags.some((tag) => {
+    if (/概念|任务类型/.test(tag)) return /分类|聚类|监督|无监督|连续/.test(line);
+    if (/公式|目标/.test(tag)) return /损失|梯度|函数|正则|交叉熵/.test(line);
+    if (/流程|步骤/.test(tag)) return /训练|预测|更新|迭代|测试/.test(line);
+    if (/数据|指标/.test(tag)) return /测试集|训练集|调参|准确率|召回率|F1/.test(line);
+    return false;
+  })) || evidenceLines[0] || "学生未提供可定位的具体句子或代码行。";
   score -= error_tags.length * 6;
   const mastery_score = Math.max(0, Math.min(100, Math.round(score)));
   const missing_points = Object.entries(dimensions)
@@ -6276,6 +6400,7 @@ function assessMlDiagnosisMastery({ question = "", studentAnswer = "", topicLabe
     mastery_score,
     mastery_level: mlDiagnosisMasteryLevel(mastery_score),
     error_tags,
+    error_evidence,
     missing_points,
     positive_points,
     project_sync_suggestion
@@ -6361,12 +6486,22 @@ function buildMlDiagnosisFeedback({ diagnosisMode = "知识问答模式", studen
 function buildMlDiagnosisFinalAnswer({ topic, mastery, standardAnswer, diagnosisFeedback, ragEvidence = [] }) {
   const nextQuestions = mlDiagnosisNextQuestions(topic.topic_label, mastery.missing_points);
   const structuredResult = {
+    workflow_type: "misconception_classification",
+    knowledge_point: topic.topic_label,
+    graph_node_id: graphNodeIdForWorkflow(topic.topic_label),
+    is_correct: Number(mastery.mastery_score || 0) >= 75,
+    misconception_tags: mastery.error_tags || [],
+    misconception_level: Number(mastery.mastery_score || 0) < 45 ? "high" : Number(mastery.mastery_score || 0) < 70 ? "medium" : "low",
+    evidence: (mastery.error_evidence || [])[0] || diagnosisFeedback || "",
+    recommended_actions: mlDiagnosisNextQuestions(topic.topic_label, mastery.missing_points).slice(0, 3),
+    need_reassessment: Number(mastery.mastery_score || 0) < 75,
     topic_label: topic.topic_label,
     topic_probability: topic.topic_probability,
     top_topic_candidates: topic.top_topic_candidates,
     mastery_score: mastery.mastery_score,
     mastery_level: mastery.mastery_level,
     error_tags: mastery.error_tags,
+    error_evidence: mastery.error_evidence,
     missing_points: mastery.missing_points,
     rag_evidence: ragEvidence,
     standard_answer: standardAnswer,
@@ -6441,6 +6576,13 @@ function buildMlDiagnosisWorkflowAnswer({ user, mode, prompt, hits = [], citatio
       student_answer: studentAnswer
     }
   };
+}
+
+function normalizeMisconceptionClassification(result = {}, context = {}) {
+  const score = Number(result.mastery_score ?? result.masteryScore ?? context.masteryScore ?? 0);
+  const tags = Array.isArray(result.misconception_tags) ? result.misconception_tags : Array.isArray(result.error_tags) ? result.error_tags : [];
+  const topic = String(result.knowledge_point || result.topic_label || context.knowledgePoint || "机器学习知识点");
+  return { workflow_type: "misconception_classification", knowledge_point: topic, graph_node_id: String(result.graph_node_id || context.nodeId || graphNodeIdForWorkflow(topic)), is_correct: result.is_correct !== undefined ? Boolean(result.is_correct) : score >= 75, misconception_tags: tags.map(String).slice(0, 12), misconception_level: String(result.misconception_level || (score < 45 ? "high" : score < 70 ? "medium" : "low")), evidence: String(result.evidence || result.error_evidence?.[0] || result.diagnosis_feedback || "").slice(0, 1200), mastery_score: Math.max(0, Math.min(100, Number.isFinite(score) ? Math.round(score) : 0)), recommended_actions: (Array.isArray(result.recommended_actions) ? result.recommended_actions : Array.isArray(result.next_questions) ? result.next_questions : []).map(String).slice(0, 5), need_reassessment: result.need_reassessment !== undefined ? Boolean(result.need_reassessment) : score < 75 };
 }
 
 function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint, studentAnswer = "" }) {
@@ -7559,6 +7701,9 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
   };
   const workflowRequestId = String(workflowResult.request_id || workflowResult.requestId || "").trim();
   const workflowScore = Number(workflowResult.mastery_score ?? workflowResult.masteryScore);
+  const workflowType = mlWorkflowType(body.workflowType || body.workflow_type, mode);
+  const structuredDiagnosis = normalizeMisconceptionClassification(workflowResult, { knowledgePoint: topicLocalization.selectedTopic || topics[0] || knowledgePoint, nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""), masteryScore: workflowScore });
+  Object.assign(enrichedWorkflowResult, workflowType === "misconception_classification" ? structuredDiagnosis : { workflow_type: workflowType });
   const acceptedWorkflowScore = topicLocalization.needsConfirmation ? null : (Number.isFinite(workflowScore) ? workflowScore : null);
   const learningEvent = recordLearningEvent(db, {
     studentId: user.id,
@@ -7582,6 +7727,8 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
       workflowRunId: workflowResult.workflow_run_id || "",
       taskId: workflowResult.task_id || ""
     },
+    evidenceType: workflowType,
+    evidenceSummary: workflowType === "misconception_classification" ? structuredDiagnosis.evidence : `AI ${workflowType}：${prompt.slice(0, 80)}`,
     idempotencyKey: workflowRequestId ? `dify:${workflowRequestId}` : ""
   });
   if (workflowResult.mastery_score !== undefined || workflowResult.masteryScore !== undefined || workflowResult.mastery_level || workflowResult.masteryLevel) {
@@ -7641,6 +7788,7 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     learningPanel,
     workflow,
     workflowResult: enrichedWorkflowResult,
+    workflowContract: ML_AI_WORKFLOW_CONTRACTS[workflowType] || ML_AI_WORKFLOW_CONTRACTS.knowledge_qa,
     retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter, ragChannel: hit.ragChannel || "" })),
     tools: [
       "intent_router",
@@ -9145,14 +9293,28 @@ function buildStudentPortfolio(db, userId, options = {}) {
     score: scorePercentText(nodeAnnotationScore(annotation.status), ""),
     summary: reportCompactText(annotation.explanation || annotation.evidenceTitle || "学生主动建构的节点证据", 160)
   })));
+  const teacherEvaluations = submissions.filter((submission) => submission.feedback?.comment || submission.feedback?.teacherComment || submission.feedback?.rubricResults).slice(0, 8).map((submission) => ({
+    time: submission.feedback?.gradedAt || submission.gradedAt || submission.updatedAt || submission.createdAt,
+    teacher: submission.feedback?.teacherName || "任课教师",
+    comment: reportCompactText(submission.feedback?.teacherComment || submission.feedback?.comment || submission.feedback?.summary || "教师已完成学习成果确认。", 220),
+    summary: submission.title || "作业/项目评价"
+  }));
   const misconceptionTrajectory = wrongNotes.slice(0, 12).map((note) => {
     const relatedDiagnosis = diagnoses.find((item) => item.topic === note.topic || (item.missingPoints || []).some((point) => String(point).includes(note.topic)));
+    const topicCorrections = corrections.filter((item) => item.fromTopic === note.topic || item.correctedTopic === note.topic);
+    const topicTests = events.filter((event) => event.knowledgePoint === note.topic || event.topic === note.topic);
+    const resolved = topicCorrections.length > 0 || topicTests.some((event) => Number(event.payload?.accuracy || event.accuracy || 0) >= 0.8);
     return {
       topic: note.topic || "待归类",
       before: reportCompactText(note.question || relatedDiagnosis?.finalAnswer || "原始理解存在缺口", 120),
       issue: reportCompactText(note.analysis || (relatedDiagnosis?.missingPoints || []).join("；") || "等待补充错因", 140),
       after: reportCompactText(note.recommendation || "完成同类题、重写解释并在反思中记录修正策略。", 140),
-      time: note.createdAt
+      time: note.createdAt,
+      firstFound: note.source || "章节前测",
+      intervention: note.recommendation || "概念对比微课 + 3 道变式题 + 节点实验",
+      retestResult: resolved ? "由错误改为正确" : "尚未完成验证性复测",
+      currentStatus: resolved ? "已消除" : "待干预",
+      transfer: resolved ? "可迁移到不平衡分类等新场景。" : "完成变式题后，再用新场景验证迁移。"
     };
   });
   const userChatThreads = (db.chatThreads || []).filter((thread) => (thread.memberIds || []).includes(userId));
@@ -9294,6 +9456,7 @@ function buildStudentPortfolio(db, userId, options = {}) {
     corrections,
     aiReviews,
     nodeAnnotations,
+    teacherEvaluations,
     collaboration,
     ethics: {
       settings: ethicsSettings,
@@ -9505,6 +9668,7 @@ function createStudentReflection(db, userId, body = {}) {
     },
     idempotencyKey: `reflection:${reflection.id}`
   });
+  appendLearningEvidence(db, { studentId: userId, evidenceType: "reflection", relatedNodeIds: body.nodeId ? [body.nodeId] : [], eventId: learningEvent?.id || "", summary: reflection.strategyChange || reflection.nextPlan || reflection.originalUnderstanding });
   return { reflection, learningEvent };
 }
 
@@ -9740,6 +9904,14 @@ function recordLearningEvent(db, event = {}) {
   };
   db.learningEvents.unshift(item);
   db.learningEvents = db.learningEvents.slice(0, 5000);
+  appendLearningEvidence(db, {
+    studentId,
+    evidenceType: event.evidenceType || event.eventType || "learning_event",
+    relatedNodeIds: event.nodeId ? [event.nodeId] : [],
+    relatedMisconceptionId: event.misconceptionId || "",
+    eventId: item.id,
+    summary: event.evidenceSummary || `${item.eventType}${item.knowledgePoint ? `：${item.knowledgePoint}` : ""}`
+  });
   return item;
 }
 
@@ -9769,6 +9941,8 @@ function recordDiagnosisResult(db, result = {}) {
   };
   db.diagnosisResults.unshift(item);
   db.diagnosisResults = db.diagnosisResults.slice(0, 3000);
+  const evidence = appendLearningEvidence(db, { studentId, evidenceType: "diagnosis", relatedNodeIds: result.nodeId ? [result.nodeId] : [], summary: item.finalAnswer || item.topic, eventId: item.eventId });
+  (item.errorTags || []).forEach((tag) => upsertMisconceptionRecord(db, { studentId, nodeId: result.nodeId || "", misconceptionType: tag, evidenceId: evidence?.id || "", action: "diagnosed", detail: item.finalAnswer, status: "active" }));
   return item;
 }
 
@@ -9796,6 +9970,7 @@ function syncStudentMasteryFromProfile(db, userId, topics = [], options = {}) {
     };
     if (existing) Object.assign(existing, snapshot);
     else db.studentMastery.push(snapshot);
+    appendNodeMasterySnapshot(db, userId, snapshot.nodeId || topic, snapshot.score, options.source || "mastery_update", snapshot.lastEventId);
   });
   return db.studentMastery.filter((item) => item.studentId === userId);
 }
@@ -10359,7 +10534,14 @@ function getRelevantState(db, userId) {
     submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
     courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
     learningProfile: ensureLearningProfile(db, userId),
-    wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
+    wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.userId)))).slice(0, 300),
+    studentMastery: (db.studentMastery || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 500),
+    misconceptionRecords: (db.misconceptionRecords || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 300),
+    prePostAssessments: (db.prePostAssessments || []).filter((item) => item.studentId === userId).slice(0, 100),
+    learningPathRecommendations: (db.learningPathRecommendations || []).filter((item) => item.studentId === userId).slice(0, 50),
+    nodeMasterySnapshots: (db.nodeMasterySnapshots || []).filter((item) => item.studentId === userId).slice(0, 500),
+    experimentSubmissions: (db.experimentSubmissions || []).filter((item) => item.studentId === userId).slice(0, 100),
+    learningEvidence: (db.learningEvidence || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 500),
     studentReflections: (db.studentReflections || []).filter((item) => item.studentId === userId).slice(0, 80),
     knowledgeCorrections: (db.knowledgeCorrections || []).filter((item) => item.studentId === userId).slice(0, 80),
     aiAnswerReviews: (db.aiAnswerReviews || []).filter((item) => item.studentId === userId).slice(0, 80),
@@ -11083,6 +11265,10 @@ async function handleApi(req, res, pathname, searchParams) {
     const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
     ensureActorCanUseId(actor, userId, "student");
     const result = applyKnowledgeCorrection(db, userId, body);
+    const correctionEvent = recordLearningEvent(db, { studentId: userId, eventType: "misconception_intervention", source: "student-correction", knowledgePoint: result.correction.correctedTopic, nodeId: body.nodeId || "", payload: { correctionId: result.correction.id, fromTopic: result.correction.fromTopic, correctedTopic: result.correction.correctedTopic, intervention: body.intervention || "订正与变式练习" }, evidenceType: "intervention" });
+    result.correction.eventId = correctionEvent?.id || "";
+    const misconception = (db.misconceptionRecords || []).find((item) => item.id === result.correction.misconceptionId || (item.studentId === userId && item.misconceptionType === result.correction.fromTopic));
+    if (misconception) { misconception.status = "intervened"; misconception.lastSeen = now(); misconception.interventionHistory = [...(misconception.interventionHistory || []), { at: now(), action: "correction_submitted", detail: result.correction.reason || "学生完成订正", evidenceId: result.correction.id }].slice(-20); }
     recordAudit(db, actor, "student.knowledge_correction", {
       resourceType: "knowledgeCorrection",
       resourceId: result.correction.id,
@@ -11159,7 +11345,9 @@ async function handleApi(req, res, pathname, searchParams) {
     const quiz = buildKnowledgeTestQuestions(db, userId, {
       subject: String(body.subject || ""),
       materialId: String(body.materialId || body.material_id || ""),
-      count: body.count
+      count: Math.min(5, Math.max(3, Number(body.count || 4))),
+      phase: String(body.phase || "diagnostic"),
+      nodeId: String(body.nodeId || body.node_id || "")
     });
     recordAudit(db, actor, "knowledge_test.generate", {
       resourceType: "knowledgeTest",
@@ -11178,7 +11366,9 @@ async function handleApi(req, res, pathname, searchParams) {
       subject: String(body.subject || ""),
       materialId: String(body.materialId || body.material_id || ""),
       attempts: body.attempts || [],
-      questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions
+      questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions,
+      phase: String(body.phase || body.question?.phase || "diagnostic"),
+      previousAccuracy: Number(body.previousAccuracy || body.previous_accuracy || 0)
     });
     const learningEvent = recordLearningEvent(db, {
       studentId: userId,
@@ -11473,6 +11663,28 @@ async function handleApi(req, res, pathname, searchParams) {
     if (!visibleKnowledgeGraphs(db, actor.id).some((item) => item.id === graph.id)) return sendError(res, 403, "无权查看该图谱");
     return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
+  if (method === "PUT" && params) {
+    const body = await readBody(req);
+    const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
+    if (!graph) return notFound(res);
+    if (actor.role !== "admin" && (graph.ownerId !== actor.id || graph.global)) return sendError(res, 403, "只能编辑自己未公开的图谱");
+    if (body.nodeId) {
+      const node = graph.nodes.find((item) => String(item.id) === String(body.nodeId));
+      if (!node) return sendError(res, 404, "知识点不存在");
+      const fields = ["label", "group", "details", "learningGoal", "masteryStandard"];
+      fields.forEach((key) => { if (body[key] !== undefined) node[key] = String(body[key] || "").slice(0, 1000); });
+      ["prerequisites", "misconceptions", "diagnosticQuestions", "remediationResources", "verificationQuestions"].forEach((key) => {
+        if (body[key] !== undefined) node[key] = Array.isArray(body[key]) ? body[key].map((item) => String(item).trim()).filter(Boolean).slice(0, 20) : String(body[key] || "").split(/\n|；|;/).map((item) => item.trim()).filter(Boolean).slice(0, 20);
+      });
+    }
+    if (Array.isArray(body.links)) {
+      graph.links = body.links.map((link) => ({ source: String(link.source), target: String(link.target), label: String(link.label || "关联").slice(0, 100), type: String(link.type || "semantic").slice(0, 40), pedagogy: String(link.pedagogy || "").slice(0, 300) })).slice(0, 1000);
+    }
+    graph.updatedAt = now();
+    recordAudit(db, actor, "graph.update", { resourceType: "graph", resourceId: graph.id, meta: { nodeId: body.nodeId || "", links: Array.isArray(body.links) ? body.links.length : undefined } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
+  }
   if (method === "DELETE" && params) {
     const userId = queryUserId(searchParams, actor);
     const index = db.knowledgeGraphs.findIndex((item) => item.id === params.id);
@@ -11661,6 +11873,30 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 201, { ok: true, wrongNote: note, learningAnalytics: learningAnalytics(db, body.userId) });
   }
 
+  if (method === "POST" && pathname === "/api/learning-data/pre-post") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const assessment = createPrePostAssessment(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "assessment_completed", source: assessment.assessmentType, score: assessment.score, payload: { assessmentId: assessment.id, nodeScores: assessment.nodeScores }, evidenceType: "assessment" });
+    writeDb(db); return send(res, 201, { ok: true, assessment, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/path-recommendations") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const path = createLearningPathRecommendation(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "learning_path_recommended", source: "path-engine", payload: { pathId: path.id, reason: path.reason, targetNodes: path.targetNodes }, evidenceType: "learning_path" });
+    writeDb(db); return send(res, 201, { ok: true, path, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/experiment-submissions") {
+    const body = await readBody(req); assertRequired(body, ["studentId", "experimentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const submission = createExperimentSubmissionRecord(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "experiment_submitted", source: "experiment-workshop", payload: { experimentSubmissionId: submission.id, experimentId: submission.experimentId, resultSummary: submission.resultSummary }, evidenceType: "experiment" });
+    appendLearningEvidence(db, { studentId: body.studentId, evidenceType: "experiment", eventId: event?.id || "", summary: submission.resultSummary });
+    writeDb(db); return send(res, 201, { ok: true, submission, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/evidence") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const evidence = appendLearningEvidence(db, body); writeDb(db); return send(res, 201, { ok: true, evidence });
+  }
+
   if (method === "POST" && pathname === "/api/mastery/update") {
     const body = await readBody(req);
     assertRequired(body, ["userId"]);
@@ -11798,6 +12034,12 @@ async function handleApi(req, res, pathname, searchParams) {
     }
     const model = { id: uid("model"), ...payload, createdAt: now() };
     db.models.unshift(model);
+    if (model.experiment?.workshop) {
+      const workshop = model.experiment.workshop;
+      const experimentSubmission = createExperimentSubmissionRecord(db, { studentId: body.userId, experimentId: workshop.experimentKey || model.id, artifacts: workshop.evidenceFiles || [], resultSummary: workshop.runResult || "", aiFeedback: workshop.conclusionCheck?.detail || "", reflection: { findings: workshop.findings || "", mismatch: workshop.mismatch || "", improvement: workshop.improvement || "" }, modelId: model.id });
+      const event = recordLearningEvent(db, { studentId: body.userId, eventType: "experiment_submitted", source: "experiment-workshop", subject: model.subject, payload: { experimentSubmissionId: experimentSubmission.id, experimentId: experimentSubmission.experimentId, resultSummary: experimentSubmission.resultSummary }, evidenceType: "experiment" });
+      appendLearningEvidence(db, { studentId: body.userId, evidenceType: "experiment", eventId: event?.id || "", summary: experimentSubmission.resultSummary });
+    }
     recordAudit(db, actor, "model.create", { resourceType: "model", resourceId: model.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, model });
@@ -12327,6 +12569,13 @@ async function handleApi(req, res, pathname, searchParams) {
         description: body.description,
         answer: body.answer
       })),
+      taskType: String(body.taskType || "standard").slice(0, 60),
+      errorTag: String(body.errorTag || "").slice(0, 160),
+      difficulty: String(body.difficulty || "基础").slice(0, 40),
+      dueAt: body.dueAt ? String(body.dueAt).slice(0, 60) : "",
+      resources: Array.isArray(body.resources) ? body.resources.map((item) => String(item).slice(0, 180)).slice(0, 12) : [],
+      targetStudentIds: Array.isArray(body.targetStudentIds) ? body.targetStudentIds.map(String).slice(0, 500) : [],
+      remediationMetrics: { baselineErrorCount: Math.max(0, Number(body.baselineErrorCount || 0)), baselineStudentCount: Math.max(0, Number(body.baselineStudentCount || 0)), completedCount: 0, improvedCount: 0, errorEliminatedCount: 0 },
       attachments: Array.isArray(body.attachments) ? body.attachments : [],
       createdAt: now(),
       updatedAt: now()
@@ -12351,6 +12600,11 @@ async function handleApi(req, res, pathname, searchParams) {
     if (body.title !== undefined) homework.title = String(body.title || homework.title);
     if (body.description !== undefined) homework.description = String(body.description || "");
     if (body.answer !== undefined) homework.answer = String(body.answer || "");
+    if (body.taskType !== undefined) homework.taskType = String(body.taskType || "standard").slice(0, 60);
+    if (body.errorTag !== undefined) homework.errorTag = String(body.errorTag || "").slice(0, 160);
+    if (body.difficulty !== undefined) homework.difficulty = String(body.difficulty || "基础").slice(0, 40);
+    if (body.dueAt !== undefined) homework.dueAt = String(body.dueAt || "").slice(0, 60);
+    if (Array.isArray(body.resources)) homework.resources = body.resources.map((item) => String(item).slice(0, 180)).slice(0, 12);
     if (body.rubric !== undefined || body.answer !== undefined || body.description !== undefined || body.title !== undefined) {
       homework.rubric = parseRubricInput(body.rubric !== undefined ? body.rubric : homework.rubricText, homework);
       homework.rubricText = rubricToText(homework.rubric);
