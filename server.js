@@ -6925,6 +6925,39 @@ function difyWorkflowUrl() {
   return `${DIFY_BASE_URL}/workflows/run`;
 }
 
+function compactDifyErrorDetail(error) {
+  const parts = [
+    error?.message,
+    error?.cause?.message,
+    error?.cause?.code,
+    error?.cause?.errno,
+    error?.cause?.address ? `${error.cause.address}${error.cause.port ? `:${error.cause.port}` : ""}` : ""
+  ].filter(Boolean);
+  return Array.from(new Set(parts.map((item) => String(item).trim()).filter(Boolean))).join("；");
+}
+
+function formatDifyNetworkError(error, authHintName) {
+  const targetUrl = difyWorkflowUrl();
+  const baseHint = `请确认 Dify 服务已启动，${authHintName} 已配置为已发布工作流 App 的 API Key，并检查 .env 中 DIFY_BASE_URL=${DIFY_BASE_URL} 是否能从当前 Node 服务访问。`;
+  if (error?.name === "AbortError") {
+    return `Dify 工作流请求超时：${DIFY_WORKFLOW_TIMEOUT_MS}ms 内未收到响应。目标地址：${targetUrl}。${baseHint}`;
+  }
+  const detail = compactDifyErrorDetail(error) || "网络请求失败";
+  const connectionCodes = ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"];
+  const looksLikeNetworkFailure = /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|connect|network/i.test(detail);
+  const codeHint = connectionCodes.find((code) => detail.includes(code));
+  const reason = codeHint === "ECONNREFUSED"
+    ? "Dify 端口拒绝连接，通常表示 Dify 未启动、端口不对，或服务没有监听该地址"
+    : codeHint === "ENOTFOUND" || codeHint === "EAI_AGAIN"
+      ? "无法解析 Dify 地址，通常是容器/宿主机地址写法不适用"
+      : codeHint === "ETIMEDOUT" || codeHint === "UND_ERR_CONNECT_TIMEOUT"
+        ? "连接 Dify 超时，可能是服务无响应或网络不可达"
+        : looksLikeNetworkFailure
+          ? "无法连接到 Dify 工作流接口"
+          : "Dify 工作流请求失败";
+  return `${reason}。目标地址：${targetUrl}。原始错误：${detail}。${baseHint}`;
+}
+
 async function postDifyWorkflow({ apiKey, inputs, user, authHintName = "DIFY_WORKFLOW_API_KEY" }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DIFY_WORKFLOW_TIMEOUT_MS);
@@ -6951,6 +6984,12 @@ async function postDifyWorkflow({ apiKey, inputs, user, authHintName = "DIFY_WOR
       });
     }
     return payload;
+  } catch (error) {
+    if (error?.status) throw error;
+    throw Object.assign(new Error(formatDifyNetworkError(error, authHintName)), {
+      status: 502,
+      cause: error
+    });
   } finally {
     clearTimeout(timeout);
   }

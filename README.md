@@ -14,6 +14,16 @@ node server.js
 http://127.0.0.1:5107
 ```
 
+## 竞赛部署
+
+如果这是第三届全球数智教育创新大赛赛组四的参赛版本，建议直接阅读 [COMPETITION_DEPLOYMENT_PLAN.md](./COMPETITION_DEPLOYMENT_PLAN.md)。
+
+上线前可先跑：
+
+```powershell
+npm run readiness
+```
+
 如需指定端口：
 
 ```powershell
