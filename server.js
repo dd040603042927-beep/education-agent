@@ -4,6 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, execFileSync } = require("child_process");
+const { createStorage } = require("./storage");
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -33,8 +34,10 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const RUNTIME_DIR = path.join(DATA_DIR, "runtime");
 const LOG_DIR = path.resolve(process.env.LOG_DIR || path.join(ROOT, "logs"));
-const BACKUP_DIR = path.resolve(process.env.BACKUP_DIR || path.join(ROOT, "backups"));
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const STORAGE_DRIVER = process.env.STORAGE_DRIVER || "json";
+const DATABASE_URL = process.env.DATABASE_URL || process.env.SQLITE_PATH || "";
+const STORAGE_SCHEMA_PATH = path.join(ROOT, "storage", "schema.sql");
 const AUDIT_LOG_PATH = path.join(LOG_DIR, "audit.log");
 const GRAPH_JOBS_PATH = path.join(RUNTIME_DIR, "graph_jobs.json");
 const UPLOAD_SESSIONS_PATH = path.join(RUNTIME_DIR, "upload_sessions.json");
@@ -69,6 +72,11 @@ const LOGIN_COOLDOWN_MS = Math.max(60 * 1000, Number(process.env.LOGIN_COOLDOWN_
 const MODEL_CODE_TIMEOUT_MS = Math.max(1000, Math.min(30 * 1000, Number(process.env.MODEL_CODE_TIMEOUT_MS || 10 * 1000)));
 const MODEL_CODE_MAX_CHARS = Math.max(1000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_CHARS || 80000)));
 const MODEL_CODE_MAX_OUTPUT_CHARS = Math.max(2000, Math.min(200000, Number(process.env.MODEL_CODE_MAX_OUTPUT_CHARS || 30000)));
+const MODEL_CODE_REPAIR_MAX_ATTEMPTS = Math.max(0, Math.min(3, Number(process.env.MODEL_CODE_REPAIR_MAX_ATTEMPTS || 2)));
+const MODEL_CODE_ALLOWED_IMPORTS = new Set(String(process.env.MODEL_CODE_ALLOWED_IMPORTS || "math,random,statistics,collections,itertools,functools,operator,heapq,bisect,decimal,fractions,typing,dataclasses")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_BASE_URL = String(process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -347,6 +355,22 @@ function createInitialDb() {
       createLearningProfile(teacherId, "teacher")
     ],
     wrongNotes: [],
+    learningEvents: [],
+    diagnosisResults: [],
+    studentMastery: [],
+    misconceptionRecords: [],
+    prePostAssessments: [],
+    learningPathRecommendations: [],
+    nodeMasterySnapshots: [],
+    experimentSubmissions: [],
+    learningEvidence: [],
+    studentReflections: [],
+    knowledgeCorrections: [],
+    aiAnswerReviews: [],
+    learningCycles: [],
+    studentNodeAnnotations: [],
+    studentEthicsSettings: [],
+    studentDataDeletionRequests: [],
     agentRuns: [],
     auditLogs: [],
     friendRequests: [],
@@ -356,18 +380,35 @@ function createInitialDb() {
   };
 }
 
-function readDb() {
-  ensureDataDir();
-  if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(createInitialDb(), null, 2), "utf8");
+let dbStorage = null;
+
+function getDbStorage() {
+  if (!dbStorage) {
+    dbStorage = createStorage({
+      driver: STORAGE_DRIVER,
+      dataDir: DATA_DIR,
+      dbPath: DB_PATH,
+      sqlitePath: DATABASE_URL,
+      schemaPath: STORAGE_SCHEMA_PATH,
+      ensureDataDir,
+      initialData: createInitialDb,
+      normalizeData: ensureDbShape,
+      writeJson: atomicWriteJson
+    });
   }
-  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-  if (ensureDbShape(db)) writeDb(db);
-  return db;
+  return dbStorage;
+}
+
+function readDb() {
+  return getDbStorage().read();
 }
 
 function writeDb(db) {
-  atomicWriteJson(DB_PATH, db);
+  getDbStorage().write(db);
+}
+
+function dbStorageMetadata() {
+  return getDbStorage().metadata();
 }
 
 function createLearningProfile(userId, role = "student") {
@@ -642,6 +683,22 @@ function ensureDbShape(db) {
     "courseMaterials",
     "learningProfiles",
     "wrongNotes",
+    "learningEvents",
+    "diagnosisResults",
+    "studentMastery",
+    "misconceptionRecords",
+    "prePostAssessments",
+    "learningPathRecommendations",
+    "nodeMasterySnapshots",
+    "experimentSubmissions",
+    "learningEvidence",
+    "studentReflections",
+    "knowledgeCorrections",
+    "aiAnswerReviews",
+    "learningCycles",
+    "studentNodeAnnotations",
+    "studentEthicsSettings",
+    "studentDataDeletionRequests",
     "agentRuns",
     "submissions",
     "auditLogs",
@@ -1795,6 +1852,27 @@ function formatModelCodeOutput({ stdout = "", stderr = "", exitCode = 0, timedOu
   return sections.join("\n").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS);
 }
 
+function inspectModelCodeSafety(source) {
+  const code = String(source || "");
+  const importPattern = /^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))/gm;
+  let match = null;
+  while ((match = importPattern.exec(code))) {
+    const root = String(match[1] || match[2] || "").split(".")[0];
+    if (root && !MODEL_CODE_ALLOWED_IMPORTS.has(root)) {
+      return { ok: false, message: "Safety block: import is not allowed: " + root + ". Allowed modules: " + Array.from(MODEL_CODE_ALLOWED_IMPORTS).join(", ") + "." };
+    }
+  }
+  const blocked = [
+    { pattern: /\b(open|eval|exec|compile|input|__import__)\s*\(/, label: "dangerous builtin" },
+    { pattern: /\b(globals|locals|vars|getattr|setattr|delattr)\s*\(/, label: "runtime reflection" },
+    { pattern: /\b(system|popen|spawn|fork|remove|unlink|rmdir|mkdir|rename|replace)\s*\(/, label: "system or file operation" },
+    { pattern: /__(?:builtins|globals|subclasses|mro|base|code|closure|dict)__/, label: "Python internal object access" }
+  ];
+  const hit = blocked.find((item) => item.pattern.test(code));
+  if (hit) return { ok: false, message: "Safety block: detected " + hit.label + ". The ML lab only allows pure computation teaching code." };
+  return { ok: true };
+}
+
 function modelCodeExecutableSource(source) {
   return `import ast
 import traceback
@@ -1866,6 +1944,13 @@ function runModelCodeSnippet(code) {
         durationMs: 0,
         output: `执行状态：运行失败（退出码 1）\n\n[stderr]\n代码长度不能超过 ${MODEL_CODE_MAX_CHARS} 个字符。`
       });
+      return;
+    }
+    const safety = inspectModelCodeSafety(source);
+    if (!safety.ok) {
+      const payload = { success: false, exitCode: 1, timedOut: false, durationMs: 0, stdout: "", stderr: safety.message, pythonCommand: "", securityBlocked: true };
+      payload.output = formatModelCodeOutput(payload);
+      resolve(payload);
       return;
     }
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -3488,6 +3573,13 @@ function validateGraph(raw, fallback) {
       resources: Array.isArray(node.resources) ? node.resources : undefined,
       competencies: Array.isArray(node.competencies) ? node.competencies.map(String) : undefined,
       assessment: node.assessment && typeof node.assessment === "object" ? node.assessment : undefined,
+      prerequisites: Array.isArray(node.prerequisites) ? node.prerequisites.map(String).slice(0, 20) : undefined,
+      learningGoal: node.learningGoal ? String(node.learningGoal).slice(0, 500) : undefined,
+      misconceptions: Array.isArray(node.misconceptions) ? node.misconceptions.map(String).slice(0, 12) : undefined,
+      diagnosticQuestions: Array.isArray(node.diagnosticQuestions) ? node.diagnosticQuestions.map(String).slice(0, 12) : undefined,
+      remediationResources: Array.isArray(node.remediationResources) ? node.remediationResources.map(String).slice(0, 12) : undefined,
+      verificationQuestions: Array.isArray(node.verificationQuestions) ? node.verificationQuestions.map(String).slice(0, 12) : undefined,
+      masteryStandard: node.masteryStandard ? String(node.masteryStandard).slice(0, 500) : undefined,
       learnerState: node.learnerState && typeof node.learnerState === "object" ? node.learnerState : undefined,
       graphRag: node.graphRag && typeof node.graphRag === "object" ? node.graphRag : undefined,
       navigation: node.navigation && typeof node.navigation === "object" ? node.navigation : undefined,
@@ -4070,7 +4162,7 @@ function knowledgeTestMasteryLevel(accuracy) {
   return "精通";
 }
 
-function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = "", count = 4 } = {}) {
+function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = "", count = 4, phase = "diagnostic", nodeId = "" } = {}) {
   const user = ensureUser(db, userId);
   const requestedSubject = normalizeSubject(subject || user.subject || "");
   const requestedMaterialId = String(materialId || "").trim();
@@ -4130,25 +4222,45 @@ function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = ""
   const topicCandidates = knowledgeTestKeywordList([cleanSubject, evidenceText].join("\n"), 12, cleanSubject);
   const topic = String(topicCandidates[0] || cleanSubject || materials[0]?.title || "课程知识点").trim();
   const questionHits = selectedKnowledgeTestHits(hits, count, cleanSubject);
-  const templates = [
+  const phaseKey = ["diagnostic", "remedial", "verify"].includes(String(phase)) ? String(phase) : "diagnostic";
+  const graph = visibleKnowledgeGraphs(db, userId).find((item) => /机器学习|machine learning|动手学机器学习/i.test(`${item.subject || ""} ${item.title || ""}`)) || visibleKnowledgeGraphs(db, userId).find((item) => item.subject === cleanSubject);
+  const graphNodeForTopic = (itemTopic) => {
+    const nodes = graph?.nodes || [];
+    return nodes.slice().sort((a, b) => String(b.label || "").length - String(a.label || "").length)
+      .find((node) => String(itemTopic || "").includes(node.label) || String(node.label || "").includes(itemTopic))
+      || (nodeId ? nodes.find((node) => node.id === nodeId) : null)
+      || nodes.find((node) => String(node.details || "").includes(itemTopic))
+      || null;
+  };
+  const templates = phaseKey === "remedial" ? [
+    { type: "contrast", prompt: (itemTopic) => `辨析「${itemTopic}」与它的相邻概念，说明二者在目标、适用条件和结果解释上的区别，并指出一个常见误区。`, rubric: "完成概念对比，指出边界、条件和错因。" },
+    { type: "steps", prompt: (itemTopic) => `请完成「${itemTopic}」关键公式或算法流程的步骤填空，并解释每一步为什么这样做。`, rubric: "步骤顺序正确，符号或输入输出说明完整。" },
+    { type: "code", prompt: (itemTopic) => `阅读一段与「${itemTopic}」相关的 Python / sklearn 代码，预测运行结果，解释关键参数，并指出一处调试方向。`, rubric: "能联系参数、输入输出和运行结果定位问题。" },
+    { type: "transfer", prompt: (itemTopic) => `给出一个「${itemTopic}」的变式应用场景，说明应如何选择方法、指标或数据处理方式。`, rubric: "能把知识点迁移到新场景并说明判断依据。" }
+  ] : phaseKey === "verify" ? [
+    { type: "contrast", prompt: (itemTopic) => `在一个新的案例中判断「${itemTopic}」是否适用，并与一个相邻概念进行辨析，说明你的依据。`, rubric: "独立迁移到新案例，边界判断准确。" },
+    { type: "process", prompt: (itemTopic) => `不参考原题，重新按步骤说明「${itemTopic}」从输入到输出的完整过程。`, rubric: "过程完整，关键步骤和条件没有遗漏。" },
+    { type: "transfer", prompt: (itemTopic) => `围绕「${itemTopic}」分析一个未见过的机器学习任务，并说明如何验证模型效果。`, rubric: "能选择合理方法、指标并解释验证方式。" },
+    { type: "explain", prompt: (itemTopic) => `用自己的话解释「${itemTopic}」最容易被误解的地方，并给出一个反例。`, rubric: "能识别误区并用反例证明理解。" }
+  ] : [
     {
-      type: "explain",
-      prompt: (itemTopic) => `请根据老师上传的「${cleanSubject}」课程资料，用自己的话解释「${itemTopic}」，并说明它在本节内容中的作用。`,
-      rubric: "覆盖定义、目标问题、关键条件和一个例子。"
+      type: "choice",
+      prompt: (itemTopic) => `选择题：围绕「${itemTopic}」写出你认为最正确的判断，并说明另外一个易混淆选项为什么不成立。`,
+      rubric: "判断正确，并能说明概念边界和易混淆选项。"
     },
     {
-      type: "condition",
-      prompt: (itemTopic) => `结合课程资料说明「${itemTopic}」的关键条件、限制或易错点，并写出判断依据。`,
-      rubric: "说明适用条件、限制、易错点和判断依据。"
+      type: "judgment",
+      prompt: (itemTopic) => `判断题：针对「${itemTopic}」给出一个常见说法，判断正误，并结合课程资料给出依据。`,
+      rubric: "正误判断明确，依据能联系关键条件或限制。"
     },
     {
-      type: "process",
-      prompt: (itemTopic) => `请按步骤描述课程资料中「${itemTopic}」对应的处理流程、解题流程或推理流程。`,
-      rubric: "步骤顺序清晰，能说明输入、处理、输出或结论。"
+      type: "derivation",
+      prompt: (itemTopic) => `公式推导：请按步骤说明「${itemTopic}」的关键公式、符号含义或计算过程，并标出最容易遗漏的一步。`,
+      rubric: "公式或步骤正确，符号说明完整，能识别易错步骤。"
     },
     {
-      type: "transfer",
-      prompt: (itemTopic) => `请基于该学科老师上传的资料，举一个与「${itemTopic}」相关的应用或题目场景，并说明如何分析。`,
+      type: "case",
+      prompt: (itemTopic) => `案例分析：给出一个与「${itemTopic}」相关的机器学习场景，说明应如何分析、选择方法或评价结果。`,
       rubric: "给出具体场景，并把知识点迁移到分析过程。"
     }
   ];
@@ -4165,22 +4277,25 @@ function buildKnowledgeTestQuestions(db, userId, { subject = "", materialId = ""
     topic,
     sourceNotice,
     sourceMaterials,
+    phase: phaseKey,
     questions: questionHits.map((hit, index) => {
       const template = templates[index % templates.length];
       const itemTopic = hit.topic || knowledgeTestTopicFromHit(hit, cleanSubject);
       const sourceText = compactWorkflowText(hit.text || hit.quote || "", 760);
       const expectedKeywords = knowledgeTestKeywordList([itemTopic, hit.chapter, sourceText].join("\n"), 14, cleanSubject);
       const companionHits = [hit, ...hits.filter((item) => item.materialId !== hit.materialId || item.chunkId !== hit.chunkId)].slice(0, 3);
+      const graphNode = graphNodeForTopic(itemTopic);
       return {
         id: uid("question"),
         order: index + 1,
         topic: itemTopic,
-        graphId: "",
-        nodeId: "",
+        graphId: graph?.id || "",
+        nodeId: graphNode?.id || "",
         materialId: hit.materialId || requestedMaterialId || "",
         subject: cleanSubject,
         prompt: template.prompt(itemTopic),
         type: template.type,
+        phase: phaseKey,
         rubric: template.rubric,
         referenceAnswer: sourceText || `围绕「${itemTopic}」说明定义、适用条件、关键步骤和常见误区。`,
         expectedKeywords,
@@ -4297,6 +4412,10 @@ function evaluateKnowledgeTestAnswer(db, userId, question, answer, options = {})
     completionRate,
     accuracy: overallAccuracy,
     masteryScore,
+    phase: question?.phase || options.phase || "diagnostic",
+    errorEliminated: String(question?.phase || options.phase || "") === "verify"
+      ? Boolean(Number(options.previousAccuracy || 0) < 60 && accuracy >= 70)
+      : null,
     masteryLevel,
     completed: answeredAttempts.length >= totalQuestions,
     attempts: answeredAttempts
@@ -5061,6 +5180,55 @@ async function verifyGeneratedAlgorithm(generated, prompt, subject) {
   };
 }
 
+function compactModelCodeRun(run, attempt = 0, label = "") {
+  return { attempt, label, success: Boolean(run?.success), exitCode: Number.isFinite(Number(run?.exitCode)) ? Number(run.exitCode) : 1, timedOut: Boolean(run?.timedOut), durationMs: Number.isFinite(Number(run?.durationMs)) ? Number(run.durationMs) : 0, pythonCommand: run?.pythonCommand || "", stdout: String(run?.stdout || "").slice(0, 2000), stderr: String(run?.stderr || "").slice(0, 1000), output: String(run?.output || "").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS), securityBlocked: Boolean(run?.securityBlocked) };
+}
+
+function verifiedRunFromResult(run) {
+  return { success: Boolean(run?.success), exitCode: Number.isFinite(Number(run?.exitCode)) ? Number(run.exitCode) : 1, durationMs: Number.isFinite(Number(run?.durationMs)) ? Number(run.durationMs) : 0, pythonCommand: run?.pythonCommand || "", stdout: String(run?.stdout || "").slice(0, 2000), stderr: String(run?.stderr || "").slice(0, 1000), output: String(run?.output || "").slice(0, MODEL_CODE_MAX_OUTPUT_CHARS), securityBlocked: Boolean(run?.securityBlocked) };
+}
+
+async function runModelCodeWithAutoRepair({ code, prompt, subject, contextHits = [] }) {
+  let currentCode = String(code || "");
+  const repairHistory = [];
+  for (let attempt = 0; attempt <= MODEL_CODE_REPAIR_MAX_ATTEMPTS; attempt += 1) {
+    const run = await runModelCodeSnippet(currentCode);
+    repairHistory.push(compactModelCodeRun(run, attempt, attempt === 0 ? "manual-run" : "auto-repair-run"));
+    if (run.success) return { ...run, repairedCode: attempt > 0 ? currentCode : "", repairAttempts: attempt, repairHistory, repairAvailable: true };
+    if (run.securityBlocked || isPythonRuntimeUnavailable(run) || attempt >= MODEL_CODE_REPAIR_MAX_ATTEMPTS || !isConfiguredSecret(OPENAI_API_KEY)) return { ...run, repairedCode: attempt > 0 ? currentCode : "", repairAttempts: attempt, repairHistory, repairAvailable: isConfiguredSecret(OPENAI_API_KEY) && !run.securityBlocked && !isPythonRuntimeUnavailable(run) };
+    const repaired = await generateAlgorithmWithOpenAI(String(prompt || "Repair and improve this machine learning lab code"), subject, { ...run, originalCode: currentCode }, contextHits);
+    currentCode = String(repaired.code || currentCode);
+  }
+  const last = repairHistory[repairHistory.length - 1] || {};
+  return { success: false, exitCode: last.exitCode || 1, timedOut: Boolean(last.timedOut), durationMs: Number(last.durationMs || 0), stdout: last.stdout || "", stderr: last.stderr || "Auto repair did not produce runnable code.", output: last.output || "Auto repair did not produce runnable code.", repairedCode: currentCode, repairAttempts: Math.max(0, repairHistory.length - 1), repairHistory, repairAvailable: isConfiguredSecret(OPENAI_API_KEY) };
+}
+
+function simpleAlgorithmExplanation(prompt, generated = {}, hits = [], options = {}) {
+  return { agentName: "ML Lab Code Agent", codeMode: options.codeMode || "teaching", difficulty: options.difficulty || "standard", goal: "Generate a runnable Python teaching lab for: " + String(prompt || generated.title || "machine learning").slice(0, 100), steps: ["Search course materials", "Generate complete Python code", "Run it on the server", "Save prompt, code, explanation, and run result"], metrics: ["exitCode", "stdout", "durationMs"], tunables: ["codeMode", "difficulty", "algorithm parameters"], courseBasis: hits.slice(0, 3).map((hit) => ({ title: hit.title || hit.sourceName || "course material", chapter: hit.chapter || "", quote: String(hit.quote || "").slice(0, 160) })) };
+}
+
+function buildModelCodeWorkflow({ hits = [], generated = {}, run = null, repairHistory = [] }) {
+  const finalRun = run || generated.verifiedRun || repairHistory[repairHistory.length - 1] || null;
+  const repairs = Math.max(0, Number(generated.repairAttempts || 0));
+  return [
+    { key: "course_search", label: "Course search tool", status: hits.length ? "done" : "fallback", detail: hits.length ? "Matched " + hits.length + " course/graph snippets" : "Used built-in template or model fallback" },
+    { key: "code_generation", label: "Code generation tool", status: "done", detail: generated.sourceType === "openai" ? "Generated Python code with model" : generated.sourceType === "course" ? "Generated from course context and stdlib template" : "Used local template or manual code" },
+    { key: "python_runner", label: "Python sandbox runner", status: finalRun?.success ? "done" : finalRun ? "failed" : "pending", detail: finalRun ? "Exit " + finalRun.exitCode + ", " + (finalRun.durationMs || 0) + " ms" : "Waiting to run" },
+    { key: "error_repair", label: "Error repair tool", status: repairs > 0 ? "done" : finalRun?.success ? "skipped" : "pending", detail: repairs > 0 ? "Auto repaired " + repairs + " time(s)" : "No repair needed or waiting for failure" },
+    { key: "experiment_record", label: "Experiment record tool", status: "ready", detail: "Save prompt, course basis, code, run result, and explanation" }
+  ];
+}
+
+function buildExperimentRecord({ userId, subject, prompt, codeMode, difficulty, generated = {}, hits = [] }) {
+  return { agentName: "ML Lab Code Agent", userId, subject, prompt: String(prompt || "").slice(0, 1200), codeMode: codeMode || "teaching", difficulty: difficulty || "standard", sourceType: generated.sourceType || "", title: generated.title || "", chapter: generated.chapter || "", citations: Array.isArray(generated.citations) ? generated.citations.slice(0, 8) : citationsFromHits(hits).slice(0, 8), explanation: generated.explanation || null, verifiedRun: generated.verifiedRun || null, repairAttempts: Number(generated.repairAttempts || 0), repairHistory: Array.isArray(generated.repairHistory) ? generated.repairHistory.slice(0, 4) : [], workflow: buildModelCodeWorkflow({ hits, generated }), createdAt: now() };
+}
+
+function sanitizeExperimentRecord(value) {
+  if (!value || typeof value !== "object") return null;
+  const workshop = value.workshop && typeof value.workshop === "object" ? value.workshop : null;
+  return { agentName: String(value.agentName || "ML Lab Code Agent").slice(0, 80), userId: String(value.userId || "").slice(0, 80), subject: normalizeSubject(value.subject || "machine learning"), prompt: String(value.prompt || "").slice(0, 1200), codeMode: String(value.codeMode || "teaching").slice(0, 40), difficulty: String(value.difficulty || "standard").slice(0, 40), sourceType: String(value.sourceType || "").slice(0, 40), title: String(value.title || "").slice(0, 160), chapter: String(value.chapter || "").slice(0, 160), citations: Array.isArray(value.citations) ? value.citations.slice(0, 8) : [], explanation: value.explanation && typeof value.explanation === "object" ? value.explanation : null, verifiedRun: value.verifiedRun && typeof value.verifiedRun === "object" ? verifiedRunFromResult(value.verifiedRun) : null, repairAttempts: Math.max(0, Math.min(3, Number(value.repairAttempts || 0))), repairHistory: Array.isArray(value.repairHistory) ? value.repairHistory.slice(0, 4) : [], workflow: Array.isArray(value.workflow) ? value.workflow.slice(0, 8) : [], workshop: workshop ? { experimentKey: String(workshop.experimentKey || "").slice(0, 60), title: String(workshop.title || "").slice(0, 160), ability: String(workshop.ability || "").slice(0, 240), dataset: String(workshop.dataset || "").slice(0, 240), nodes: Array.isArray(workshop.nodes) ? workshop.nodes.slice(0, 8).map((item) => String(item).slice(0, 80)) : [], steps: Array.isArray(workshop.steps) ? workshop.steps.slice(0, 8).map((item) => String(item).slice(0, 160)) : [], findings: String(workshop.findings || "").slice(0, 1200), mismatch: String(workshop.mismatch || "").slice(0, 1200), improvement: String(workshop.improvement || "").slice(0, 1200), evidenceFiles: Array.isArray(workshop.evidenceFiles) ? workshop.evidenceFiles.slice(0, 8).map((file) => ({ name: String(file?.name || "").slice(0, 160), type: String(file?.type || "").slice(0, 80), size: Math.max(0, Math.min(2 * 1024 * 1024, Number(file?.size || 0))) })) : [], conclusionCheck: workshop.conclusionCheck && typeof workshop.conclusionCheck === "object" ? { ok: Boolean(workshop.conclusionCheck.ok), title: String(workshop.conclusionCheck.title || "").slice(0, 160), detail: String(workshop.conclusionCheck.detail || "").slice(0, 500), evidence: String(workshop.conclusionCheck.evidence || "").slice(0, 300) } : null, runResult: String(workshop.runResult || "").slice(0, 10000) } : null, createdAt: value.createdAt || now(), updatedAt: value.updatedAt || "" };
+}
+
 function isAcademicMisuse(prompt) {
   return /直接.*(写|生成|完成).*(作业|论文|实验报告|考试|答案)|代写|替我写|帮我作弊|考试.*答案|不要解释.*只给答案/.test(String(prompt || ""));
 }
@@ -5103,6 +5271,25 @@ const ML_DIAGNOSIS_WORKFLOW_INFO = {
   version: "0.6.0",
   source: "dify/ml_learning_diagnosis/ml_learning_diagnosis_assistant_upgraded_0_6_0.yml"
 };
+const ML_AI_WORKFLOW_CONTRACTS = {
+  knowledge_qa: { label: "机器学习知识问答", input: ["问题", "当前知识点", "课程资料"], output: ["分层讲解", "引用资料", "关联节点"] },
+  misconception_classification: { label: "错因分类", input: ["学生答案", "标准答案", "解题过程", "节点信息"], output: ["对错", "错因标签", "错误证据", "掌握度", "补救任务", "复测标记"] },
+  personalized_path: { label: "个性化路径生成", input: ["掌握度", "错因", "前置依赖", "可用时间"], output: ["任务序列", "资源", "练习", "预计时长"] },
+  reflection_evaluation: { label: "反思引导与评价", input: ["学生反思", "学习记录"], output: ["反思质量反馈", "待改进点", "迁移建议"] }
+};
+
+function mlWorkflowType(value = "", mode = "") {
+  const key = String(value || "").trim().toLowerCase();
+  if (["knowledge_qa", "qa", "concept", "derivation", "code", "explain", "guided"].includes(key)) return key === "knowledge_qa" ? key : "knowledge_qa";
+  if (["misconception_classification", "diagnosis", "grade", "grading"].includes(key)) return "misconception_classification";
+  if (["personalized_path", "review", "plan", "class_analysis", "remedial_plan"].includes(key)) return "personalized_path";
+  if (["reflection_evaluation", "reflection"].includes(key)) return "reflection_evaluation";
+  return mode === "grade" ? "misconception_classification" : mode === "plan" ? "personalized_path" : "knowledge_qa";
+}
+
+function graphNodeIdForWorkflow(label = "") {
+  return String(label || "").trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "").slice(0, 100);
+}
 
 const ML_DIAGNOSIS_WORKFLOW_STEP_TITLES = [
   "开始",
@@ -5362,6 +5549,117 @@ function findGraphContext(db, userId, subject, prompt, topics = [], hits = []) {
   };
 }
 
+function normalizedTopicKey(topic) {
+  return String(topic || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[（）()《》「」'"]/g, "");
+}
+
+function mlTermPatternForTopic(topic) {
+  const text = String(topic || "");
+  if (!text.trim()) return null;
+  return ML_TERM_PATTERNS.find((item) => (
+    item.label === text
+    || item.label.includes(text)
+    || text.includes(item.label)
+    || item.pattern.test(text)
+  )) || null;
+}
+
+function topicDirectHit(text, topic) {
+  const source = String(text || "");
+  const label = String(topic || "").trim();
+  if (!source.trim() || !label) return false;
+  if (textContainsKeyword(source, label)) return true;
+  const term = mlTermPatternForTopic(label);
+  return term ? term.pattern.test(source) : false;
+}
+
+function normalizeTopicProbability(value, fallback = 0.45) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? fallback : normalized;
+}
+
+function buildTopicLocalization({ prompt = "", knowledgePoint = "", graphContext = {}, agent = {}, workflowResult = {} }) {
+  const evidenceText = [
+    prompt,
+    knowledgePoint,
+    graphContext?.focusNode?.label,
+    ...(Array.isArray(agent.topics) ? agent.topics : []),
+    workflowResult.topic_label || workflowResult.topicLabel || ""
+  ].filter(Boolean).join("\n");
+  const candidateMap = new Map();
+  const addCandidate = (topic, score, source, evidence = "") => {
+    const label = String(topic || "").trim();
+    if (!label) return;
+    const key = normalizedTopicKey(label);
+    if (!key) return;
+    const direct = topicDirectHit(prompt, label) || topicDirectHit(knowledgePoint, label);
+    let adjusted = Number(score || 0);
+    if (direct) adjusted = Math.max(adjusted + 0.22, 0.92);
+    if (!direct && source === "图谱焦点") adjusted = Math.min(adjusted, 0.58);
+    adjusted = Math.max(0.05, Math.min(1, adjusted));
+    const existing = candidateMap.get(key);
+    const item = {
+      topic: label,
+      probability: Number(adjusted.toFixed(4)),
+      source,
+      evidence: evidence || (direct ? "学生问题或手动上下文直接命中该知识点" : "由工作流、图谱或检索证据推断"),
+      direct
+    };
+    if (!existing || item.probability > existing.probability) candidateMap.set(key, item);
+  };
+
+  if (knowledgePoint) addCandidate(knowledgePoint, 0.82, "手动上下文", "学生或页面上下文已指定知识点");
+  const workflowTopic = workflowResult.topic_label || workflowResult.topicLabel || "";
+  if (workflowTopic) addCandidate(workflowTopic, normalizeTopicProbability(workflowResult.topic_probability ?? workflowResult.topicProbability, agent.confidence === "dify" ? 0.68 : 0.54), "Dify 工作流", "工作流结构化输出的 topic_label");
+  const workflowCandidates = Array.isArray(workflowResult.top_topic_candidates || workflowResult.topTopicCandidates)
+    ? (workflowResult.top_topic_candidates || workflowResult.topTopicCandidates)
+    : [];
+  workflowCandidates.forEach((item, index) => {
+    const topic = typeof item === "string" ? item : item.topic || item.label || item.name || "";
+    const probability = typeof item === "string" ? Math.max(0.42, 0.58 - index * 0.06) : normalizeTopicProbability(item.probability ?? item.score, Math.max(0.42, 0.62 - index * 0.07));
+    addCandidate(topic, probability, "Dify 候选", "工作流返回的候选知识点");
+  });
+  (Array.isArray(agent.topics) ? agent.topics : []).forEach((topic, index) => {
+    addCandidate(topic, Math.max(0.32, 0.54 - index * 0.04), "智能体候选", "智能体综合检索与回答生成得到");
+  });
+  if (graphContext?.focusNode?.label) {
+    addCandidate(graphContext.focusNode.label, 0.52, "图谱焦点", graphContext.graphTitle ? `命中图谱「${graphContext.graphTitle}」节点` : "命中知识图谱节点");
+  }
+  ML_TERM_PATTERNS.forEach((item) => {
+    if (item.pattern.test(evidenceText)) addCandidate(item.label, 0.88, "问题文本命中", `问题文本命中「${item.label}」别名或关键词`);
+  });
+
+  const candidates = Array.from(candidateMap.values())
+    .sort((a, b) => b.probability - a.probability)
+    .slice(0, 5);
+  const best = candidates[0] || {
+    topic: knowledgePoint || workflowTopic || "待确认知识点",
+    probability: 0.35,
+    source: "待确认",
+    evidence: "没有足够的题面、上下文或图谱证据",
+    direct: false
+  };
+  const second = candidates[1];
+  const margin = second ? best.probability - second.probability : best.probability;
+  const needsConfirmation = best.probability < 0.62 || (!best.direct && second && margin < 0.12);
+  const confidenceLabel = best.probability >= 0.82
+    ? "高"
+    : best.probability >= 0.62 ? "中" : "低";
+  return {
+    selectedTopic: best.topic,
+    confidence: best.probability,
+    confidenceLabel,
+    needsConfirmation,
+    candidates,
+    basis: best.evidence,
+    policy: needsConfirmation ? "低置信度或候选接近，仅记录为待确认，不更新掌握度。" : "定位证据充足，本轮可写入学习画像。",
+    corrected: false
+  };
+}
+
 function profileMasterySummary(profile) {
   const entries = Object.entries(profile.mastery || {})
     .filter(([, item]) => Array.isArray(item?.evidence) && item.evidence.length > 0)
@@ -5397,6 +5695,51 @@ function updateTopicMastery(db, userId, topics, delta, evidence) {
   return profile;
 }
 
+function appendLearningEvidence(db, item = {}) {
+  db.learningEvidence = Array.isArray(db.learningEvidence) ? db.learningEvidence : [];
+  const evidence = { id: uid("evidence"), studentId: String(item.studentId || ""), evidenceType: String(item.evidenceType || "learning_event").slice(0, 80), relatedNodeIds: Array.isArray(item.relatedNodeIds) ? item.relatedNodeIds.map(String).slice(0, 20) : [], relatedMisconceptionId: String(item.relatedMisconceptionId || ""), eventId: String(item.eventId || ""), summary: String(item.summary || "").slice(0, 1200), teacherVerified: Boolean(item.teacherVerified), createdAt: now() };
+  if (!evidence.studentId) return null;
+  db.learningEvidence.unshift(evidence); db.learningEvidence = db.learningEvidence.slice(0, 6000);
+  return evidence;
+}
+
+function appendNodeMasterySnapshot(db, studentId, nodeId, masteryScore, source, eventId = "") {
+  if (!nodeId || masteryScore === null || masteryScore === undefined) return null;
+  db.nodeMasterySnapshots = Array.isArray(db.nodeMasterySnapshots) ? db.nodeMasterySnapshots : [];
+  const snapshot = { id: uid("mastery_snap"), studentId, nodeId: String(nodeId), masteryScore: normalizeLearningScore(masteryScore), source: String(source || "learning_activity").slice(0, 100), eventId: String(eventId || ""), recordedAt: now() };
+  db.nodeMasterySnapshots.unshift(snapshot); db.nodeMasterySnapshots = db.nodeMasterySnapshots.slice(0, 10000);
+  return snapshot;
+}
+
+function upsertMisconceptionRecord(db, item = {}) {
+  db.misconceptionRecords = Array.isArray(db.misconceptionRecords) ? db.misconceptionRecords : [];
+  const studentId = String(item.studentId || ""); const type = String(item.misconceptionType || "待归类错因").slice(0, 180); const nodeId = String(item.nodeId || "");
+  if (!studentId) return null;
+  const record = db.misconceptionRecords.find((row) => row.studentId === studentId && row.nodeId === nodeId && row.misconceptionType === type && row.status !== "eliminated");
+  const history = { at: now(), action: String(item.action || "diagnosed").slice(0, 80), detail: String(item.detail || "").slice(0, 600), evidenceId: String(item.evidenceId || "") };
+  if (record) { record.lastSeen = now(); record.evidenceId = history.evidenceId || record.evidenceId; record.status = item.status || record.status || "active"; record.interventionHistory = [...(record.interventionHistory || []), history].slice(-20); return record; }
+  const next = { id: uid("misconception"), studentId, nodeId, misconceptionType: type, evidenceId: history.evidenceId, firstSeen: now(), lastSeen: now(), status: item.status || "active", interventionHistory: [history] };
+  db.misconceptionRecords.unshift(next); db.misconceptionRecords = db.misconceptionRecords.slice(0, 5000); return next;
+}
+
+function createPrePostAssessment(db, item = {}) {
+  db.prePostAssessments = Array.isArray(db.prePostAssessments) ? db.prePostAssessments : [];
+  const assessment = { id: uid("assessment"), studentId: String(item.studentId || ""), cycleId: String(item.cycleId || ""), assessmentType: String(item.assessmentType || "diagnostic").slice(0, 60), score: normalizeLearningScore(item.score), nodeScores: item.nodeScores && typeof item.nodeScores === "object" ? item.nodeScores : {}, completedAt: item.completedAt || now() };
+  db.prePostAssessments.unshift(assessment); db.prePostAssessments = db.prePostAssessments.slice(0, 5000); return assessment;
+}
+
+function createLearningPathRecommendation(db, item = {}) {
+  db.learningPathRecommendations = Array.isArray(db.learningPathRecommendations) ? db.learningPathRecommendations : [];
+  const path = { id: uid("path"), studentId: String(item.studentId || ""), targetNodes: Array.isArray(item.targetNodes) ? item.targetNodes.map(String).slice(0, 20) : [], reason: String(item.reason || "").slice(0, 1000), tasks: Array.isArray(item.tasks) ? item.tasks.slice(0, 12) : [], estimatedMinutes: Math.max(0, Math.min(1440, Number(item.estimatedMinutes || 0))), status: String(item.status || "recommended").slice(0, 40), createdAt: now(), updatedAt: now() };
+  db.learningPathRecommendations.unshift(path); db.learningPathRecommendations = db.learningPathRecommendations.slice(0, 3000); return path;
+}
+
+function createExperimentSubmissionRecord(db, item = {}) {
+  db.experimentSubmissions = Array.isArray(db.experimentSubmissions) ? db.experimentSubmissions : [];
+  const submission = { id: uid("experiment_submission"), studentId: String(item.studentId || ""), experimentId: String(item.experimentId || ""), artifacts: Array.isArray(item.artifacts) ? item.artifacts.slice(0, 12) : [], resultSummary: String(item.resultSummary || "").slice(0, 1500), aiFeedback: String(item.aiFeedback || "").slice(0, 1500), reflection: item.reflection && typeof item.reflection === "object" ? item.reflection : {}, modelId: String(item.modelId || ""), submittedAt: now() };
+  db.experimentSubmissions.unshift(submission); db.experimentSubmissions = db.experimentSubmissions.slice(0, 3000); return submission;
+}
+
 function recordLearningActivity(db, userId, activity) {
   const profile = ensureLearningProfile(db, userId);
   profile.questionCount = Number(profile.questionCount || 0) + (activity.kind === "question" ? 1 : 0);
@@ -5424,6 +5767,8 @@ function addWrongNote(db, userId, note) {
   };
   db.wrongNotes.unshift(wrongNote);
   db.wrongNotes = db.wrongNotes.slice(0, 500);
+  const misconception = upsertMisconceptionRecord(db, { studentId: userId, nodeId: note.nodeId || "", misconceptionType: note.misconceptionType || wrongNote.analysis || wrongNote.topic, action: "diagnosed", detail: wrongNote.analysis, status: "active" });
+  wrongNote.misconceptionId = misconception?.id || "";
   return wrongNote;
 }
 
@@ -5522,6 +5867,73 @@ function buildAgentActions(mode, topics) {
   ]);
 }
 
+function metacognitivePromptsForTopic(topic = "当前知识点", mode = "qa") {
+  const label = String(topic || "当前知识点").trim() || "当前知识点";
+  const common = [
+    `你为什么会这样理解「${label}」？请写出依据，而不是只写结论。`,
+    `你能不能举一个反例或边界场景，检验自己是否真的理解「${label}」？`,
+    "你现在最不确定的一步是什么？下一次准备怎么验证？",
+    "这次你使用 AI 是为了获得提示、核对证据，还是直接替代思考？"
+  ];
+  if (mode === "grade") {
+    return [
+      `你这次错误更像是概念误解、条件遗漏、步骤跳跃，还是表达不完整？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  if (mode === "practice") {
+    return [
+      `作答前，你准备先用哪个知识点或公式？为什么？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  if (mode === "guided") {
+    return [
+      `在看下一条提示前，你能先说出自己已经确定的部分吗？`,
+      ...common.slice(0, 3)
+    ];
+  }
+  return common;
+}
+
+function buildGraphProfileRecommendations({ topics = [], graphContext = {}, profile = {}, mastery = [] }) {
+  const focus = graphContext?.focusNode;
+  const topic = topics[0] || focus?.label || "当前知识点";
+  const weakTopics = mastery.filter((item) => item.score === null || item.score < 0.58).map((item) => item.topic).slice(0, 4);
+  const prerequisites = (graphContext?.prerequisiteNodes || []).map((node) => node.label).filter(Boolean).slice(0, 4);
+  const related = (graphContext?.relatedNodes || []).map((node) => node.label).filter(Boolean).slice(0, 4);
+  const profileEvidence = profile.mastery?.[topic]?.evidence || [];
+  const nextPath = [
+    prerequisites.length ? `先补前置：${prerequisites.join("、")}` : "",
+    `聚焦节点：${focus?.label || topic}`,
+    weakTopics.length ? `修正薄弱：${weakTopics.join("、")}` : "完成一次变式测试",
+    "写结构化反思并进入学习档案"
+  ].filter(Boolean);
+  return {
+    title: "GraphRAG + 学习画像推荐路径",
+    topic,
+    graphNode: focus ? {
+      graphId: graphContext.graphId || "",
+      graphTitle: graphContext.graphTitle || "",
+      nodeId: focus.id || "",
+      label: focus.label || topic,
+      path: graphContext.path || []
+    } : null,
+    weakTopics,
+    prerequisites,
+    related,
+    nextPath,
+    evidenceIndex: {
+      profileEvidenceCount: Array.isArray(profileEvidence) ? profileEvidence.length : 0,
+      graphEvidence: focus ? "知识图谱节点作为证据索引" : "未命中图谱节点",
+      ragEvidence: "引用来源与图谱节点共同约束 AI 回答"
+    },
+    rationale: focus
+      ? "AI 回答绑定课程资料和图谱节点，本轮行为回写画像，画像再反向影响复习路径。"
+      : "当前没有稳定图谱焦点，建议先用知识点纠错或图谱定位确认节点后再更新画像。"
+  };
+}
+
 function buildLearningPanel({ citations, topics, graphContext, profile, mode, strategy, answerDepth }) {
   const mastery = masteryItemsForTopics(profile, topics);
   const prerequisites = (graphContext?.prerequisiteNodes || []).map((node) => ({
@@ -5552,6 +5964,8 @@ function buildLearningPanel({ citations, topics, graphContext, profile, mode, st
     prerequisites,
     misconceptions,
     recommendedExercises: buildRecommendedExercises(mode, topics, graphContext),
+    metacognitivePrompts: metacognitivePromptsForTopic(topics[0] || graphContext?.focusNode?.label || "当前知识点", mode),
+    profileDrivenPath: buildGraphProfileRecommendations({ topics, graphContext, profile, mastery }),
     mastery,
     suggestions,
     graphFocus: graphContext?.focusNode ? {
@@ -5953,6 +6367,17 @@ function assessMlDiagnosisMastery({ question = "", studentAnswer = "", topicLabe
   if (["KNN", "KMeans聚类", "PCA降维", "支持向量机"].includes(topicLabel) && !dimensions["数据预处理"]) errors.push("数据预处理缺失");
 
   const error_tags = Array.from(new Set(errors));
+  const evidenceLines = answer
+    .split(/\r?\n|[。；;！？!?]/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const error_evidence = evidenceLines.find((line) => error_tags.some((tag) => {
+    if (/概念|任务类型/.test(tag)) return /分类|聚类|监督|无监督|连续/.test(line);
+    if (/公式|目标/.test(tag)) return /损失|梯度|函数|正则|交叉熵/.test(line);
+    if (/流程|步骤/.test(tag)) return /训练|预测|更新|迭代|测试/.test(line);
+    if (/数据|指标/.test(tag)) return /测试集|训练集|调参|准确率|召回率|F1/.test(line);
+    return false;
+  })) || evidenceLines[0] || "学生未提供可定位的具体句子或代码行。";
   score -= error_tags.length * 6;
   const mastery_score = Math.max(0, Math.min(100, Math.round(score)));
   const missing_points = Object.entries(dimensions)
@@ -5975,6 +6400,7 @@ function assessMlDiagnosisMastery({ question = "", studentAnswer = "", topicLabe
     mastery_score,
     mastery_level: mlDiagnosisMasteryLevel(mastery_score),
     error_tags,
+    error_evidence,
     missing_points,
     positive_points,
     project_sync_suggestion
@@ -6060,12 +6486,22 @@ function buildMlDiagnosisFeedback({ diagnosisMode = "知识问答模式", studen
 function buildMlDiagnosisFinalAnswer({ topic, mastery, standardAnswer, diagnosisFeedback, ragEvidence = [] }) {
   const nextQuestions = mlDiagnosisNextQuestions(topic.topic_label, mastery.missing_points);
   const structuredResult = {
+    workflow_type: "misconception_classification",
+    knowledge_point: topic.topic_label,
+    graph_node_id: graphNodeIdForWorkflow(topic.topic_label),
+    is_correct: Number(mastery.mastery_score || 0) >= 75,
+    misconception_tags: mastery.error_tags || [],
+    misconception_level: Number(mastery.mastery_score || 0) < 45 ? "high" : Number(mastery.mastery_score || 0) < 70 ? "medium" : "low",
+    evidence: (mastery.error_evidence || [])[0] || diagnosisFeedback || "",
+    recommended_actions: mlDiagnosisNextQuestions(topic.topic_label, mastery.missing_points).slice(0, 3),
+    need_reassessment: Number(mastery.mastery_score || 0) < 75,
     topic_label: topic.topic_label,
     topic_probability: topic.topic_probability,
     top_topic_candidates: topic.top_topic_candidates,
     mastery_score: mastery.mastery_score,
     mastery_level: mastery.mastery_level,
     error_tags: mastery.error_tags,
+    error_evidence: mastery.error_evidence,
     missing_points: mastery.missing_points,
     rag_evidence: ragEvidence,
     standard_answer: standardAnswer,
@@ -6140,6 +6576,13 @@ function buildMlDiagnosisWorkflowAnswer({ user, mode, prompt, hits = [], citatio
       student_answer: studentAnswer
     }
   };
+}
+
+function normalizeMisconceptionClassification(result = {}, context = {}) {
+  const score = Number(result.mastery_score ?? result.masteryScore ?? context.masteryScore ?? 0);
+  const tags = Array.isArray(result.misconception_tags) ? result.misconception_tags : Array.isArray(result.error_tags) ? result.error_tags : [];
+  const topic = String(result.knowledge_point || result.topic_label || context.knowledgePoint || "机器学习知识点");
+  return { workflow_type: "misconception_classification", knowledge_point: topic, graph_node_id: String(result.graph_node_id || context.nodeId || graphNodeIdForWorkflow(topic)), is_correct: result.is_correct !== undefined ? Boolean(result.is_correct) : score >= 75, misconception_tags: tags.map(String).slice(0, 12), misconception_level: String(result.misconception_level || (score < 45 ? "high" : score < 70 ? "medium" : "low")), evidence: String(result.evidence || result.error_evidence?.[0] || result.diagnosis_feedback || "").slice(0, 1200), mastery_score: Math.max(0, Math.min(100, Number.isFinite(score) ? Math.round(score) : 0)), recommended_actions: (Array.isArray(result.recommended_actions) ? result.recommended_actions : Array.isArray(result.next_questions) ? result.next_questions : []).map(String).slice(0, 5), need_reassessment: result.need_reassessment !== undefined ? Boolean(result.need_reassessment) : score < 75 };
 }
 
 function answerFromEvidence({ user, mode, prompt, hits, citations, profile, teaching, answerDepth, chapter, knowledgePoint, studentAnswer = "" }) {
@@ -6482,6 +6925,39 @@ function difyWorkflowUrl() {
   return `${DIFY_BASE_URL}/workflows/run`;
 }
 
+function compactDifyErrorDetail(error) {
+  const parts = [
+    error?.message,
+    error?.cause?.message,
+    error?.cause?.code,
+    error?.cause?.errno,
+    error?.cause?.address ? `${error.cause.address}${error.cause.port ? `:${error.cause.port}` : ""}` : ""
+  ].filter(Boolean);
+  return Array.from(new Set(parts.map((item) => String(item).trim()).filter(Boolean))).join("；");
+}
+
+function formatDifyNetworkError(error, authHintName) {
+  const targetUrl = difyWorkflowUrl();
+  const baseHint = `请确认 Dify 服务已启动，${authHintName} 已配置为已发布工作流 App 的 API Key，并检查 .env 中 DIFY_BASE_URL=${DIFY_BASE_URL} 是否能从当前 Node 服务访问。`;
+  if (error?.name === "AbortError") {
+    return `Dify 工作流请求超时：${DIFY_WORKFLOW_TIMEOUT_MS}ms 内未收到响应。目标地址：${targetUrl}。${baseHint}`;
+  }
+  const detail = compactDifyErrorDetail(error) || "网络请求失败";
+  const connectionCodes = ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"];
+  const looksLikeNetworkFailure = /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|connect|network/i.test(detail);
+  const codeHint = connectionCodes.find((code) => detail.includes(code));
+  const reason = codeHint === "ECONNREFUSED"
+    ? "Dify 端口拒绝连接，通常表示 Dify 未启动、端口不对，或服务没有监听该地址"
+    : codeHint === "ENOTFOUND" || codeHint === "EAI_AGAIN"
+      ? "无法解析 Dify 地址，通常是容器/宿主机地址写法不适用"
+      : codeHint === "ETIMEDOUT" || codeHint === "UND_ERR_CONNECT_TIMEOUT"
+        ? "连接 Dify 超时，可能是服务无响应或网络不可达"
+        : looksLikeNetworkFailure
+          ? "无法连接到 Dify 工作流接口"
+          : "Dify 工作流请求失败";
+  return `${reason}。目标地址：${targetUrl}。原始错误：${detail}。${baseHint}`;
+}
+
 async function postDifyWorkflow({ apiKey, inputs, user, authHintName = "DIFY_WORKFLOW_API_KEY" }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DIFY_WORKFLOW_TIMEOUT_MS);
@@ -6508,6 +6984,12 @@ async function postDifyWorkflow({ apiKey, inputs, user, authHintName = "DIFY_WOR
       });
     }
     return payload;
+  } catch (error) {
+    if (error?.status) throw error;
+    throw Object.assign(new Error(formatDifyNetworkError(error, authHintName)), {
+      status: 502,
+      cause: error
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -6603,7 +7085,9 @@ function buildDifyAssistantContext({ user, mode, teaching, subject, chapter, kno
     answer_depth: answerDepth,
     target_level: difyTargetLevel(answerDepth),
     diagnosis_depth: difyDiagnosisDepth(answerDepth),
-    has_student_answer: Boolean(hasStudentAnswer)
+    has_student_answer: Boolean(hasStudentAnswer),
+    metacognitive_prompts: metacognitivePromptsForTopic(knowledgePoint || subject || "当前知识点", mode),
+    metacognitive_instruction: "回答后必须引导学生解释依据、检验反例、标记不确定点，并反思是否过度依赖 AI。"
   };
 }
 
@@ -7223,22 +7707,92 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     throw Object.assign(new Error(`学生 Dify 工作流调用失败：${error.message || error}`), { status: 502 });
   }
   const graphContext = findGraphContext(db, user.id, subject, retrievalQuery, agent.topics, hits);
+  const workflowResult = agent.workflowResult || {};
+  const topicLocalization = buildTopicLocalization({ prompt, knowledgePoint, graphContext, agent, workflowResult });
   const topics = Array.from(new Set([
+    topicLocalization.selectedTopic,
     knowledgePoint,
-    graphContext.focusNode?.label,
-    ...(agent.topics || [])
+    ...(agent.topics || []),
+    graphContext.focusNode?.label
   ].filter(Boolean))).slice(0, 8);
+  const masteryTopics = topicLocalization.needsConfirmation ? [] : topics;
   const evidenceDelta = ["high", "dify"].includes(agent.confidence) ? 0.04 : agent.confidence === "medium" ? 0.02 : -0.02;
   let updatedProfile = profile;
-  updatedProfile = updateTopicMastery(db, user.id, topics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  if (masteryTopics.length) {
+    updatedProfile = updateTopicMastery(db, user.id, masteryTopics, evidenceDelta, `智能体对话：${prompt.slice(0, 60)}`);
+  }
   recordLearningActivity(db, user.id, {
     kind: mode === "practice" ? "practice" : "question",
     mode,
     prompt: prompt.slice(0, 120),
     topics,
     confidence: agent.confidence,
+    topicLocalization,
     minutes: mode === "plan" ? 6 : 3
   });
+  const enrichedWorkflowResult = {
+    ...workflowResult,
+    topic_label: topicLocalization.selectedTopic || workflowResult.topic_label || topics[0] || knowledgePoint,
+    topic_probability: topicLocalization.confidence,
+    top_topic_candidates: topicLocalization.candidates,
+    topic_localization: topicLocalization,
+    mastery_update_skipped: topicLocalization.needsConfirmation
+  };
+  const workflowRequestId = String(workflowResult.request_id || workflowResult.requestId || "").trim();
+  const workflowScore = Number(workflowResult.mastery_score ?? workflowResult.masteryScore);
+  const workflowType = mlWorkflowType(body.workflowType || body.workflow_type, mode);
+  const structuredDiagnosis = normalizeMisconceptionClassification(workflowResult, { knowledgePoint: topicLocalization.selectedTopic || topics[0] || knowledgePoint, nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""), masteryScore: workflowScore });
+  Object.assign(enrichedWorkflowResult, workflowType === "misconception_classification" ? structuredDiagnosis : { workflow_type: workflowType });
+  const acceptedWorkflowScore = topicLocalization.needsConfirmation ? null : (Number.isFinite(workflowScore) ? workflowScore : null);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: user.id,
+    classId: String(body.classId || body.class_id || user.classIds?.[0] || ""),
+    eventType: topicLocalization.needsConfirmation ? "ai_topic_pending" : (hasStudentAnswer || mode === "grade" ? "ai_diagnosis" : "ai_question"),
+    source: agent.workflowSource || "dify-api",
+    subject,
+    knowledgePoint: topicLocalization.selectedTopic || topics[0] || knowledgePoint,
+    graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
+    nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
+    score: acceptedWorkflowScore,
+    payload: {
+      requestId: workflowRequestId,
+      mode,
+      prompt,
+      studentAnswer,
+      topics,
+      topicLocalization,
+      masteryUpdated: Boolean(masteryTopics.length),
+      confidence: agent.confidence,
+      workflowRunId: workflowResult.workflow_run_id || "",
+      taskId: workflowResult.task_id || ""
+    },
+    evidenceType: workflowType,
+    evidenceSummary: workflowType === "misconception_classification" ? structuredDiagnosis.evidence : `AI ${workflowType}：${prompt.slice(0, 80)}`,
+    idempotencyKey: workflowRequestId ? `dify:${workflowRequestId}` : ""
+  });
+  if (workflowResult.mastery_score !== undefined || workflowResult.masteryScore !== undefined || workflowResult.mastery_level || workflowResult.masteryLevel) {
+    recordDiagnosisResult(db, {
+      studentId: user.id,
+      eventId: learningEvent?.id || "",
+      topic: topicLocalization.selectedTopic || workflowResult.topic_label || topics[0] || knowledgePoint,
+      masteryScore: acceptedWorkflowScore,
+      masteryLevel: topicLocalization.needsConfirmation ? "待确认" : (workflowResult.mastery_level || workflowResult.masteryLevel || ""),
+      errorTags: Array.isArray(workflowResult.error_tags) ? workflowResult.error_tags : [],
+      missingPoints: Array.isArray(workflowResult.missing_points) ? workflowResult.missing_points : [],
+      evidence: Array.isArray(workflowResult.rag_evidence) ? workflowResult.rag_evidence : [],
+      finalAnswer: agent.content || "",
+      modelOrWorkflow: agent.workflowSource || "dify-api",
+      idempotencyKey: workflowRequestId ? `dify-diagnosis:${workflowRequestId}` : ""
+    });
+  }
+  if (masteryTopics.length) {
+    syncStudentMasteryFromProfile(db, user.id, masteryTopics, {
+      subject,
+      graphId: String(body.graphId || body.graph_id || graphContext.graphId || ""),
+      nodeId: String(body.nodeId || body.node_id || graphContext.focusNode?.id || ""),
+      lastEventId: learningEvent?.id || ""
+    });
+  }
   if (mode === "grade" && topics[0]) {
     addWrongNote(db, user.id, {
       source: "批改反馈",
@@ -7257,6 +7811,7 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     strategy: teaching.strategy,
     answerDepth
   });
+  learningPanel.topicLocalization = topicLocalization;
   const workflow = buildMlDiagnosisWorkflowTrace({ retrieval, citations, mode, topics, hasStudentAnswer });
   return {
     ...agent,
@@ -7271,7 +7826,8 @@ async function buildStudentDiagnosisAnswer(db, user, body) {
     actions: buildAgentActions(mode, topics),
     learningPanel,
     workflow,
-    workflowResult: agent.workflowResult,
+    workflowResult: enrichedWorkflowResult,
+    workflowContract: ML_AI_WORKFLOW_CONTRACTS[workflowType] || ML_AI_WORKFLOW_CONTRACTS.knowledge_qa,
     retrieved: hits.map((hit) => ({ type: hit.type, title: hit.title, score: hit.score, subject: hit.subject, chapter: hit.chapter, ragChannel: hit.ragChannel || "" })),
     tools: [
       "intent_router",
@@ -7413,6 +7969,1876 @@ function learningAnalytics(db, userId) {
   };
 }
 
+function scorePercentNumber(value) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? null : Math.round(normalized * 100);
+}
+
+function scorePercentText(value, fallback = "未记录") {
+  const score = scorePercentNumber(value);
+  return score === null ? fallback : `${score}%`;
+}
+
+function eventTimeValue(item) {
+  return new Date(item?.occurredAt || item?.createdAt || item?.updatedAt || item?.submittedAt || item?.gradedAt || 0).getTime() || 0;
+}
+
+function sortNewest(items = []) {
+  return items.slice().sort((a, b) => eventTimeValue(b) - eventTimeValue(a));
+}
+
+function classNamesForUser(db, user) {
+  const ids = new Set(Array.isArray(user.classIds) ? user.classIds : []);
+  (db.classes || []).forEach((klass) => {
+    if ((klass.studentIds || []).includes(user.id)) ids.add(klass.id);
+  });
+  return Array.from(ids).map((id) => (db.classes || []).find((klass) => klass.id === id)?.name).filter(Boolean);
+}
+
+function inferPortfolioSubject(db, userId, events = []) {
+  const profile = ensureLearningProfile(db, userId);
+  const user = getUser(db, userId) || {};
+  const subjectCounts = new Map();
+  const add = (subject, weight = 1) => {
+    const label = normalizeSubject(subject || "");
+    if (!label || label === "通用") return;
+    subjectCounts.set(label, (subjectCounts.get(label) || 0) + weight);
+  };
+  events.forEach((event) => add(event.subject, 2));
+  Object.keys(profile.mastery || {}).forEach((topic) => {
+    if (/KNN|K\s*近邻|逻辑回归|支持向量机|SVM|机器学习|监督学习|特征工程/i.test(topic)) add("机器学习", 3);
+  });
+  (db.courseMaterials || []).filter((item) => item.ownerId === userId || item.global).forEach((item) => add(item.subject, 0.5));
+  add(user.subject || user.className, 1);
+  const ranked = Array.from(subjectCounts.entries()).sort((a, b) => b[1] - a[1]);
+  return ranked[0]?.[0] || user.subject || "机器学习";
+}
+
+function portfolioGoalsForSubject(subject) {
+  if (/机器学习|machine learning|ML/i.test(subject)) {
+    return ["理解 KNN、逻辑回归、支持向量机等核心算法", "能解释算法适用条件、关键参数和常见误区", "能用测验、代码实验和反思证明学习改进"];
+  }
+  return [`理解${subject || "本课程"}核心概念`, "能用资料引用和练习结果解释学习过程", "能形成错因修正、作品证据和个人反思"];
+}
+
+function portfolioStage(evidence = {}) {
+  const stages = [
+    { key: "pretest", label: "前测诊断", done: evidence.knowledgeTests > 0 || evidence.masteryChanges > 0 },
+    { key: "goals", label: "学习目标设定", done: evidence.learningCycles > 0 || evidence.nodeAnnotations > 0 },
+    { key: "aiGraph", label: "AI + 知识图谱学习", done: evidence.aiDialogues > 0 && evidence.nodeAnnotations > 0 },
+    { key: "practice", label: "节点练习/作业", done: evidence.knowledgeTests > 1 || evidence.learningOutputs > 0 },
+    { key: "fix", label: "错因修正", done: evidence.wrongNotes > 0 },
+    { key: "posttest", label: "后测与反思", done: evidence.knowledgeTests >= 2 && evidence.reflections > 0 }
+  ];
+  const active = stages.find((stage) => !stage.done) || stages[stages.length - 1];
+  return {
+    label: stages.map((stage) => stage.label).join(" → "),
+    activeKey: active.key,
+    activeLabel: active.label,
+    stages,
+    progress: Math.round(stages.filter((stage) => stage.done).length / stages.length * 100)
+  };
+}
+
+function buildMasteryComparison(events = [], mastery = []) {
+  const groups = new Map();
+  events
+    .filter((event) => event.knowledgePoint && event.score !== null && event.score !== undefined)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b))
+    .forEach((event) => {
+      const key = event.knowledgePoint;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(event);
+    });
+  mastery.forEach((item) => {
+    const key = item.knowledgePoint;
+    if (!key) return;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({
+      knowledgePoint: key,
+      subject: item.subject,
+      score: item.score,
+      eventType: "student_mastery_snapshot",
+      source: "studentMastery",
+      occurredAt: item.updatedAt,
+      createdAt: item.updatedAt
+    });
+  });
+  return Array.from(groups.entries()).map(([topic, rows]) => {
+    const sorted = rows.sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+    const first = sorted.find((item) => item.score !== null && item.score !== undefined);
+    const last = sorted.slice().reverse().find((item) => item.score !== null && item.score !== undefined);
+    const start = normalizeLearningScore(first?.score);
+    const current = normalizeLearningScore(last?.score);
+    const change = start !== null && current !== null ? Number((current - start).toFixed(4)) : null;
+    return {
+      topic,
+      subject: last?.subject || first?.subject || "",
+      start,
+      current,
+      change,
+      startText: scorePercentText(start),
+      currentText: scorePercentText(current),
+      changeText: change === null ? "未计算" : `${change >= 0 ? "+" : ""}${Math.round(change * 100)}%`,
+      evidenceCount: sorted.length,
+      firstAt: first?.occurredAt || first?.createdAt || "",
+      lastAt: last?.occurredAt || last?.createdAt || ""
+    };
+  }).sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0)).slice(0, 24);
+}
+
+const DEFAULT_LEARNING_CYCLE_REQUIREMENTS = {
+  aiDialogues: 3,
+  knowledgeTests: 2,
+  reflections: 1,
+  learningOutputs: 1,
+  wrongFixes: 1
+};
+
+const LEARNING_CYCLE_TEMPLATES = [
+  {
+    key: "knn_intro",
+    name: "KNN 入门周期",
+    title: "机器学习 KNN 入门学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 2 周",
+    goals: ["理解 KNN 核心思想", "掌握距离度量与 K 值选择", "能用测试和错因订正解释 KNN 的适用边界"],
+    focusNodes: ["KNN", "距离度量", "K 值选择", "特征缩放", "分类边界"],
+    recommendedTestNodes: ["KNN", "距离度量", "K 值选择"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测与概念建构", tasks: ["完成 KNN 前测", "阅读 KNN 图谱节点", "先写自己的 KNN 理解再让 AI 诊断"] },
+      { week: "第 2 周", title: "变式测试与反思", tasks: ["完成距离度量测试", "订正 K 值选择误区", "写一次结构化反思并形成学习卡片"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "logistic_regression",
+    name: "逻辑回归专题周期",
+    title: "机器学习逻辑回归专题学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 3 周",
+    goals: ["理解逻辑回归基本思想", "说明 sigmoid、损失函数和决策边界", "能比较逻辑回归与 KNN 的适用场景"],
+    focusNodes: ["逻辑回归", "Sigmoid 函数", "损失函数", "决策边界", "分类评估"],
+    recommendedTestNodes: ["逻辑回归", "损失函数", "分类评估"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测与函数理解", tasks: ["完成逻辑回归前测", "标注 Sigmoid 节点", "向 AI 提交原始理解"] },
+      { week: "第 2 周", title: "损失函数与训练", tasks: ["完成损失函数测试", "整理常见误区", "用自己的话解释参数更新"] },
+      { week: "第 3 周", title: "后测与迁移", tasks: ["完成同知识点后测", "比较 KNN 与逻辑回归", "提交一份小实验或笔记"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "svm_compare",
+    name: "SVM 对比学习周期",
+    title: "机器学习 SVM 对比学习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 3 周",
+    goals: ["理解支持向量机的间隔思想", "比较 SVM、KNN 与逻辑回归的差异", "能识别核函数和超参数相关误区"],
+    focusNodes: ["支持向量机", "最大间隔", "核函数", "KNN", "逻辑回归"],
+    recommendedTestNodes: ["支持向量机", "最大间隔", "核函数"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "概念定位", tasks: ["完成 SVM 前测", "阅读最大间隔节点", "纠正 KNN/SVM 混淆点"] },
+      { week: "第 2 周", title: "对比学习", tasks: ["完成核函数测试", "用表格比较三类算法", "让 AI 检查比较依据"] },
+      { week: "第 3 周", title: "后测与反思", tasks: ["完成后测", "提交错因图谱或学习卡片", "写一次 AI 使用边界反思"] }
+    ],
+    evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 }
+  },
+  {
+    key: "ml_review",
+    name: "机器学习综合复习周期",
+    title: "机器学习核心算法综合复习周期",
+    subject: "机器学习",
+    startLabel: "第 1 周",
+    endLabel: "第 4 周",
+    goals: ["串联 KNN、逻辑回归、SVM 等核心算法", "用图谱路径定位薄弱点", "形成前后测对比、错因修正和学习产出"],
+    focusNodes: ["KNN", "逻辑回归", "支持向量机", "特征缩放", "模型评估"],
+    recommendedTestNodes: ["KNN", "逻辑回归", "支持向量机", "模型评估"],
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测诊断", tasks: ["完成综合前测", "选出 3 个薄弱节点", "设置本轮证据要求"] },
+      { week: "第 2 周", title: "图谱路径学习", tasks: ["按图谱路径复习 KNN 与逻辑回归", "完成一次 AI 诊断", "保存学习卡片"] },
+      { week: "第 3 周", title: "错因修正", tasks: ["完成阶段测", "订正错因标签", "上传笔记或代码实验"] },
+      { week: "第 4 周", title: "后测与档案", tasks: ["完成后测", "写周期总结反思", "生成匿名申报证据包"] }
+    ],
+    evidenceRequirements: { aiDialogues: 4, knowledgeTests: 3, reflections: 2, learningOutputs: 1, wrongFixes: 2 }
+  }
+];
+
+const LEARNING_CYCLE_TASK_STATUS_LABELS = {
+  not_started: "未开始",
+  in_progress: "进行中",
+  submitted: "已提交",
+  archived: "已入档",
+  needs_reflection: "需反思",
+  done: "已完成"
+};
+
+function normalizeStringItems(value, max = 12) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, max);
+  }
+  return String(value || "")
+    .split(/[\n,，;；、]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, max);
+}
+
+function normalizeWeeklyPlanItems(value, max = 8) {
+  const raw = Array.isArray(value) ? value : String(value || "")
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return raw.slice(0, max).map((item, index) => {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      return {
+        week: String(item.week || item.label || `第 ${index + 1} 周`).trim().slice(0, 40),
+        title: String(item.title || item.name || "").trim().slice(0, 80),
+        tasks: normalizeStringItems(item.tasks || item.task || "", 8)
+      };
+    }
+    const text = String(item || "").trim();
+    const parts = text.split(/[:：]/);
+    return {
+      week: parts.length > 1 ? parts[0].trim().slice(0, 40) : `第 ${index + 1} 周`,
+      title: parts.length > 1 ? parts[1].trim().slice(0, 80) : text.slice(0, 80),
+      tasks: parts.length > 2 ? normalizeStringItems(parts.slice(2).join("："), 8) : []
+    };
+  }).filter((item) => item.week || item.title || item.tasks.length);
+}
+
+function learningCycleTemplateLibrary() {
+  return LEARNING_CYCLE_TEMPLATES.map((template) => JSON.parse(JSON.stringify(template)));
+}
+
+function findLearningCycleTemplate(templateKey = "") {
+  return learningCycleTemplateLibrary().find((template) => template.key === String(templateKey || "").trim()) || null;
+}
+
+function learningCycleDefaultsForSubject(subject = "机器学习") {
+  const isMachineLearning = /机器学习|machine learning|ML|KNN|逻辑回归/i.test(subject || "");
+  const defaultTemplate = LEARNING_CYCLE_TEMPLATES[0];
+  return {
+    title: isMachineLearning ? "机器学习 KNN 与逻辑回归专题学习" : `${subject || "课程"}专题学习周期`,
+    subject: subject || "机器学习",
+    startLabel: isMachineLearning ? defaultTemplate.startLabel : "第 1 周",
+    endLabel: isMachineLearning ? "第 4 周" : "第 4 周",
+    goals: isMachineLearning
+      ? ["掌握 KNN 原理、距离度量与 K 值选择", "理解逻辑回归基本思想与适用场景", "能用测试、错因订正、反思和学习产出证明理解变化"]
+      : [`掌握${subject || "本课程"}核心概念`, "能用 AI 诊断和图谱路径修正误区", "形成可导出的学习证据档案"],
+    focusNodes: isMachineLearning ? ["KNN", "距离度量", "K 值选择", "逻辑回归", "损失函数"] : [],
+    weeklyPlan: isMachineLearning ? LEARNING_CYCLE_TEMPLATES[3].weeklyPlan : [],
+    recommendedTestNodes: isMachineLearning ? ["KNN", "距离度量", "K 值选择", "逻辑回归"] : [],
+    evidenceRequirements: { ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS }
+  };
+}
+
+function normalizeLearningCycleRecord(cycle = {}, userId = "", subject = "") {
+  const template = findLearningCycleTemplate(cycle.templateKey);
+  const defaults = {
+    ...learningCycleDefaultsForSubject(cycle.subject || subject),
+    ...(template || {})
+  };
+  const requirements = {
+    ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS,
+    ...(defaults.evidenceRequirements && typeof defaults.evidenceRequirements === "object" ? defaults.evidenceRequirements : {}),
+    ...(cycle.evidenceRequirements && typeof cycle.evidenceRequirements === "object" ? cycle.evidenceRequirements : {})
+  };
+  Object.keys(requirements).forEach((key) => {
+    requirements[key] = Math.max(0, Math.min(99, Number(requirements[key] || 0)));
+  });
+  return {
+    id: cycle.id || uid("cycle"),
+    studentId: cycle.studentId || userId,
+    title: String(cycle.title || defaults.title).trim().slice(0, 120),
+    subject: normalizeSubject(cycle.subject || defaults.subject || subject || ""),
+    startLabel: String(cycle.startLabel || defaults.startLabel).trim().slice(0, 40),
+    endLabel: String(cycle.endLabel || defaults.endLabel).trim().slice(0, 40),
+    startDate: String(cycle.startDate || "").trim().slice(0, 30),
+    endDate: String(cycle.endDate || "").trim().slice(0, 30),
+    goals: normalizeStringItems(cycle.goals && cycle.goals.length ? cycle.goals : defaults.goals, 8),
+    templateKey: String(cycle.templateKey || template?.key || "").trim().slice(0, 80),
+    focusNodes: normalizeStringItems(cycle.focusNodes && cycle.focusNodes.length ? cycle.focusNodes : defaults.focusNodes, 12),
+    weeklyPlan: normalizeWeeklyPlanItems(cycle.weeklyPlan && cycle.weeklyPlan.length ? cycle.weeklyPlan : defaults.weeklyPlan, 8),
+    recommendedTestNodes: normalizeStringItems(cycle.recommendedTestNodes && cycle.recommendedTestNodes.length ? cycle.recommendedTestNodes : defaults.recommendedTestNodes, 12),
+    viewMode: ["stage", "week"].includes(cycle.viewMode) ? cycle.viewMode : "stage",
+    evidenceRequirements: requirements,
+    status: ["draft", "active", "completed", "archived"].includes(cycle.status) ? cycle.status : "active",
+    manualTaskStatus: cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {},
+    createdAt: cycle.createdAt || now(),
+    updatedAt: cycle.updatedAt || cycle.createdAt || now()
+  };
+}
+
+function activeLearningCycle(db, userId, subject = "") {
+  db.learningCycles = Array.isArray(db.learningCycles) ? db.learningCycles : [];
+  const cycles = sortNewest(db.learningCycles.filter((item) => item.studentId === userId && item.status !== "archived"));
+  const selected = cycles.find((item) => item.status === "active") || cycles[0];
+  if (selected) return normalizeLearningCycleRecord(selected, userId, subject);
+  const defaults = learningCycleDefaultsForSubject(subject);
+  return normalizeLearningCycleRecord({
+    ...defaults,
+    id: `virtual_cycle_${userId}`,
+    studentId: userId,
+    virtual: true
+  }, userId, subject);
+}
+
+function buildLearningCycleTaskProgress(cycle = {}, evidenceCounts = {}) {
+  const requirements = {
+    ...DEFAULT_LEARNING_CYCLE_REQUIREMENTS,
+    ...(cycle.evidenceRequirements || {})
+  };
+  const knowledgeTests = Number(evidenceCounts.knowledgeTests || 0);
+  const wrongFixes = Number(evidenceCounts.wrongNotes || 0) + Number(evidenceCounts.corrections || 0);
+  const learningOutputs = Number(evidenceCounts.learningOutputs || 0);
+  const aiTarget = Math.max(1, Number(requirements.aiDialogues || 1));
+  const practiceTarget = Math.max(1, Number(requirements.knowledgeTests || 1)) + (Number(requirements.learningOutputs || 0) > 0 ? 1 : 0);
+  const reflectionTarget = Math.max(1, Number(requirements.reflections || 1));
+  const hasSavedCyclePlan = !String(cycle.id || "").startsWith("virtual_cycle_")
+    && (cycle.goals || []).length >= 2
+    && ((cycle.focusNodes || []).length || (cycle.recommendedTestNodes || []).length);
+  const values = {
+    pretest: Math.min(knowledgeTests, 1),
+    goals: hasSavedCyclePlan ? 1 : 0,
+    aiGraph: Math.min(Number(evidenceCounts.aiDialogues || 0), aiTarget) + Math.min(1, Number(evidenceCounts.nodeAnnotations || 0) + Number(evidenceCounts.learningCards || 0)),
+    practice: knowledgeTests + Math.min(1, learningOutputs),
+    wrongFix: wrongFixes,
+    postReflection: Math.min(1, Math.max(0, knowledgeTests - 1)) + Math.min(Number(evidenceCounts.reflections || 0), reflectionTarget)
+  };
+  const defs = [
+    {
+      key: "pretest",
+      label: "前测诊断",
+      shortLabel: "前测",
+      target: 1,
+      value: values.pretest,
+      page: "graph",
+      evidenceType: "前测证据",
+      evidence: "知识点掌握度、典型误区和原始理解会进入学习档案",
+      nextAction: "生成前测题并独立作答",
+      evidenceChecklist: ["前测分数", "薄弱知识点", "原始理解", "典型误区"]
+    },
+    {
+      key: "goals",
+      label: "学习目标设定",
+      shortLabel: "目标",
+      target: 1,
+      value: values.goals,
+      page: "home",
+      evidenceType: "目标证据",
+      evidence: "保存本周期要解决的 2-3 个具体难点和验证节点",
+      nextAction: "设置本轮学习周期、目标和重点节点",
+      evidenceChecklist: ["周期主题", "2-3 个难点", "目标节点", "证据要求"]
+    },
+    {
+      key: "aiGraph",
+      label: "AI + 知识图谱学习",
+      shortLabel: "AI+图谱",
+      target: aiTarget + 1,
+      value: values.aiGraph,
+      page: "ai",
+      evidenceType: "AI 与图谱证据",
+      evidence: "带着原始答案向 AI 追问，保留引用资料和图谱节点路径",
+      nextAction: "先写自己的理解，再让 AI 诊断并打开图谱焦点",
+      evidenceChecklist: ["AI 对话次数", "引用资料", "图谱路径", "AI 审辩记录"]
+    },
+    {
+      key: "practice",
+      label: "节点练习/作业",
+      shortLabel: "练习",
+      target: practiceTarget,
+      value: values.practice,
+      page: "graph",
+      evidenceType: "练习验证证据",
+      evidence: "知识测试、作业提交、代码实验或节点产出会写入学习画像",
+      nextAction: "完成一次同知识点变式测试或提交学习产出",
+      evidenceChecklist: ["正确率", "提交记录", "模型实验", "节点学习卡片"]
+    },
+    {
+      key: "wrongFix",
+      label: "错因修正",
+      shortLabel: "修正",
+      target: Math.max(1, Number(requirements.wrongFixes || 1)),
+      value: values.wrongFix,
+      page: "portfolio",
+      evidenceType: "错因修正证据",
+      evidence: "记录错题、误区、修正解释和二次验证方式",
+      nextAction: "补充错因、修正后理解和验证题",
+      evidenceChecklist: ["错题", "误区标签", "修正解释", "二次验证"]
+    },
+    {
+      key: "postReflection",
+      label: "后测与反思",
+      shortLabel: "后测反思",
+      target: reflectionTarget + 1,
+      value: values.postReflection,
+      page: "portfolio",
+      evidenceType: "后测反思证据",
+      evidence: "后测掌握度变化、学习策略变化和 AI 使用反思共同入档",
+      nextAction: "完成后测，并填写结构化反思卡",
+      evidenceChecklist: ["后测掌握度", "学习策略变化", "AI 使用反思", "下一步验证计划"]
+    }
+  ];
+  const manual = cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {};
+  const tasks = defs.map((task) => {
+    const target = Math.max(1, Number(task.target || 1));
+    const value = Math.max(0, Number(task.value || 0));
+    const manualStatus = manual[task.key] || {};
+    const evidenceDone = value >= target;
+    const manualStatusKey = LEARNING_CYCLE_TASK_STATUS_LABELS[manualStatus.status] ? manualStatus.status : "";
+    let statusKey = manualStatusKey || (value > 0 ? "in_progress" : "not_started");
+    if (evidenceDone) statusKey = "archived";
+    if (manualStatus.done || manualStatusKey === "done") statusKey = "done";
+    if (manualStatusKey === "submitted" && !evidenceDone) statusKey = "submitted";
+    if (manualStatusKey === "needs_reflection") statusKey = "needs_reflection";
+    if (["aiGraph", "practice", "wrongFix"].includes(task.key) && evidenceDone && Number(evidenceCounts.reflections || 0) < reflectionTarget) {
+      statusKey = "needs_reflection";
+    }
+    const done = Boolean(["archived", "done"].includes(statusKey));
+    const gapValue = Math.max(0, target - value);
+    return {
+      ...task,
+      target,
+      value,
+      done,
+      manualDone: Boolean(manualStatus.done),
+      statusKey,
+      statusLabel: LEARNING_CYCLE_TASK_STATUS_LABELS[statusKey] || "进行中",
+      note: manualStatus.note || "",
+      gap: gapValue ? `还差 ${gapValue} ${task.evidenceType.includes("对话") ? "次" : task.evidenceType.includes("反思") ? "份" : task.evidenceType.includes("产出") ? "个" : "次"}` : "证据已形成",
+      progress: Math.round(Math.min(1, value / target) * 100),
+      statusText: done ? "已入档" : `${LEARNING_CYCLE_TASK_STATUS_LABELS[statusKey] || "进行中"} · ${value}/${target}`
+    };
+  });
+  const current = tasks.find((task) => !task.done) || tasks[tasks.length - 1];
+  const completedRatio = tasks.reduce((sum, task) => sum + Math.min(1, Number(task.value || 0) / Math.max(1, Number(task.target || 1))), 0) / Math.max(1, tasks.length);
+  const stages = tasks.slice(0, 6).map((task) => ({
+    key: task.key,
+    label: task.shortLabel,
+    done: task.done,
+    statusKey: task.statusKey
+  }));
+  const evidenceGaps = tasks
+    .filter((task) => !task.done)
+    .map((task) => ({
+      key: task.key,
+      label: task.label,
+      evidenceType: task.evidenceType,
+      gap: task.gap,
+      nextAction: task.nextAction,
+      page: task.page,
+      statusKey: task.statusKey,
+      statusLabel: task.statusLabel
+    }));
+  return {
+    tasks,
+    evidenceGaps,
+    nextTask: tasks.find((task) => !task.done) || null,
+    currentStage: {
+      label: stages.map((stage) => stage.label).join(" → "),
+      activeKey: current.key,
+      activeLabel: current.shortLabel || current.label,
+      stages,
+      progress: Math.round(completedRatio * 100)
+    },
+    requiredEvidenceText: [
+      "1 个学习目标设定",
+      `至少 ${requirements.aiDialogues} 次 AI 对话`,
+      `${requirements.knowledgeTests} 次测试`,
+      `${requirements.wrongFixes} 条错因修正`,
+      `${requirements.reflections} 份反思`,
+      `${requirements.learningOutputs} 个学习产出`
+    ].join("、")
+  };
+}
+
+function buildLearningCycleView(db, userId, subject = "", evidenceCounts = {}) {
+  const cycle = activeLearningCycle(db, userId, subject);
+  const progress = buildLearningCycleTaskProgress(cycle, evidenceCounts);
+  return {
+    ...cycle,
+    virtual: String(cycle.id || "").startsWith("virtual_cycle_"),
+    rangeText: [cycle.startLabel, cycle.endLabel].filter(Boolean).join(" 到 "),
+    templateLibrary: learningCycleTemplateLibrary(),
+    evidenceCounts,
+    evidenceLoop: ["学习目标", "前测诊断", "图谱路径", "AI 对话", "知识测试", "错因修正", "反思", "后测", "学习档案"],
+    ...progress
+  };
+}
+
+function buildLearningCycleCompletionReport({ cycle = {}, comparison = [], wrongNotes = [], reflections = [], citations = [], counts = {}, ethicsSettings = {} }) {
+  const progress = Number(cycle.currentStage?.progress || 0);
+  const ready = progress >= 100;
+  const improvedTopics = comparison.filter((item) => Number(item.change || 0) > 0);
+  const weakTopics = comparison.filter((item) => Number(item.current || 0) < 0.58);
+  const reflectionSamples = reflections.slice(0, 5).map((item) => ({
+    time: item.createdAt,
+    topic: item.knowledgePoint || item.contextTitle || "学习反思",
+    text: reportCompactText([item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；"), 220)
+  }));
+  return {
+    ready,
+    statusText: ready ? "已生成周期完成报告" : `周期进度 ${progress}%，完成后自动生成报告`,
+    title: `${cycle.title || "学习周期"}完成报告`,
+    generatedAt: ready ? now() : "",
+    summary: ready
+      ? `本周期完成 ${Number(counts.aiDialogues || 0)} 次 AI 对话、${Number(counts.knowledgeTests || 0)} 次测试、${Number(counts.reflections || 0)} 份反思和 ${Number(counts.learningOutputs || 0)} 个学习产出。`
+      : "完成前测、AI 学习、知识测试、错因修正、反思、后测和学习产出后，系统会自动生成周期总结。",
+    prePostComparison: comparison.slice(0, 8).map((item) => ({
+      topic: item.topic,
+      startText: item.startText,
+      currentText: item.currentText,
+      changeText: item.changeText
+    })),
+    masteryChange: {
+      improvedTopics: improvedTopics.length,
+      weakTopics: weakTopics.length,
+      highlights: improvedTopics.slice(0, 5).map((item) => `${item.topic} ${item.changeText}`)
+    },
+    misconceptionChange: {
+      wrongNotes: wrongNotes.length,
+      corrections: Number(counts.corrections || 0),
+      summary: wrongNotes.length ? `已形成 ${wrongNotes.length} 条错因记录，可用于展示从误解到修正后理解的轨迹。` : "暂无错因记录，建议完成一次错因订正。"
+    },
+    reflectionSamples,
+    aiUseStatement: ethicsSettings.aiUseDisclosure
+      ? "AI 用于诊断、引用、追问和学习建议；学生保留原始作答、最终判断和反思记录。"
+      : "建议开启 AI 使用声明，明确 AI 辅助内容与学生原创内容边界。",
+    citationSummary: {
+      count: citations.length,
+      sources: citations.slice(0, 8).map((item) => item.sourceName || item.title || item.id).filter(Boolean)
+    },
+    anonymousPackage: ready
+      ? "可生成匿名申报包：隐藏学生姓名、ID 和敏感对话，仅保留过程证据、统计摘要、引用来源和反思摘录。"
+      : "周期完成后可一键生成匿名申报包。"
+  };
+}
+
+function suggestLearningCycleFromProfile(db, userId, body = {}) {
+  const portfolio = buildStudentPortfolio(db, userId);
+  const currentCycle = portfolio.learningCycle || {};
+  const requestedTemplate = findLearningCycleTemplate(body.templateKey) || null;
+  const weakByMastery = (portfolio.masteryComparison || [])
+    .filter((item) => Number(item.current || 0) < 0.68)
+    .map((item) => item.topic);
+  const weakByAnnotation = (portfolio.nodeAnnotations || [])
+    .filter((item) => ["weak", "uncertain", "learning"].includes(item.status))
+    .map((item) => item.nodeLabel || item.knowledgePoint)
+    .filter(Boolean);
+  const focusNodes = Array.from(new Set([
+    ...normalizeStringItems(body.focusNodes || "", 8),
+    ...weakByMastery,
+    ...weakByAnnotation,
+    ...(requestedTemplate?.focusNodes || currentCycle.focusNodes || []),
+    "KNN",
+    "逻辑回归"
+  ].filter(Boolean))).slice(0, 6);
+  const primary = focusNodes[0] || "KNN";
+  const secondary = focusNodes[1] || "逻辑回归";
+  const suggestion = {
+    templateKey: requestedTemplate?.key || currentCycle.templateKey || "ml_review",
+    title: `${currentCycle.subject || portfolio.summary?.subject || "机器学习"} ${primary} 与 ${secondary} 学习周期`,
+    subject: currentCycle.subject || portfolio.summary?.subject || requestedTemplate?.subject || "机器学习",
+    startLabel: body.startLabel || "第 1 周",
+    endLabel: body.endLabel || "第 4 周",
+    goals: [
+      `补齐 ${primary} 的核心概念、适用条件和常见误区`,
+      `围绕 ${focusNodes.slice(0, 4).join("、")} 完成图谱路径学习和测试诊断`,
+      "用前后测、错因订正、结构化反思和学习产出证明理解变化"
+    ],
+    focusNodes,
+    recommendedTestNodes: focusNodes.slice(0, 4),
+    weeklyPlan: [
+      { week: "第 1 周", title: "前测诊断", tasks: [`完成 ${primary} 前测`, "标注薄弱图谱节点", "设置证据要求"] },
+      { week: "第 2 周", title: "AI 学习与图谱路径", tasks: ["先作答再求助", `围绕 ${primary} 向 AI 追问`, "把 AI 回答转成学习卡片"] },
+      { week: "第 3 周", title: "知识测试与错因修正", tasks: [`完成 ${secondary} 或相关节点测试`, "订正错因标签", "补充我的理解"] },
+      { week: "第 4 周", title: "后测与学习档案", tasks: ["完成同知识点后测", "写周期总结反思", "生成匿名申报证据包"] }
+    ],
+    evidenceRequirements: {
+      aiDialogues: Math.max(3, Number(currentCycle.evidenceRequirements?.aiDialogues || 0)),
+      knowledgeTests: Math.max(2, Number(currentCycle.evidenceRequirements?.knowledgeTests || 0)),
+      reflections: Math.max(1, Number(currentCycle.evidenceRequirements?.reflections || 0)),
+      learningOutputs: Math.max(1, Number(currentCycle.evidenceRequirements?.learningOutputs || 0)),
+      wrongFixes: Math.max(1, Number(currentCycle.evidenceRequirements?.wrongFixes || 0))
+    },
+    rationale: [
+      weakByMastery.length ? `根据掌握度低于 68% 的知识点推荐：${weakByMastery.slice(0, 4).join("、")}` : "当前掌握度数据不足，优先使用机器学习核心节点模板。",
+      weakByAnnotation.length ? `结合学生图谱标注：${weakByAnnotation.slice(0, 4).join("、")}` : "建议在图谱中标注薄弱/不确定节点，以便后续生成更精准周期。",
+      "证据要求覆盖 AI 对话、测试、错因修正、反思和学习产出，可直接进入学习档案。"
+    ],
+    generatedAt: now()
+  };
+  return normalizeLearningCycleRecord(suggestion, userId, suggestion.subject);
+}
+
+function upsertStudentLearningCycle(db, userId, body = {}) {
+  db.learningCycles = Array.isArray(db.learningCycles) ? db.learningCycles : [];
+  const template = findLearningCycleTemplate(body.templateKey);
+  const subject = normalizeSubject(body.subject || template?.subject || "");
+  let cycle = body.id
+    ? db.learningCycles.find((item) => item.id === String(body.id) && item.studentId === userId)
+    : db.learningCycles.find((item) => item.studentId === userId && item.status === "active");
+  if (!cycle) {
+    cycle = normalizeLearningCycleRecord({ ...(template || {}), studentId: userId, subject, createdAt: now() }, userId, subject);
+    db.learningCycles.unshift(cycle);
+  }
+  const source = template && body.applyTemplate ? { ...template } : {};
+  const next = normalizeLearningCycleRecord({
+    ...source,
+    ...cycle,
+    title: body.title !== undefined ? body.title : source.title || cycle.title,
+    subject: body.subject !== undefined ? body.subject : source.subject || cycle.subject,
+    startLabel: body.startLabel !== undefined ? body.startLabel : source.startLabel || cycle.startLabel,
+    endLabel: body.endLabel !== undefined ? body.endLabel : source.endLabel || cycle.endLabel,
+    startDate: body.startDate !== undefined ? body.startDate : cycle.startDate,
+    endDate: body.endDate !== undefined ? body.endDate : cycle.endDate,
+    goals: body.goals !== undefined ? body.goals : source.goals || cycle.goals,
+    templateKey: body.templateKey !== undefined ? body.templateKey : source.key || cycle.templateKey,
+    focusNodes: body.focusNodes !== undefined ? body.focusNodes : source.focusNodes || cycle.focusNodes,
+    weeklyPlan: body.weeklyPlan !== undefined ? body.weeklyPlan : source.weeklyPlan || cycle.weeklyPlan,
+    recommendedTestNodes: body.recommendedTestNodes !== undefined ? body.recommendedTestNodes : source.recommendedTestNodes || cycle.recommendedTestNodes,
+    viewMode: body.viewMode !== undefined ? body.viewMode : cycle.viewMode,
+    evidenceRequirements: body.evidenceRequirements !== undefined ? body.evidenceRequirements : source.evidenceRequirements || cycle.evidenceRequirements,
+    status: body.status !== undefined ? body.status : cycle.status,
+    manualTaskStatus: cycle.manualTaskStatus,
+    updatedAt: now()
+  }, userId, subject || cycle.subject);
+  Object.assign(cycle, next);
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "learning_cycle_update",
+    source: "learning-cycle",
+    subject: cycle.subject,
+    knowledgePoint: cycle.title,
+    payload: {
+      title: cycle.title,
+      range: [cycle.startLabel, cycle.endLabel].filter(Boolean).join(" 到 "),
+      goals: cycle.goals,
+      templateKey: cycle.templateKey,
+      focusNodes: cycle.focusNodes,
+      weeklyPlan: cycle.weeklyPlan,
+      recommendedTestNodes: cycle.recommendedTestNodes,
+      evidenceRequirements: cycle.evidenceRequirements
+    }
+  });
+  return cycle;
+}
+
+function updateLearningCycleTask(db, userId, body = {}) {
+  const cycle = upsertStudentLearningCycle(db, userId, { id: body.cycleId, subject: body.subject });
+  const key = String(body.taskKey || body.key || "").trim();
+  if (!key) throw Object.assign(new Error("请提供任务标识"), { status: 400 });
+  cycle.manualTaskStatus = cycle.manualTaskStatus && typeof cycle.manualTaskStatus === "object" ? cycle.manualTaskStatus : {};
+  const status = LEARNING_CYCLE_TASK_STATUS_LABELS[body.status] ? body.status : "";
+  cycle.manualTaskStatus[key] = {
+    done: body.done === true || body.done === "true" || body.done === "1" || status === "done",
+    status: status || (body.done === true || body.done === "true" || body.done === "1" ? "done" : "not_started"),
+    note: String(body.note || "").trim().slice(0, 300),
+    updatedAt: now()
+  };
+  cycle.updatedAt = now();
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "learning_cycle_task",
+    source: "learning-cycle",
+    subject: cycle.subject,
+    knowledgePoint: cycle.title,
+    payload: { taskKey: key, ...cycle.manualTaskStatus[key] }
+  });
+  return cycle;
+}
+
+function nodeAnnotationScore(status = "") {
+  return {
+    mastered: 0.86,
+    uncertain: 0.55,
+    weak: 0.32,
+    learning: 0.62,
+    not_started: 0.18
+  }[status] ?? null;
+}
+
+function nodeAnnotationStatusLabel(status = "") {
+  return {
+    mastered: "已掌握",
+    uncertain: "不确定",
+    weak: "易错/薄弱",
+    learning: "正在学习",
+    not_started: "未开始"
+  }[status] || "正在学习";
+}
+
+function createStudentNodeAnnotation(db, userId, body = {}) {
+  db.studentNodeAnnotations = Array.isArray(db.studentNodeAnnotations) ? db.studentNodeAnnotations : [];
+  const graphId = String(body.graphId || "").trim();
+  const nodeId = String(body.nodeId || "").trim();
+  const nodeLabel = String(body.nodeLabel || body.knowledgePoint || "").trim().slice(0, 120);
+  if (!graphId || !nodeId || !nodeLabel) throw Object.assign(new Error("请先选择知识图谱节点"), { status: 400 });
+  const status = ["mastered", "uncertain", "weak", "learning", "not_started"].includes(body.status) ? body.status : "learning";
+  let annotation = db.studentNodeAnnotations.find((item) => item.studentId === userId && item.graphId === graphId && item.nodeId === nodeId);
+  if (!annotation) {
+    annotation = {
+      id: uid("nodeann"),
+      studentId: userId,
+      graphId,
+      nodeId,
+      createdAt: now()
+    };
+    db.studentNodeAnnotations.unshift(annotation);
+  }
+  Object.assign(annotation, {
+    subject: String(body.subject || "").trim().slice(0, 80),
+    graphTitle: String(body.graphTitle || "").trim().slice(0, 120),
+    nodeLabel,
+    favorite: body.favorite === true || body.favorite === "true" || body.favorite === "1",
+    status,
+    statusLabel: nodeAnnotationStatusLabel(status),
+    explanation: String(body.explanation || "").trim().slice(0, 1200),
+    evidenceType: String(body.evidenceType || "note").trim().slice(0, 40),
+    evidenceTitle: String(body.evidenceTitle || "").trim().slice(0, 120),
+    evidenceUrl: String(body.evidenceUrl || "").trim().slice(0, 300),
+    fromAiAnswer: body.fromAiAnswer === true || body.fromAiAnswer === "true" || body.fromAiAnswer === "1",
+    updatedAt: now()
+  });
+  db.studentNodeAnnotations = db.studentNodeAnnotations.slice(0, 2000);
+  const score = nodeAnnotationScore(status);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "graph_node_annotation",
+    source: "student-graph-construction",
+    subject: annotation.subject,
+    knowledgePoint: nodeLabel,
+    graphId,
+    nodeId,
+    score,
+    payload: {
+      status,
+      favorite: annotation.favorite,
+      explanation: annotation.explanation,
+      evidenceType: annotation.evidenceType,
+      evidenceTitle: annotation.evidenceTitle,
+      fromAiAnswer: annotation.fromAiAnswer
+    }
+  });
+  if (score !== null) {
+    setTopicMasteryScore(db, userId, nodeLabel, score, `学生图谱标注：${annotation.statusLabel}`);
+    syncStudentMasteryFromProfile(db, userId, [nodeLabel], {
+      subject: annotation.subject,
+      graphId,
+      nodeId,
+      lastEventId: learningEvent.id
+    });
+  }
+  return { annotation, learningEvent };
+}
+
+function defaultStudentEthicsSettings(userId) {
+  return {
+    studentId: userId,
+    aiUseDisclosure: true,
+    citationRequired: true,
+    uncertaintyNotice: true,
+    dataConsent: true,
+    anonymousExportDefault: true,
+    requireOriginalAnswerFirst: true,
+    allowTeacherPrivateConversationAccess: false,
+    aiFinalAnswerBlocked: true,
+    updatedAt: ""
+  };
+}
+
+function getStudentEthicsSettings(db, userId) {
+  db.studentEthicsSettings = Array.isArray(db.studentEthicsSettings) ? db.studentEthicsSettings : [];
+  return {
+    ...defaultStudentEthicsSettings(userId),
+    ...(db.studentEthicsSettings.find((item) => item.studentId === userId) || {})
+  };
+}
+
+function updateStudentEthicsSettings(db, userId, body = {}) {
+  db.studentEthicsSettings = Array.isArray(db.studentEthicsSettings) ? db.studentEthicsSettings : [];
+  let settings = db.studentEthicsSettings.find((item) => item.studentId === userId);
+  if (!settings) {
+    settings = defaultStudentEthicsSettings(userId);
+    db.studentEthicsSettings.unshift(settings);
+  }
+  [
+    "aiUseDisclosure",
+    "citationRequired",
+    "uncertaintyNotice",
+    "dataConsent",
+    "anonymousExportDefault",
+    "requireOriginalAnswerFirst",
+    "allowTeacherPrivateConversationAccess",
+    "aiFinalAnswerBlocked"
+  ].forEach((key) => {
+    if (body[key] !== undefined) settings[key] = body[key] === true || body[key] === "true" || body[key] === "1";
+  });
+  settings.updatedAt = now();
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "ethics_settings_update",
+    source: "ethics-settings",
+    subject: "",
+    knowledgePoint: "AI 使用规范与学术诚信",
+    payload: settings
+  });
+  return settings;
+}
+
+function requestStudentDataDeletion(db, userId, body = {}) {
+  db.studentDataDeletionRequests = Array.isArray(db.studentDataDeletionRequests) ? db.studentDataDeletionRequests : [];
+  const scopes = normalizeStringItems(body.scopes || body.scope || "learningEvents,studentReflections,aiAnswerReviews,studentNodeAnnotations", 12);
+  const request = {
+    id: uid("delreq"),
+    studentId: userId,
+    scopes,
+    reason: String(body.reason || "").trim().slice(0, 300),
+    status: "requested",
+    createdAt: now()
+  };
+  db.studentDataDeletionRequests.unshift(request);
+  recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "data_deletion_request",
+    source: "privacy-center",
+    knowledgePoint: "个人学习数据管理",
+    payload: { scopes, reason: request.reason }
+  });
+  return request;
+}
+
+function buildPortfolioTimeline({ events = [], reflections = [], wrongNotes = [], submissions = [], conversations = [], agentRuns = [], aiReviews = [], nodeAnnotations = [] }) {
+  const items = [];
+  events.forEach((event) => {
+    items.push({
+      id: event.id,
+      type: reportEventLabel(event.eventType),
+      rawType: event.eventType,
+      time: event.occurredAt || event.createdAt,
+      title: event.knowledgePoint || reportEventLabel(event.eventType),
+      summary: reportCompactText(event.payload?.prompt || event.payload?.question || event.payload?.answer || event.payload?.evidence || event.payload?.analysis || event.source || "", 160),
+      score: scorePercentText(event.score, ""),
+      source: event.source || ""
+    });
+  });
+  reflections.forEach((item) => {
+    items.push({
+      id: item.id,
+      type: "结构化反思",
+      rawType: "structured_reflection",
+      time: item.createdAt,
+      title: item.knowledgePoint || item.contextTitle || "学习反思",
+      summary: reportCompactText([item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；"), 180),
+      score: "",
+      source: item.contextType || "reflection"
+    });
+  });
+  wrongNotes.forEach((note) => {
+    items.push({
+      id: note.id,
+      type: "错因修正",
+      rawType: "wrong_note",
+      time: note.createdAt,
+      title: note.topic || "错题",
+      summary: reportCompactText(note.analysis || note.recommendation || note.question || "", 160),
+      score: "",
+      source: note.source || "wrong-note"
+    });
+  });
+  submissions.forEach((submission) => {
+    items.push({
+      id: submission.id,
+      type: "作品/作业",
+      rawType: "homework_submission",
+      time: submission.submittedAt || submission.createdAt,
+      title: submission.title || submission.homeworkTitle || "作业提交",
+      summary: reportCompactText(submission.content || submission.answer || submission.feedback?.comment || "", 160),
+      score: scorePercentText(submission.score, ""),
+      source: reportStatusLabel(submission.status)
+    });
+  });
+  conversations.slice(0, 12).forEach((conv) => {
+    const latestUserMessage = [...(conv.messages || [])].reverse().find((message) => message.role === "user");
+    if (!latestUserMessage) return;
+    items.push({
+      id: conv.id,
+      type: "AI 对话",
+      rawType: "ai_conversation",
+      time: conv.updatedAt || latestUserMessage.createdAt,
+      title: conv.title || "AI 对话",
+      summary: reportCompactText(latestUserMessage.content || "", 150),
+      score: "",
+      source: conv.mode || ""
+    });
+  });
+  agentRuns.slice(0, 12).forEach((run) => {
+    items.push({
+      id: run.id,
+      type: "AI 工作流",
+      rawType: "agent_run",
+      time: run.createdAt,
+      title: (run.knowledgePoints || [])[0] || run.intent || "AI 工作流",
+      summary: reportCompactText(run.prompt || run.strategy || "", 150),
+      score: "",
+      source: run.confidence || ""
+    });
+  });
+  aiReviews.forEach((review) => {
+    items.push({
+      id: review.id,
+      type: "AI 审辩记录",
+      rawType: "ai_answer_review",
+      time: review.createdAt,
+      title: review.topic || review.reviewType || "AI 可信度评价",
+      summary: reportCompactText([review.reviewType, review.comment, review.finalJudgment, review.studentAction].filter(Boolean).join("；"), 160),
+      score: review.trustScore === null || review.trustScore === undefined ? "" : `${Math.round(Number(review.trustScore || 0) * 100)}%`,
+      source: review.accepted ? "采纳" : "待修正"
+    });
+  });
+  nodeAnnotations.forEach((annotation) => {
+    items.push({
+      id: annotation.id,
+      type: annotation.fromAiAnswer ? "AI 回答学习卡片" : "图谱节点标注",
+      rawType: "graph_node_annotation",
+      time: annotation.updatedAt || annotation.createdAt,
+      title: annotation.nodeLabel || "图谱节点",
+      summary: reportCompactText([annotation.statusLabel, annotation.explanation, annotation.evidenceTitle].filter(Boolean).join("；"), 180),
+      score: scorePercentText(nodeAnnotationScore(annotation.status), ""),
+      source: annotation.favorite ? "已收藏" : annotation.evidenceType || "node"
+    });
+  });
+  return sortNewest(items).slice(0, 120);
+}
+
+function buildInnovationSummary(subject = "课程", evidence = {}) {
+  const counts = evidence.counts || {};
+  const cycle = evidence.cycle || {};
+  const comparison = evidence.comparison || [];
+  const citationCount = Number(evidence.citationCount || 0);
+  const nodeAnnotationCount = Number(counts.nodeAnnotations || 0);
+  const learningOutputCount = Number(counts.learningOutputs || (Number(counts.homeworkOutputs || 0) + Number(counts.modelExperiments || 0) + nodeAnnotationCount));
+  const loopEvidence = [
+    `${Number(counts.aiDialogues || 0)} 次 AI 对话`,
+    `${Number(counts.knowledgeTests || 0)} 次知识测试`,
+    `${Number(counts.wrongNotes || 0) + Number(counts.corrections || 0)} 条错因/纠错`,
+    `${Number(counts.reflections || 0)} 份结构化反思`
+  ];
+  const points = [
+    {
+      key: "evidence_loop",
+      title: "证据驱动的 AI 自主学习闭环",
+      summary: "学生不是简单问 AI，而是在系统中完成“诊断-学习-测试-修正-反思-再诊断”的完整周期，每一步都形成可追踪证据。",
+      evidence: loopEvidence,
+      evaluationValue: "对应学习过程记录、学习成效证据和个人反思，能证明一个完整实施周期真实发生。"
+    },
+    {
+      key: "graph_path",
+      title: "知识图谱驱动的个性化学习路径",
+      summary: "系统把课程资料、知识点关系、常见误区和学生掌握度结合起来，围绕具体知识节点推荐学习路径，而不是泛泛聊天。",
+      evidence: [
+        `${citationCount} 条课程/图谱引用`,
+        `${nodeAnnotationCount} 条学生节点标注`,
+        `${(cycle.tasks || []).filter((task) => task.done).length}/${(cycle.tasks || []).length || 7} 个周期任务完成`
+      ],
+      evaluationValue: "把知识结构、学习画像和路径推荐连成闭环，突出学生在具体知识节点上的成长。"
+    },
+    {
+      key: "metacognition",
+      title: "AI 诊断与学生反思结合的元认知培养",
+      summary: "AI 不只给答案，还帮助学生发现误区、表达不确定性、制定下一步学习计划，推动学生从“获得答案”转向“管理自己的学习”。",
+      evidence: [
+        `${Number(counts.reflections || 0)} 份反思`,
+        `${Number(counts.aiWorkflowRuns || 0)} 次 AI 诊断/工作流`,
+        `${comparison.filter((item) => Number(item.change || 0) > 0).length} 个知识点出现掌握度提升`
+      ],
+      evaluationValue: "反思字段直接记录原理解、AI 发现、策略变化、不确定点和下一步计划，体现元认知发展。"
+    },
+    {
+      key: "critical_ai",
+      title: "学生参与校验 AI 的批判性学习机制",
+      summary: "学生可以纠正 AI 的知识点定位、标注回答是否可靠、查看引用来源，体现 Beyond AI：不是依赖 AI，而是学会审慎使用 AI。",
+      evidence: [
+        `${Number(counts.corrections || 0)} 条知识点纠正`,
+        `${Number(counts.aiReviews || 0)} 条 AI 审辩记录`,
+        `${citationCount} 条可追溯引用`
+      ],
+      evaluationValue: "把 AI 的不确定性、引用和学生校验显式纳入学习档案，回应规范性和可信度评审。"
+    },
+    {
+      key: "auto_portfolio",
+      title: "自动生成学习证据档案",
+      summary: "系统自动把 AI 对话、测试结果、错题、图谱节点、反思、作业和成果组织成学习档案，直接支持学习评价和案例申报。",
+      evidence: [
+        `${Number(counts.aiDialogues || 0) + Number(counts.knowledgeTests || 0) + Number(counts.reflections || 0) + learningOutputCount} 条核心证据`,
+        `${learningOutputCount} 个学习产出/节点证据`,
+        "支持 HTML/PDF/CSV/JSON 与匿名导出"
+      ],
+      evaluationValue: "减少人工整理申报材料的成本，让学习过程、成效变化和个人反思自动形成证据包。"
+    }
+  ];
+  return {
+    title: "证据驱动的 AI 学习闭环",
+    thesis: "不是让 AI 直接替学生学习，而是让 AI 在诊断、路径推荐、证据记录和反思引导中支持学生形成可持续的自主学习能力。",
+    loop: ["前测诊断", "学习目标设定", "AI + 知识图谱学习", "节点练习/作业", "错因修正", "后测与反思"],
+    positioning: "创新点不表述为“用了大模型、知识图谱或 Dify”，而表述为 AI 环境下学生自主学习能力、元认知和证据化评价方式的改变。",
+    points,
+    differentiators: points.map((point) => point.title),
+    subject
+  };
+}
+
+function averageNormalizedScore(values = []) {
+  const normalized = values.map(normalizeLearningScore).filter((value) => value !== null);
+  if (!normalized.length) return null;
+  return Number((normalized.reduce((sum, value) => sum + value, 0) / normalized.length).toFixed(4));
+}
+
+function effectPercentText(value, empty = "待形成") {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? empty : scorePercentText(normalized);
+}
+
+function learningGainText(start, current) {
+  if (start === null || current === null) return "待形成";
+  const gain = Number((current - start).toFixed(4));
+  return `${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%`;
+}
+
+function buildLearningEffectPanel({ comparison = [], events = [], wrongNotes = [], corrections = [], aiReviews = [], works = [], reflections = [], cycle = {} }) {
+  const comparable = comparison.filter((item) => item.start !== null && item.current !== null);
+  const startAverage = averageNormalizedScore(comparable.map((item) => item.start));
+  const currentAverage = averageNormalizedScore(comparable.map((item) => item.current));
+  const knowledgeTestEvents = events
+    .filter((event) => event.eventType === "knowledge_test_evaluate" && event.score !== null && event.score !== undefined)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+  const firstPracticeScore = normalizeLearningScore(knowledgeTestEvents[0]?.score);
+  const latestPracticeScore = normalizeLearningScore(knowledgeTestEvents[knowledgeTestEvents.length - 1]?.score);
+  const durationEvents = events
+    .filter((event) => Number.isFinite(Number(event.durationSeconds)) && Number(event.durationSeconds) > 0)
+    .sort((a, b) => eventTimeValue(a) - eventTimeValue(b));
+  const firstDuration = durationEvents[0]?.durationSeconds ? Math.round(Number(durationEvents[0].durationSeconds) / 60) : null;
+  const latestDuration = durationEvents[durationEvents.length - 1]?.durationSeconds ? Math.round(Number(durationEvents[durationEvents.length - 1].durationSeconds) / 60) : null;
+  const strategyEvidence = reflections.filter((item) => item.originalUnderstanding && item.aiDiscovery && item.strategyChange);
+  const auditEvidence = aiReviews.filter((item) => /question|error|citation|partial|challenge|质疑|错误|引用|部分/.test(String(item.reviewType || item.comment || item.studentAction || "")));
+  const reviewTypeCounts = aiReviews.reduce((acc, item) => {
+    const key = item.reviewType || "未分类";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const resolvedMisconceptions = corrections.length;
+  const unresolvedMisconceptions = Math.max(0, wrongNotes.length - corrections.length);
+  const gain = startAverage !== null && currentAverage !== null ? Number((currentAverage - startAverage).toFixed(4)) : null;
+  const metrics = [
+    {
+      key: "mastery",
+      label: "知识点掌握度",
+      before: effectPercentText(startAverage),
+      after: effectPercentText(currentAverage),
+      change: learningGainText(startAverage, currentAverage),
+      evidence: `${comparable.length} 个知识点有前后记录`,
+      source: "前测/后测、AI 诊断、作业批改与掌握度快照"
+    },
+    {
+      key: "accuracy",
+      label: "正确率",
+      before: effectPercentText(firstPracticeScore),
+      after: effectPercentText(latestPracticeScore),
+      change: learningGainText(firstPracticeScore, latestPracticeScore),
+      evidence: `${knowledgeTestEvents.length} 次知识测试或练习验证`,
+      source: "知识测试提交记录"
+    },
+    {
+      key: "misconception",
+      label: "错因数量",
+      before: `${wrongNotes.length} 条记录`,
+      after: `${resolvedMisconceptions} 条已修正`,
+      change: unresolvedMisconceptions ? `仍有 ${unresolvedMisconceptions} 条待验证` : "已形成修正闭环",
+      evidence: `${wrongNotes.length} 条错因，${corrections.length} 条纠正`,
+      source: "错题本、知识点纠正、结构化反思"
+    },
+    {
+      key: "efficiency",
+      label: "学习效率",
+      before: firstDuration === null ? "待记录" : `${firstDuration} 分钟`,
+      after: latestDuration === null ? "待记录" : `${latestDuration} 分钟`,
+      change: firstDuration !== null && latestDuration !== null ? `${latestDuration <= firstDuration ? "减少" : "增加"} ${Math.abs(latestDuration - firstDuration)} 分钟` : "需要带时长的任务记录",
+      evidence: `${durationEvents.length} 条带时长学习事件`,
+      source: "测验、作业或学习事件 durationSeconds"
+    },
+    {
+      key: "strategy",
+      label: "学习策略",
+      before: "直接问答/等待解释",
+      after: `${strategyEvidence.length} 次先写原理解再让 AI 诊断`,
+      change: auditEvidence.length ? `${auditEvidence.length} 次质疑/核验 AI` : "审辩记录待补充",
+      evidence: `${reflections.length} 份反思，${aiReviews.length} 条 AI 审辩`,
+      source: "结构化反思、AI 审辩表单"
+    },
+    {
+      key: "output",
+      label: "作品产出",
+      before: "周期开始前待归档",
+      after: `${works.length} 个作品/实验/学习卡片`,
+      change: works.length ? "已有可展示产出" : "建议提交代码实验、学习笔记或项目报告",
+      evidence: works.slice(0, 4).map((item) => item.title).filter(Boolean).join("；") || "暂无作品证据",
+      source: "作业、模型实验、图谱节点卡片"
+    }
+  ];
+  return {
+    title: "前后对比学习成效",
+    learningGain: gain,
+    learningGainText: gain === null ? "待形成" : `${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%`,
+    summary: gain === null
+      ? "完成前测、后测和反思后自动计算学习增益。"
+      : `本周期平均掌握度从 ${effectPercentText(startAverage)} 到 ${effectPercentText(currentAverage)}，学习增益 ${gain >= 0 ? "+" : ""}${Math.round(gain * 100)}%。`,
+    metrics,
+    reviewTypeCounts,
+    evidenceSources: [
+      "前测/后测掌握度记录",
+      "练习与作业正确率",
+      "错题和知识点纠正",
+      "结构化反思",
+      "AI 审辩记录",
+      "代码实验、学习笔记和项目报告"
+    ],
+    cycleTitle: cycle.title || ""
+  };
+}
+
+function buildDeclarationApplicationSections(portfolio = {}) {
+  const cycle = portfolio.learningCycle || {};
+  const effect = portfolio.effectPanel || {};
+  const showcase = portfolio.showcase || {};
+  const graphPath = portfolio.graphRagProfileCoupling?.recommendedPath || [];
+  const reflectionSamples = portfolio.reflectionExcerpts || [];
+  return [
+    {
+      key: "problem",
+      title: "学习问题",
+      summary: showcase.background || `${portfolio.summary?.student?.name || "学生"} 在 ${portfolio.summary?.subject || "本课程"} 中需要把薄弱知识点、错因和学习策略变化变成可验证证据。`,
+      evidence: [
+        `${cycle.focusNodes?.length || 0} 个重点节点`,
+        `${cycle.evidenceCounts?.wrongNotes || 0} 条错因记录`,
+        `${portfolio.masteryComparison?.length || 0} 个掌握度对比点`
+      ]
+    },
+    {
+      key: "intervention",
+      title: "AI介入方案",
+      summary: showcase.intervention || "通过 GraphRAG 引用、知识图谱路径、AI 诊断、审辩记录和结构化反思支持学生自主学习。",
+      evidence: [
+        `${cycle.evidenceCounts?.aiDialogues || 0} 次 AI 对话`,
+        `${portfolio.graphRagProfileCoupling?.ragCitationCount || 0} 条 RAG/图谱引用`,
+        `${portfolio.aiReviews?.length || 0} 条 AI 审辩`
+      ]
+    },
+    {
+      key: "cycle",
+      title: "完整学习周期",
+      summary: `${cycle.title || "学习周期"}：${cycle.rangeText || "第 1 周 到 第 4 周"}；${cycle.requiredEvidenceText || "前测、目标、AI 学习、练习、修正、后测反思"}`,
+      evidence: (cycle.tasks || []).map((task) => `${task.label}：${task.statusText || task.statusLabel}`).slice(0, 6)
+    },
+    {
+      key: "effect",
+      title: "成效数据",
+      summary: effect.summary || "系统按前后测、正确率、错因修正、效率、学习策略和作品产出自动汇总成效。",
+      evidence: (effect.metrics || []).slice(0, 6).map((metric) => `${metric.label}：${metric.before} -> ${metric.after}（${metric.change}）`)
+    },
+    {
+      key: "reflection",
+      title: "个人反思",
+      summary: reflectionSamples[0]?.text || "学生记录原始理解、AI 发现、是否采纳、策略变化、下一步验证和避免过度依赖 AI 的做法。",
+      evidence: reflectionSamples.slice(0, 5).map((item) => `${item.topic}：${item.text}`)
+    },
+    {
+      key: "transfer",
+      title: "推广价值",
+      summary: showcase.transfer || "同一证据链可迁移到其他课程和小组协作场景，用统一模板记录学习周期、成效和规范使用 AI。",
+      evidence: [
+        `${portfolio.collaboration?.chatThreads || 0} 个协作会话`,
+        `${portfolio.works?.length || 0} 个作品证据`,
+        graphPath[0] ? `示例路径：${graphPath.slice(0, 3).map((item) => item.topic).join(" -> ")}` : "路径待生成"
+      ]
+    },
+    {
+      key: "ethics",
+      title: "伦理规范",
+      summary: [portfolio.ethics?.aiStatement, portfolio.ethics?.citationPolicy, portfolio.ethics?.privacyPolicy].filter(Boolean).join(" "),
+      evidence: [
+        portfolio.ethics?.settings?.anonymousExportDefault ? "默认匿名导出" : "可手动匿名导出",
+        portfolio.ethics?.settings?.citationRequired ? "要求引用来源" : "建议开启引用来源",
+        portfolio.ethics?.settings?.requireOriginalAnswerFirst ? "先作答再求助" : "建议开启先作答再求助"
+      ]
+    }
+  ];
+}
+
+function buildVideoScriptOutline(portfolio = {}) {
+  const cycle = portfolio.learningCycle || {};
+  const effect = portfolio.effectPanel || {};
+  return [
+    { time: "0:00-0:25", shot: "学生端学习周期驾驶舱", narration: `说明学习问题和本周期主题：${cycle.title || "完整学习周期"}`, evidence: cycle.focusNodes?.slice(0, 4).join("、") || "学习目标" },
+    { time: "0:25-1:05", shot: "前测诊断与目标设定", narration: "展示前测掌握度、典型误区、学生原始理解和 2-3 个学习目标。", evidence: cycle.tasks?.slice(0, 2).map((task) => task.statusText).join("；") || "" },
+    { time: "1:05-1:55", shot: "AI 三栏学习工作台", narration: "展示知识图谱路径、AI 诊断回答、引用来源、学生审辩和最终判断。", evidence: `${cycle.evidenceCounts?.aiDialogues || 0} 次 AI 对话，${cycle.evidenceCounts?.aiReviews || 0} 条审辩` },
+    { time: "1:55-2:35", shot: "节点练习/作业与错因修正", narration: "展示练习正确率、错题、误区修正解释和二次验证。", evidence: `${cycle.evidenceCounts?.knowledgeTests || 0} 次测试，${cycle.evidenceCounts?.wrongNotes || 0} 条错因` },
+    { time: "2:35-3:15", shot: "前后对比成效面板", narration: `展示学习增益、正确率变化、策略变化和作品产出。${effect.learningGainText ? `学习增益 ${effect.learningGainText}` : ""}`, evidence: effect.summary || "" },
+    { time: "3:15-3:45", shot: "个人反思与伦理规范", narration: "展示学生如何判断 AI、如何避免过度依赖、如何保留引用和匿名导出。", evidence: `${portfolio.reflections?.length || 0} 份反思，${portfolio.aiReviews?.length || 0} 条审辩` },
+    { time: "3:45-4:30", shot: "学习周期申报页与导出", narration: "打开固定七段申报页，导出匿名证据包、申报表素材和视频脚本。", evidence: "学习问题 -> AI介入方案 -> 完整学习周期 -> 成效数据 -> 个人反思 -> 推广价值 -> 伦理规范" }
+  ];
+}
+
+function buildDeclarationEvidencePack({ portfolio, events = [], citations = [], aiReviews = [] }) {
+  const comparison = portfolio.masteryComparison || [];
+  const counts = portfolio.learningCycle?.evidenceCounts || {};
+  const masteryChart = comparison.slice(0, 8).map((item) => ({
+    topic: item.topic,
+    start: item.start,
+    current: item.current,
+    change: item.change,
+    startText: item.startText,
+    currentText: item.currentText,
+    changeText: item.changeText
+  }));
+  const eventTypeCounts = {};
+  events.forEach((event) => {
+    const label = reportEventLabel(event.eventType);
+    eventTypeCounts[label] = (eventTypeCounts[label] || 0) + 1;
+  });
+  const citationSources = {};
+  citations.forEach((citation) => {
+    const key = citation.sourceName || citation.title || citation.id || "未知来源";
+    citationSources[key] = (citationSources[key] || 0) + 1;
+  });
+  return {
+    title: "个人学习档案自动生成申报证据包",
+    ready: Boolean((portfolio.timeline || []).length || comparison.length || (portfolio.reflections || []).length),
+    processTimeline: (portfolio.timeline || []).slice(0, 20),
+    masteryChart,
+    eventTypeCounts,
+    evidenceCounts: counts,
+    cycleTasks: (portfolio.learningCycle?.tasks || []).map((task) => ({
+      key: task.key,
+      label: task.label,
+      statusText: task.statusText,
+      statusLabel: task.statusLabel,
+      done: task.done,
+      evidenceType: task.evidenceType,
+      evidence: task.evidence
+    })),
+    cycleCompletionReport: portfolio.learningCycle?.completionReport || {},
+    cycleRequirements: portfolio.learningCycle?.evidenceRequirements || {},
+    innovationPoints: (portfolio.innovation?.points || []).map((point) => ({
+      title: point.title,
+      summary: point.summary,
+      evidence: point.evidence,
+      evaluationValue: point.evaluationValue
+    })),
+    aiDialogueSummary: (portfolio.aiSupportRecords || []).slice(0, 8).map((item) => ({
+      topic: item.topic,
+      prompt: item.prompt,
+      citations: item.citations,
+      confidence: item.confidence
+    })),
+    reflectionSamples: (portfolio.reflectionExcerpts || []).slice(0, 5),
+    correctionRecords: (portfolio.corrections || []).slice(0, 8),
+    aiReviewRecords: aiReviews.slice(0, 8),
+    applicationSections: buildDeclarationApplicationSections(portfolio),
+    videoScriptOutline: buildVideoScriptOutline(portfolio),
+    effectPanel: portfolio.effectPanel || {},
+    citationSources: Object.entries(citationSources).map(([source, count]) => ({ source, count })).slice(0, 12),
+    anonymization: "可导出匿名版，隐藏学生姓名、ID 和真实班级，仅保留过程证据与统计摘要。",
+    exportMaterials: ["学习过程时间线", "前后测对比图", "错因修正记录", "AI 对话与引用摘要", "学生反思摘录", "匿名化学习档案", "申报表素材 JSON/HTML/PDF", "3-5 分钟视频脚本提纲"]
+  };
+}
+
+function buildStudentPortfolio(db, userId, options = {}) {
+  const user = ensureUser(db, userId);
+  const anonymous = Boolean(options.anonymous);
+  const events = sortNewest((db.learningEvents || []).filter((event) => event.studentId === userId));
+  const diagnoses = sortNewest((db.diagnosisResults || []).filter((item) => item.studentId === userId));
+  const mastery = sortNewest((db.studentMastery || []).filter((item) => item.studentId === userId));
+  const reflections = sortNewest((db.studentReflections || []).filter((item) => item.studentId === userId));
+  const corrections = sortNewest((db.knowledgeCorrections || []).filter((item) => item.studentId === userId));
+  const aiReviews = sortNewest((db.aiAnswerReviews || []).filter((item) => item.studentId === userId));
+  const nodeAnnotations = sortNewest((db.studentNodeAnnotations || []).filter((item) => item.studentId === userId));
+  const ethicsSettings = getStudentEthicsSettings(db, userId);
+  const wrongNotes = sortNewest((db.wrongNotes || []).filter((item) => item.userId === userId));
+  const conversations = sortNewest((db.conversations || []).filter((item) => item.userId === userId));
+  const submissions = sortNewest((db.submissions || []).filter((item) => item.studentId === userId).map((submission) => {
+    const homework = (db.homework || []).find((item) => item.id === submission.homeworkId);
+    return { ...submission, title: homework?.title || submission.title || "作业提交", homeworkTitle: homework?.title || "" };
+  }));
+  const agentRuns = sortNewest((db.agentRuns || []).filter((item) => item.userId === userId));
+  const models = sortNewest((db.models || []).filter((item) => item.ownerId === userId));
+  const subject = inferPortfolioSubject(db, userId, events);
+  const comparison = buildMasteryComparison(events, mastery);
+  const evidenceCounts = {
+    aiDialogues: conversations.length,
+    aiWorkflowRuns: agentRuns.length,
+    knowledgeTests: events.filter((event) => event.eventType === "knowledge_test_evaluate").length,
+    masteryChanges: comparison.filter((item) => item.change !== null && item.change !== 0).length,
+    wrongNotes: wrongNotes.length,
+    reflections: reflections.length,
+    homeworkOutputs: submissions.length,
+    modelExperiments: models.length,
+    corrections: corrections.length,
+    aiReviews: aiReviews.length,
+    nodeAnnotations: nodeAnnotations.length,
+    learningCycles: (db.learningCycles || []).filter((item) => item.studentId === userId && item.status !== "archived").length,
+    learningCards: nodeAnnotations.filter((item) => item.fromAiAnswer).length,
+    learningOutputs: submissions.length + models.length + nodeAnnotations.length
+  };
+  const cycleView = buildLearningCycleView(db, userId, subject, evidenceCounts);
+  const stage = cycleView.currentStage || portfolioStage(evidenceCounts);
+  const timeline = buildPortfolioTimeline({ events, reflections, wrongNotes, submissions, conversations, agentRuns, aiReviews, nodeAnnotations });
+  const latestDiagnosis = diagnoses[0] || null;
+  const aiSupportRecords = agentRuns.slice(0, 10).map((run) => ({
+    id: run.id,
+    time: run.createdAt,
+    topic: (run.knowledgePoints || [])[0] || run.intent || "待定位",
+    prompt: reportCompactText(run.prompt || "", 140),
+    help: run.strategy || "课程资料 + 图谱 + 诊断工作流",
+    citations: Array.isArray(run.citations) ? run.citations.slice(0, 5).map((item) => item.sourceName || item.title || item.id).filter(Boolean) : [],
+    adopted: "已归档到学习事件，可在反思卡中记录是否采纳。",
+    confidence: run.workflowResult?.topic_localization?.confidenceLabel || run.confidence || ""
+  }));
+  const allCitations = agentRuns.flatMap((run) => Array.isArray(run.citations) ? run.citations : []);
+  const works = submissions.slice(0, 10).map((submission) => ({
+    id: submission.id,
+    type: "作业/项目",
+    title: submission.title || "作业提交",
+    time: submission.submittedAt || submission.createdAt,
+    status: reportStatusLabel(submission.status),
+    score: scorePercentText(submission.score, "未评分"),
+    summary: reportCompactText(submission.content || submission.answer || submission.feedback?.comment || "", 160)
+  })).concat(models.slice(0, 8).map((model) => ({
+    id: model.id,
+    type: "代码实验",
+    title: model.name || "模型实验",
+    time: model.updatedAt || model.createdAt,
+    status: model.mode || "实验记录",
+    score: "",
+    summary: reportCompactText(model.notes || model.experiment?.summary || "", 160)
+  }))).concat(nodeAnnotations.slice(0, 12).map((annotation) => ({
+    id: annotation.id,
+    type: annotation.fromAiAnswer ? "AI 学习卡片" : "图谱标注",
+    title: annotation.nodeLabel || annotation.evidenceTitle || "节点证据",
+    time: annotation.updatedAt || annotation.createdAt,
+    status: [annotation.statusLabel, annotation.favorite ? "已收藏" : ""].filter(Boolean).join(" · "),
+    score: scorePercentText(nodeAnnotationScore(annotation.status), ""),
+    summary: reportCompactText(annotation.explanation || annotation.evidenceTitle || "学生主动建构的节点证据", 160)
+  })));
+  const teacherEvaluations = submissions.filter((submission) => submission.feedback?.comment || submission.feedback?.teacherComment || submission.feedback?.rubricResults).slice(0, 8).map((submission) => ({
+    time: submission.feedback?.gradedAt || submission.gradedAt || submission.updatedAt || submission.createdAt,
+    teacher: submission.feedback?.teacherName || "任课教师",
+    comment: reportCompactText(submission.feedback?.teacherComment || submission.feedback?.comment || submission.feedback?.summary || "教师已完成学习成果确认。", 220),
+    summary: submission.title || "作业/项目评价"
+  }));
+  const misconceptionTrajectory = wrongNotes.slice(0, 12).map((note) => {
+    const relatedDiagnosis = diagnoses.find((item) => item.topic === note.topic || (item.missingPoints || []).some((point) => String(point).includes(note.topic)));
+    const topicCorrections = corrections.filter((item) => item.fromTopic === note.topic || item.correctedTopic === note.topic);
+    const topicTests = events.filter((event) => event.knowledgePoint === note.topic || event.topic === note.topic);
+    const resolved = topicCorrections.length > 0 || topicTests.some((event) => Number(event.payload?.accuracy || event.accuracy || 0) >= 0.8);
+    return {
+      topic: note.topic || "待归类",
+      before: reportCompactText(note.question || relatedDiagnosis?.finalAnswer || "原始理解存在缺口", 120),
+      issue: reportCompactText(note.analysis || (relatedDiagnosis?.missingPoints || []).join("；") || "等待补充错因", 140),
+      after: reportCompactText(note.recommendation || "完成同类题、重写解释并在反思中记录修正策略。", 140),
+      time: note.createdAt,
+      firstFound: note.source || "章节前测",
+      intervention: note.recommendation || "概念对比微课 + 3 道变式题 + 节点实验",
+      retestResult: resolved ? "由错误改为正确" : "尚未完成验证性复测",
+      currentStatus: resolved ? "已消除" : "待干预",
+      transfer: resolved ? "可迁移到不平衡分类等新场景。" : "完成变式题后，再用新场景验证迁移。"
+    };
+  });
+  const userChatThreads = (db.chatThreads || []).filter((thread) => (thread.memberIds || []).includes(userId));
+  const collaborationMessages = userChatThreads.flatMap((thread) => (thread.messages || []).map((message) => ({ ...message, threadTitle: thread.title || thread.name || "小组讨论" })));
+  const collaboration = {
+    classes: classNamesForUser(db, user),
+    chatThreads: userChatThreads.length,
+    messages: collaborationMessages.filter((msg) => msg.senderId === userId).length,
+    contributionHint: "可用于小组共学任务、共享图谱、成员贡献和共识总结。",
+    groupSpace: {
+      title: "小组共学最小闭环",
+      graphCoBuild: `${nodeAnnotations.length} 条本人图谱标注/学习卡片，可作为小组共建知识图谱的贡献记录。`,
+      questionPool: wrongNotes.slice(0, 6).map((note) => note.topic || note.question || "待归类问题"),
+      roles: [
+        { role: "提问者", evidence: conversations.length ? `${conversations.length} 次学习对话` : "待通过问题池补充" },
+        { role: "验证者", evidence: aiReviews.length ? `${aiReviews.length} 条 AI 审辩` : "待补充引用核验" },
+        { role: "总结者", evidence: reflections.length ? `${reflections.length} 份结构化反思` : "待补充小组总结" },
+        { role: "代码实验者", evidence: models.length ? `${models.length} 个模型实验` : "可由模型实验室补充" }
+      ],
+      aiDiscussionSummary: collaborationMessages.length
+        ? reportCompactText(collaborationMessages.slice(-8).map((msg) => msg.content || msg.text || "").join("；"), 220)
+        : "暂无小组讨论消息，可在班级或站内消息中围绕问题池开展轻量协作。",
+      peerReview: submissions.length ? `${submissions.length} 次作业/项目提交可用于同伴互评。` : "可在作业提交后加入同伴互评与贡献记录。",
+      timeline: collaborationMessages.slice(-8).map((msg) => ({
+        time: msg.createdAt || msg.time || "",
+        title: msg.threadTitle || "小组讨论",
+        summary: reportCompactText(msg.content || msg.text || "", 120)
+      }))
+    }
+  };
+  const reflectionExcerpts = reflections.slice(0, 5).map((item) => ({
+    time: item.createdAt,
+    topic: item.knowledgePoint || item.contextTitle || "学习反思",
+    text: reportCompactText(item.strategyChange || item.aiAgreement || item.aiDiscovery || item.aiLimitation || item.nextPlan || item.originalUnderstanding || "", 180)
+  }));
+  const summary = {
+    student: anonymous ? { id: "S001", name: "匿名学生", classes: classNamesForUser(db, user).map((_, index) => `班级${index + 1}`) } : { id: user.id, name: user.name, classes: classNamesForUser(db, user) },
+    subject,
+    generatedAt: now(),
+    latestActivity: timeline[0]?.time || "",
+    averageMastery: mastery.length
+      ? Number((mastery.reduce((sum, item) => sum + Number(normalizeLearningScore(item.score) || 0), 0) / mastery.length).toFixed(4))
+      : null,
+    latestDiagnosis: latestDiagnosis ? {
+      topic: latestDiagnosis.topic,
+      score: latestDiagnosis.masteryScore,
+      level: latestDiagnosis.masteryLevel,
+      time: latestDiagnosis.createdAt
+    } : null
+  };
+  const innovation = buildInnovationSummary(subject, {
+    counts: evidenceCounts,
+    cycle: cycleView,
+    comparison,
+    citationCount: allCitations.length
+  });
+  const pathSource = comparison.length
+    ? comparison
+    : (cycleView.focusNodes || []).map((topic) => ({
+      topic,
+      current: null,
+      currentText: "未诊断",
+      changeText: "待形成"
+    }));
+  const recommendedPath = pathSource.slice(0, 6).map((item, index) => {
+    const current = item.current === null || item.current === undefined ? null : Number(item.current);
+    const weak = current === null || current < 0.58;
+    const previous = (cycleView.focusNodes || [])[Math.max(0, index - 1)] || "本章基础概念";
+    const next = (cycleView.focusNodes || [])[index + 1] || (cycleView.recommendedTestNodes || [])[0] || "同知识点变式题";
+    return {
+      topic: item.topic,
+      current,
+      action: weak ? "先补前置并完成同类题" : "做变式后测并写反思",
+      why: weak
+        ? `当前掌握度${item.currentText || "未诊断"}，应优先补齐该节点再进入后续任务。`
+        : `该节点已有学习证据，适合作为后测或迁移任务的验证点。`,
+      misconceptionRelation: wrongNotes.some((note) => {
+        const noteTopic = String(note.topic || "").trim();
+        const pathTopic = String(item.topic || "").trim();
+        return Boolean(noteTopic && pathTopic && (noteTopic.includes(pathTopic) || pathTopic.includes(noteTopic)));
+      })
+        ? "错题本中已有相关误区，学习时需要对照修正解释。"
+        : "暂无显式错题，可通过前测或 AI 诊断确认是否存在隐性误区。",
+      prerequisites: [previous].filter(Boolean),
+      verification: weak ? "完成一道同知识点变式题，并写下修正后的解释。" : "完成一次后测题或小型代码/笔记产出。",
+      fallback: `仍未掌握时，回到「${previous}」或补学「${next}」。`,
+      evidenceSource: item.evidenceCount ? `${item.evidenceCount} 条掌握度证据` : "学习周期目标与图谱节点"
+    };
+  });
+  const graphRagProfileCoupling = {
+    title: "GraphRAG + 学习画像双向驱动",
+    description: "AI 回答绑定课程资料和知识图谱；学习行为回写学生画像；画像反过来影响路径推荐；图谱节点成为学习证据索引。",
+    graphEvidenceCount: allCitations.filter((item) => item.type === "graph" || item.graphId || item.nodeId).length,
+    ragCitationCount: allCitations.length,
+    profileEvidenceCount: mastery.reduce((sum, item) => sum + Number(item.evidenceCount || 0), 0) + nodeAnnotations.length,
+    weakDrivenTopics: comparison.filter((item) => Number(item.current || 0) < 0.58).slice(0, 6).map((item) => item.topic),
+    recommendedPath
+  };
+  const cycleCompletionReport = buildLearningCycleCompletionReport({
+    cycle: cycleView,
+    comparison,
+    wrongNotes,
+    reflections,
+    citations: allCitations,
+    counts: evidenceCounts,
+    ethicsSettings
+  });
+  const effectPanel = buildLearningEffectPanel({
+    comparison,
+    events,
+    wrongNotes,
+    corrections,
+    aiReviews,
+    works,
+    reflections,
+    cycle: cycleView
+  });
+  const portfolio = {
+    summary,
+    learningCycle: {
+      ...cycleView,
+      subject: cycleView.subject || subject,
+      goals: cycleView.goals?.length ? cycleView.goals : portfolioGoalsForSubject(subject),
+      currentStage: stage,
+      evidenceCounts,
+      evidenceLoop: innovation.loop,
+      completionReport: cycleCompletionReport
+    },
+    innovation,
+    graphRagProfileCoupling,
+    effectPanel,
+    timeline,
+    masteryComparison: comparison,
+    aiSupportRecords,
+    works,
+    misconceptionTrajectory,
+    reflections,
+    reflectionExcerpts,
+    corrections,
+    aiReviews,
+    nodeAnnotations,
+    teacherEvaluations,
+    collaboration,
+    ethics: {
+      settings: ethicsSettings,
+      aiStatement: ethicsSettings.aiUseDisclosure
+        ? "对话、诊断、资料引用和学习建议由 AI 辅助生成；最终答案、反思与作品提交由学生确认。"
+        : "学生尚未开启 AI 使用声明展示，建议在参赛材料中显式说明 AI 辅助边界。",
+      citationPolicy: ethicsSettings.citationRequired
+        ? "AI 回答必须展示引用来源；没有引用或低置信度时仅作为待确认学习事件。"
+        : "当前允许不强制引用，建议比赛演示时开启引用来源记录。",
+      privacyPolicy: ethicsSettings.dataConsent
+        ? "导出时可匿名化学生姓名、ID 和班级；教师端默认以统计和证据摘要为主。"
+        : "学生尚未授权将个人学习数据用于档案展示，只保留本地个人可见记录。",
+      integrityMode: ethicsSettings.requireOriginalAnswerFirst
+        ? "推荐先作答再求助，诊断时要求保留学生原始理解，AI 生成内容不直接作为最终答案。"
+        : "当前未强制先作答再求助，建议在正式实施周期中启用。"
+    },
+    showcase: {
+      background: `${summary.student.name} 在 ${subject} 学习中围绕核心概念、错因修正和反思形成证据链。`,
+      intervention: "知识图谱、GraphRAG 引用、AI 诊断、知识测试、错题修正、结构化反思和学习档案导出。",
+      period: "4 周学习周期，可用于小样本深描或班级推广。",
+      effect: {
+        prePostTopics: comparison.length,
+        masteryImproved: comparison.filter((item) => Number(item.change || 0) > 0).length,
+        wrongNotes: wrongNotes.length,
+        reflections: reflections.length,
+        evidenceEvents: events.length,
+        learningGain: effectPanel.learningGain,
+        learningGainText: effectPanel.learningGainText
+      },
+      reflectionExcerpts,
+      transfer: "同一证据链可迁移到其他课程：前测、AI 学习、图谱节点、测试、错因、反思、后测、导出。",
+      norms: "保留引用、不确定性提示、学生授权、匿名导出和知识点定位纠错。"
+    },
+    exports: ["html", "pdf", "csv", "json", "application", "script"]
+  };
+  portfolio.declarationEvidencePack = buildDeclarationEvidencePack({ portfolio, events, citations: allCitations, aiReviews });
+  return portfolio;
+}
+
+function studentPortfolioJson(portfolio) {
+  return JSON.stringify(portfolio, null, 2);
+}
+
+function studentPortfolioCsv(portfolio) {
+  const rows = [
+    ["section", "time", "type", "topic", "score", "summary"],
+    ...portfolio.timeline.map((item) => ["timeline", reportDate(item.time), item.type, item.title, item.score, item.summary]),
+    ...portfolio.masteryComparison.map((item) => ["mastery", reportDate(item.lastAt), "前后测对比", item.topic, item.currentText, `起始 ${item.startText}，变化 ${item.changeText}`]),
+    ...portfolio.reflections.map((item) => ["reflection", reportDate(item.createdAt), "结构化反思", item.knowledgePoint || item.contextTitle || "", "", [item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；")]),
+    ...(portfolio.aiReviews || []).map((item) => ["ai_review", reportDate(item.createdAt), item.reviewType, item.topic || "", item.trustScore === null || item.trustScore === undefined ? "" : `${Math.round(Number(item.trustScore || 0) * 100)}%`, item.comment || item.studentAction || ""]),
+    ...((portfolio.innovation?.points || []).map((item) => ["innovation", reportDate(portfolio.summary.generatedAt), "教育创新点", item.title, "", [item.summary, ...(item.evidence || []), item.evaluationValue].filter(Boolean).join("；")])),
+    ...((portfolio.declarationEvidencePack?.exportMaterials || []).map((item) => ["evidence_pack", reportDate(portfolio.summary.generatedAt), "申报材料", item, "", portfolio.declarationEvidencePack?.anonymization || ""]))
+  ];
+  return rows.map((row) => row.map(csvCell).join(",")).join("\n");
+}
+
+function studentPortfolioHtml(portfolio, options = {}) {
+  const printScript = options.print ? `<script>window.addEventListener("load",()=>setTimeout(()=>window.print(),300));</script>` : "";
+  const stats = portfolio.learningCycle.evidenceCounts;
+  const statRows = [
+    ["AI 对话", stats.aiDialogues],
+    ["知识测试", stats.knowledgeTests],
+    ["掌握变化", stats.masteryChanges],
+    ["错题", stats.wrongNotes],
+    ["反思", stats.reflections],
+    ["作品/实验", stats.learningOutputs || (stats.homeworkOutputs + stats.modelExperiments)]
+  ];
+  const tableRows = (rows, columns) => rows.length
+    ? rows.map((row) => `<tr>${columns.map((column) => `<td>${reportHtmlEscape(row[column] ?? "")}</td>`).join("")}</tr>`).join("")
+    : `<tr><td colspan="${columns.length}">暂无记录</td></tr>`;
+  const innovationRows = (portfolio.innovation?.points || []).map((point, index) => ({
+    序号: index + 1,
+    创新点: point.title,
+    教育价值: point.summary,
+    证据指标: (point.evidence || []).join("；"),
+    申报对应: point.evaluationValue || ""
+  }));
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>学生学习证据档案</title>
+  <style>
+    body{font-family:"Microsoft YaHei",Arial,sans-serif;margin:0;color:#172033;background:#f6f8fb;}
+    main{max-width:1080px;margin:0 auto;padding:34px;}
+    section{background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px;margin:0 0 18px;}
+    h1,h2,h3,p{margin:0;} h1{font-size:30px;} h2{font-size:20px;margin-bottom:12px;} p{line-height:1.7;color:#536476;}
+    .hero{display:grid;grid-template-columns:1.4fr .8fr;gap:18px;align-items:start;}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px;}
+    .stat{border:1px solid #edf2f7;border-radius:8px;padding:12px;background:#f8fafc;} .stat strong{display:block;font-size:24px;}
+    table{width:100%;border-collapse:collapse;font-size:14px;} th,td{border-bottom:1px solid #edf2f7;text-align:left;vertical-align:top;padding:10px;} th{color:#536476;background:#f8fafc;}
+    .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;} .chips span{border:1px solid #dfe7f1;border-radius:999px;padding:7px 10px;background:#f8fafc;}
+    @media print{body{background:#fff;} main{padding:0;} section{break-inside:avoid;box-shadow:none;}}
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <div>
+      <h1>${reportHtmlEscape(portfolio.summary.student.name)}学习证据档案</h1>
+      <p>${reportHtmlEscape(portfolio.learningCycle.title)} · 当前阶段：${reportHtmlEscape(portfolio.learningCycle.currentStage.activeLabel)} · 生成时间：${reportDate(portfolio.summary.generatedAt)}</p>
+      <div class="chips">${portfolio.learningCycle.goals.map((goal) => `<span>${reportHtmlEscape(goal)}</span>`).join("")}</div>
+    </div>
+    <div class="stats">${statRows.map(([label, value]) => `<div class="stat"><strong>${reportHtmlEscape(value)}</strong><span>${reportHtmlEscape(label)}</span></div>`).join("")}</div>
+  </section>
+  <section><h2>${reportHtmlEscape(portfolio.innovation?.title || "证据驱动的 AI 学习闭环")}</h2><p>${reportHtmlEscape(portfolio.innovation?.thesis || "")}</p><p>${reportHtmlEscape(portfolio.innovation?.positioning || "")}</p><div class="chips">${(portfolio.innovation?.loop || []).map((item) => `<span>${reportHtmlEscape(item)}</span>`).join("")}</div></section>
+  <section><h2>五个教育创新点</h2><table><thead><tr><th>序号</th><th>创新点</th><th>教育价值</th><th>证据指标</th><th>申报对应</th></tr></thead><tbody>${tableRows(innovationRows, ["序号", "创新点", "教育价值", "证据指标", "申报对应"])}</tbody></table></section>
+  <section><h2>GraphRAG + 学习画像</h2><p>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.description || "")}</p><div class="stats"><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.ragCitationCount || 0)}</strong><span>RAG 引用</span></div><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.graphEvidenceCount || 0)}</strong><span>图谱证据</span></div><div class="stat"><strong>${reportHtmlEscape(portfolio.graphRagProfileCoupling?.profileEvidenceCount || 0)}</strong><span>画像证据</span></div></div></section>
+  <section><h2>学习时间线</h2><table><thead><tr><th>时间</th><th>类型</th><th>主题</th><th>分数</th><th>摘要</th></tr></thead><tbody>${tableRows(portfolio.timeline.slice(0, 60).map((item) => ({ 时间: reportDate(item.time), 类型: item.type, 主题: item.title, 分数: item.score, 摘要: item.summary })), ["时间", "类型", "主题", "分数", "摘要"])}</tbody></table></section>
+  <section><h2>前测/后测与掌握度变化</h2><table><thead><tr><th>知识点</th><th>起始</th><th>当前</th><th>变化</th><th>证据数</th></tr></thead><tbody>${tableRows(portfolio.masteryComparison.map((item) => ({ 知识点: item.topic, 起始: item.startText, 当前: item.currentText, 变化: item.changeText, 证据数: item.evidenceCount })), ["知识点", "起始", "当前", "变化", "证据数"])}</tbody></table></section>
+  <section><h2>AI 支持记录</h2><table><thead><tr><th>时间</th><th>知识点</th><th>帮助方式</th><th>引用</th><th>采纳</th></tr></thead><tbody>${tableRows(portfolio.aiSupportRecords.map((item) => ({ 时间: reportDate(item.time), 知识点: item.topic, 帮助方式: item.help, 引用: item.citations.join("、"), 采纳: item.adopted })), ["时间", "知识点", "帮助方式", "引用", "采纳"])}</tbody></table></section>
+  <section><h2>AI 审辩记录</h2><table><thead><tr><th>时间</th><th>知识点</th><th>类型</th><th>可信度</th><th>说明</th></tr></thead><tbody>${tableRows((portfolio.aiReviews || []).map((item) => ({ 时间: reportDate(item.createdAt), 知识点: item.topic, 类型: item.reviewType, 可信度: item.trustScore === null || item.trustScore === undefined ? "" : `${Math.round(Number(item.trustScore || 0) * 100)}%`, 说明: item.comment || item.studentAction || "" })), ["时间", "知识点", "类型", "可信度", "说明"])}</tbody></table></section>
+  <section><h2>作品证据</h2><table><thead><tr><th>时间</th><th>类型</th><th>标题</th><th>状态</th><th>摘要</th></tr></thead><tbody>${tableRows(portfolio.works.map((item) => ({ 时间: reportDate(item.time), 类型: item.type, 标题: item.title, 状态: [item.status, item.score].filter(Boolean).join(" · "), 摘要: item.summary })), ["时间", "类型", "标题", "状态", "摘要"])}</tbody></table></section>
+  <section><h2>错因变化与个人反思</h2><table><thead><tr><th>时间</th><th>主题</th><th>原理解/发现/判断/策略/计划</th></tr></thead><tbody>${tableRows(portfolio.reflections.map((item) => ({ 时间: reportDate(item.createdAt), 主题: item.knowledgePoint || item.contextTitle || "学习反思", "原理解/发现/判断/策略/计划": [item.originalUnderstanding, item.aiDiscovery, item.aiAgreement, item.strategyChange, item.aiLimitation, item.nextPlan, item.antiOverreliance].filter(Boolean).join("；") })), ["时间", "主题", "原理解/发现/判断/策略/计划"])}</tbody></table></section>
+  <section><h2>申报证据包</h2><p>${reportHtmlEscape(portfolio.declarationEvidencePack?.anonymization || "")}</p><div class="chips">${(portfolio.declarationEvidencePack?.exportMaterials || []).map((item) => `<span>${reportHtmlEscape(item)}</span>`).join("")}</div></section>
+  <section><h2>规范机制</h2><p>${reportHtmlEscape(portfolio.ethics.aiStatement)}</p><p>${reportHtmlEscape(portfolio.ethics.citationPolicy)}</p><p>${reportHtmlEscape(portfolio.ethics.privacyPolicy)}</p></section>
+</main>${printScript}</body></html>`;
+}
+
+function studentPortfolioApplicationJson(portfolio) {
+  return JSON.stringify({
+    title: `${portfolio.learningCycle?.title || "学习周期"}申报表素材`,
+    generatedAt: portfolio.summary?.generatedAt || now(),
+    student: portfolio.summary?.student,
+    subject: portfolio.summary?.subject,
+    sections: portfolio.declarationEvidencePack?.applicationSections || buildDeclarationApplicationSections(portfolio),
+    effectPanel: portfolio.effectPanel,
+    evidencePack: portfolio.declarationEvidencePack,
+    exports: portfolio.exports
+  }, null, 2);
+}
+
+function studentPortfolioVideoScript(portfolio) {
+  const outline = portfolio.declarationEvidencePack?.videoScriptOutline || buildVideoScriptOutline(portfolio);
+  const lines = [
+    `# 3-5 分钟展示视频脚本提纲`,
+    "",
+    `案例：${portfolio.learningCycle?.title || "AI 支持的完整学习周期"}`,
+    `学生：${portfolio.summary?.student?.name || "匿名学生"} · 学科：${portfolio.summary?.subject || ""}`,
+    "",
+    ...outline.flatMap((item, index) => [
+      `## ${index + 1}. ${item.time} ${item.shot}`,
+      `旁白：${item.narration}`,
+      `证据：${item.evidence || "待补充"}`,
+      ""
+    ])
+  ];
+  return lines.join("\n");
+}
+
+function buildStudentPortfolioExportPayload(db, userId, format = "json", options = {}) {
+  const portfolio = buildStudentPortfolio(db, userId, options);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const normalizedFormat = ["json", "csv", "html", "pdf", "application", "script"].includes(String(format).toLowerCase()) ? String(format).toLowerCase() : "json";
+  const anonymized = options.anonymous ? "-anonymous" : "";
+  if (normalizedFormat === "csv") return { format: "csv", fileName: `student-portfolio${anonymized}-${stamp}.csv`, mime: "text/csv;charset=utf-8", content: studentPortfolioCsv(portfolio), portfolio };
+  if (normalizedFormat === "application") return { format: "application", fileName: `application-material${anonymized}-${stamp}.json`, mime: "application/json;charset=utf-8", content: studentPortfolioApplicationJson(portfolio), portfolio };
+  if (normalizedFormat === "script") return { format: "script", fileName: `video-script${anonymized}-${stamp}.md`, mime: "text/markdown;charset=utf-8", content: studentPortfolioVideoScript(portfolio), portfolio };
+  if (normalizedFormat === "html" || normalizedFormat === "pdf") {
+    return {
+      format: normalizedFormat,
+      fileName: normalizedFormat === "pdf" ? `student-portfolio${anonymized}-${stamp}-print.html` : `student-portfolio${anonymized}-${stamp}.html`,
+      mime: "text/html;charset=utf-8",
+      content: studentPortfolioHtml(portfolio, { print: normalizedFormat === "pdf" }),
+      portfolio
+    };
+  }
+  return { format: "json", fileName: `student-portfolio${anonymized}-${stamp}.json`, mime: "application/json;charset=utf-8", content: studentPortfolioJson(portfolio), portfolio };
+}
+
+function createStudentReflection(db, userId, body = {}) {
+  db.studentReflections = Array.isArray(db.studentReflections) ? db.studentReflections : [];
+  const reflection = {
+    id: uid("refl"),
+    studentId: userId,
+    subject: String(body.subject || "").slice(0, 80),
+    knowledgePoint: String(body.knowledgePoint || body.topic || "").slice(0, 120),
+    contextType: String(body.contextType || "learning").slice(0, 60),
+    contextId: String(body.contextId || "").slice(0, 120),
+    contextTitle: String(body.contextTitle || body.title || "").slice(0, 160),
+    originalUnderstanding: String(body.originalUnderstanding || "").slice(0, 1200),
+    aiDiscovery: String(body.aiDiscovery || "").slice(0, 1200),
+    aiAgreement: String(body.aiAgreement || "").slice(0, 800),
+    strategyChange: String(body.strategyChange || body.changes || "").slice(0, 1200),
+    uncertainty: String(body.uncertainty || "").slice(0, 1200),
+    aiLimitation: String(body.aiLimitation || "").slice(0, 1000),
+    nextPlan: String(body.nextPlan || "").slice(0, 1200),
+    antiOverreliance: String(body.antiOverreliance || "").slice(0, 1000),
+    aiUseBoundary: String(body.aiUseBoundary || "AI 用于提示、引用和诊断；最终理解、作答和反思由学生确认。").slice(0, 800),
+    createdAt: now()
+  };
+  db.studentReflections.unshift(reflection);
+  db.studentReflections = db.studentReflections.slice(0, 1200);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "structured_reflection",
+    source: "reflection-card",
+    subject: reflection.subject,
+    knowledgePoint: reflection.knowledgePoint,
+    payload: {
+      reflectionId: reflection.id,
+      contextType: reflection.contextType,
+      contextId: reflection.contextId,
+      originalUnderstanding: reflection.originalUnderstanding,
+      aiDiscovery: reflection.aiDiscovery,
+      strategyChange: reflection.strategyChange,
+      uncertainty: reflection.uncertainty,
+      nextPlan: reflection.nextPlan
+    },
+    idempotencyKey: `reflection:${reflection.id}`
+  });
+  appendLearningEvidence(db, { studentId: userId, evidenceType: "reflection", relatedNodeIds: body.nodeId ? [body.nodeId] : [], eventId: learningEvent?.id || "", summary: reflection.strategyChange || reflection.nextPlan || reflection.originalUnderstanding });
+  return { reflection, learningEvent };
+}
+
+function applyKnowledgeCorrection(db, userId, body = {}) {
+  db.knowledgeCorrections = Array.isArray(db.knowledgeCorrections) ? db.knowledgeCorrections : [];
+  const correctedTopic = String(body.correctedTopic || body.topic || "").trim().slice(0, 120);
+  if (!correctedTopic) throw Object.assign(new Error("请填写纠正后的知识点"), { status: 400 });
+  const eventId = String(body.eventId || "").trim();
+  const diagnosisId = String(body.diagnosisId || "").trim();
+  const messageId = String(body.messageId || "").trim();
+  const event = eventId ? (db.learningEvents || []).find((item) => item.id === eventId && item.studentId === userId) : null;
+  const diagnosis = diagnosisId
+    ? (db.diagnosisResults || []).find((item) => item.id === diagnosisId && item.studentId === userId)
+    : eventId ? (db.diagnosisResults || []).find((item) => item.eventId === eventId && item.studentId === userId) : null;
+  const fromTopic = String(body.fromTopic || event?.knowledgePoint || diagnosis?.topic || "").trim();
+  const correction = {
+    id: uid("corr"),
+    studentId: userId,
+    eventId,
+    diagnosisId: diagnosis?.id || diagnosisId,
+    messageId,
+    fromTopic,
+    correctedTopic,
+    confidence: normalizeLearningScore(body.confidence) ?? null,
+    reason: String(body.reason || "").slice(0, 800),
+    candidates: Array.isArray(body.candidates) ? body.candidates.slice(0, 8) : [],
+    createdAt: now()
+  };
+  db.knowledgeCorrections.unshift(correction);
+  db.knowledgeCorrections = db.knowledgeCorrections.slice(0, 1000);
+  if (event) {
+    event.knowledgePoint = correctedTopic;
+    event.payload = compactLearningPayload({
+      ...(event.payload || {}),
+      correctedTopic,
+      previousTopic: fromTopic,
+      correctionId: correction.id,
+      topicLocalization: {
+        ...(event.payload?.topicLocalization || {}),
+        selectedTopic: correctedTopic,
+        corrected: true,
+        needsConfirmation: false,
+        policy: "学生已手动纠正知识点，学习事件已重新归档。"
+      }
+    });
+  }
+  if (diagnosis) {
+    diagnosis.topic = correctedTopic;
+    diagnosis.correctedTopic = correctedTopic;
+    diagnosis.previousTopic = fromTopic;
+  }
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "knowledge_point_corrected",
+    source: "student-correction",
+    subject: String(body.subject || event?.subject || "").trim(),
+    knowledgePoint: correctedTopic,
+    graphId: String(event?.graphId || body.graphId || "").trim(),
+    nodeId: String(event?.nodeId || body.nodeId || "").trim(),
+    payload: {
+      correctionId: correction.id,
+      eventId,
+      diagnosisId: correction.diagnosisId,
+      messageId,
+      fromTopic,
+      correctedTopic,
+      reason: correction.reason,
+      candidates: correction.candidates
+    },
+    idempotencyKey: `knowledge-correction:${correction.id}`
+  });
+  syncStudentMasteryFromProfile(db, userId, [correctedTopic], {
+    subject: String(body.subject || event?.subject || "").trim(),
+    graphId: String(event?.graphId || body.graphId || "").trim(),
+    nodeId: String(event?.nodeId || body.nodeId || "").trim(),
+    lastEventId: learningEvent?.id || ""
+  });
+  return { correction, learningEvent, event, diagnosis };
+}
+
+function createAiAnswerReview(db, userId, body = {}) {
+  db.aiAnswerReviews = Array.isArray(db.aiAnswerReviews) ? db.aiAnswerReviews : [];
+  const reviewType = String(body.reviewType || body.type || "trust_review").trim().slice(0, 80);
+  const topic = String(body.topic || body.knowledgePoint || "").trim().slice(0, 120);
+  const trustScore = normalizeLearningScore(body.trustScore);
+  const accepted = ["accepted", "partial_accept"].includes(reviewType) || body.accepted === true || body.accepted === "1";
+  const issueTags = Array.isArray(body.issueTags) ? body.issueTags.map(String).filter(Boolean).slice(0, 12) : [];
+  if (reviewType && !issueTags.includes(reviewType)) issueTags.unshift(reviewType);
+  const review = {
+    id: uid("airev"),
+    studentId: userId,
+    conversationId: String(body.conversationId || "").slice(0, 120),
+    messageId: String(body.messageId || "").slice(0, 120),
+    topic,
+    reviewType,
+    trustScore,
+    accepted,
+    issueTags: issueTags.slice(0, 12),
+    comment: String(body.comment || "").slice(0, 1200),
+    studentAction: String(body.studentAction || "").slice(0, 800),
+    finalJudgment: String(body.finalJudgment || body.studentAction || "").slice(0, 1000),
+    citationIssue: String(body.citationIssue || "").slice(0, 800),
+    verificationNeed: String(body.verificationNeed || "").slice(0, 800),
+    createdAt: now()
+  };
+  db.aiAnswerReviews.unshift(review);
+  db.aiAnswerReviews = db.aiAnswerReviews.slice(0, 1200);
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "ai_answer_review",
+    source: "student-ai-review",
+    knowledgePoint: review.topic,
+    score: review.trustScore,
+    payload: {
+      reviewId: review.id,
+      conversationId: review.conversationId,
+      messageId: review.messageId,
+      reviewType: review.reviewType,
+      accepted: review.accepted,
+      issueTags: review.issueTags,
+      comment: review.comment,
+      studentAction: review.studentAction,
+      finalJudgment: review.finalJudgment,
+      citationIssue: review.citationIssue,
+      verificationNeed: review.verificationNeed
+    },
+    idempotencyKey: `ai-answer-review:${review.id}`
+  });
+  return { review, learningEvent };
+}
+
 function requestBearerToken(req) {
   const header = String(req.headers.authorization || "");
   const match = header.match(/^Bearer\s+(.+)$/i);
@@ -7467,6 +9893,125 @@ function setTopicMasteryScore(db, userId, topic, score, evidence, status = "") {
   profile.weakPoints = Array.from(weakSet).slice(0, 12);
   profile.updatedAt = now();
   return profile;
+}
+
+function normalizeLearningScore(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const score = Number(value);
+  if (!Number.isFinite(score)) return null;
+  if (score > 1 && score <= 100) return Number((score / 100).toFixed(4));
+  return Math.max(0, Math.min(1, Number(score.toFixed(4))));
+}
+
+function compactLearningPayload(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+  const copy = { ...payload };
+  ["prompt", "question", "answer", "studentAnswer", "finalAnswer"].forEach((key) => {
+    if (copy[key] !== undefined) copy[key] = String(copy[key] || "").slice(0, 1200);
+  });
+  return copy;
+}
+
+function recordLearningEvent(db, event = {}) {
+  db.learningEvents = Array.isArray(db.learningEvents) ? db.learningEvents : [];
+  const idempotencyKey = String(event.idempotencyKey || "").trim();
+  if (idempotencyKey) {
+    const existing = db.learningEvents.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) return existing;
+  }
+  const studentId = String(event.studentId || event.userId || "").trim();
+  if (!studentId) return null;
+  const item = {
+    id: event.id || uid("learn"),
+    studentId,
+    classId: String(event.classId || "").trim(),
+    teacherId: String(event.teacherId || "").trim(),
+    subject: String(event.subject || "").trim(),
+    eventType: String(event.eventType || "unknown").trim(),
+    source: String(event.source || "").trim(),
+    knowledgePoint: String(event.knowledgePoint || event.topic || "").trim(),
+    graphId: String(event.graphId || "").trim(),
+    nodeId: String(event.nodeId || "").trim(),
+    homeworkId: String(event.homeworkId || "").trim(),
+    submissionId: String(event.submissionId || "").trim(),
+    score: normalizeLearningScore(event.score),
+    durationSeconds: Number.isFinite(Number(event.durationSeconds)) ? Math.max(0, Math.round(Number(event.durationSeconds))) : null,
+    payload: compactLearningPayload(event.payload || {}),
+    idempotencyKey,
+    occurredAt: event.occurredAt || now(),
+    createdAt: now()
+  };
+  db.learningEvents.unshift(item);
+  db.learningEvents = db.learningEvents.slice(0, 5000);
+  appendLearningEvidence(db, {
+    studentId,
+    evidenceType: event.evidenceType || event.eventType || "learning_event",
+    relatedNodeIds: event.nodeId ? [event.nodeId] : [],
+    relatedMisconceptionId: event.misconceptionId || "",
+    eventId: item.id,
+    summary: event.evidenceSummary || `${item.eventType}${item.knowledgePoint ? `：${item.knowledgePoint}` : ""}`
+  });
+  return item;
+}
+
+function recordDiagnosisResult(db, result = {}) {
+  db.diagnosisResults = Array.isArray(db.diagnosisResults) ? db.diagnosisResults : [];
+  const idempotencyKey = String(result.idempotencyKey || "").trim();
+  if (idempotencyKey) {
+    const existing = db.diagnosisResults.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) return existing;
+  }
+  const studentId = String(result.studentId || result.userId || "").trim();
+  if (!studentId) return null;
+  const item = {
+    id: result.id || uid("diag"),
+    studentId,
+    eventId: String(result.eventId || "").trim(),
+    topic: String(result.topic || "").trim(),
+    masteryScore: normalizeLearningScore(result.masteryScore),
+    masteryLevel: String(result.masteryLevel || "").trim(),
+    errorTags: Array.isArray(result.errorTags) ? result.errorTags.map(String).filter(Boolean).slice(0, 20) : [],
+    missingPoints: Array.isArray(result.missingPoints) ? result.missingPoints.map(String).filter(Boolean).slice(0, 20) : [],
+    evidence: Array.isArray(result.evidence) ? result.evidence.slice(0, 12) : [],
+    finalAnswer: String(result.finalAnswer || "").slice(0, 3000),
+    modelOrWorkflow: String(result.modelOrWorkflow || "").trim(),
+    idempotencyKey,
+    createdAt: now()
+  };
+  db.diagnosisResults.unshift(item);
+  db.diagnosisResults = db.diagnosisResults.slice(0, 3000);
+  const evidence = appendLearningEvidence(db, { studentId, evidenceType: "diagnosis", relatedNodeIds: result.nodeId ? [result.nodeId] : [], summary: item.finalAnswer || item.topic, eventId: item.eventId });
+  (item.errorTags || []).forEach((tag) => upsertMisconceptionRecord(db, { studentId, nodeId: result.nodeId || "", misconceptionType: tag, evidenceId: evidence?.id || "", action: "diagnosed", detail: item.finalAnswer, status: "active" }));
+  return item;
+}
+
+function syncStudentMasteryFromProfile(db, userId, topics = [], options = {}) {
+  db.studentMastery = Array.isArray(db.studentMastery) ? db.studentMastery : [];
+  const profile = ensureLearningProfile(db, userId);
+  const user = getUser(db, userId);
+  const subject = String(options.subject || user?.subject || "").trim();
+  const uniqueTopics = Array.from(new Set((Array.isArray(topics) ? topics : [topics]).map(String).map((item) => item.trim()).filter(Boolean))).slice(0, 12);
+  uniqueTopics.forEach((topic) => {
+    const mastery = profile.mastery?.[topic];
+    if (!mastery) return;
+    const existing = db.studentMastery.find((item) => item.studentId === userId && item.subject === subject && item.knowledgePoint === topic);
+    const snapshot = {
+      studentId: userId,
+      subject,
+      knowledgePoint: topic,
+      graphId: String(options.graphId || existing?.graphId || "").trim(),
+      nodeId: String(options.nodeId || existing?.nodeId || "").trim(),
+      score: normalizeLearningScore(mastery.score),
+      status: String(mastery.status || "").trim(),
+      evidenceCount: Array.isArray(mastery.evidence) ? mastery.evidence.length : 0,
+      lastEventId: String(options.lastEventId || existing?.lastEventId || "").trim(),
+      updatedAt: mastery.updatedAt || now()
+    };
+    if (existing) Object.assign(existing, snapshot);
+    else db.studentMastery.push(snapshot);
+    appendNodeMasterySnapshot(db, userId, snapshot.nodeId || topic, snapshot.score, options.source || "mastery_update", snapshot.lastEventId);
+  });
+  return db.studentMastery.filter((item) => item.studentId === userId);
 }
 
 function normalizeDifyCallbackPayload(body = {}) {
@@ -7560,6 +10105,47 @@ function syncDifyDiagnosisCallback(db, rawBody, req) {
       masteryLevel
     );
   }
+  const callbackRequestId = String(payload.request_id || payload.requestId || "").trim();
+  const learningEvent = recordLearningEvent(db, {
+    studentId: userId,
+    eventType: "dify_diagnosis",
+    source: "dify",
+    subject: String(payload.subject || structured.subject || user.subject || ""),
+    knowledgePoint: topic,
+    score: normalizedScore,
+    payload: {
+      requestId: callbackRequestId,
+      syncMode,
+      conversationId,
+      question,
+      studentAnswer,
+      finalAnswer,
+      masteryLevel,
+      errorTags: errors,
+      missingPoints: missing,
+      citations
+    },
+    idempotencyKey: callbackRequestId ? `dify:${callbackRequestId}` : ""
+  });
+  recordDiagnosisResult(db, {
+    studentId: userId,
+    eventId: learningEvent?.id || "",
+    topic,
+    masteryScore: normalizedScore,
+    masteryLevel,
+    errorTags: errors,
+    missingPoints: missing,
+    evidence: Array.isArray(ragEvidence) ? ragEvidence : [],
+    finalAnswer,
+    modelOrWorkflow: "dify-student-diagnosis",
+    idempotencyKey: callbackRequestId ? `dify-diagnosis:${callbackRequestId}` : ""
+  });
+  if (shouldWriteMastery) {
+    syncStudentMasteryFromProfile(db, userId, [topic], {
+      subject: String(payload.subject || structured.subject || user.subject || ""),
+      lastEventId: learningEvent?.id || ""
+    });
+  }
   let wrongNote = null;
   if (studentAnswer && (errors.length || missing.length || (normalizedScore !== null && normalizedScore < 0.75))) {
     wrongNote = addWrongNote(db, userId, {
@@ -7571,6 +10157,7 @@ function syncDifyDiagnosisCallback(db, rawBody, req) {
       recommendation: missing.length ? `补齐：${missing.join("、")}` : "按标准解释重写答案并完成同类题。"
     });
   }
+  if (learningEvent && wrongNote) learningEvent.payload.wrongNoteId = wrongNote.id;
   let conversation = null;
   const skipConversationWrite = syncMode === "api-return" || syncMode === "api_return";
   if (!skipConversationWrite && (question || finalAnswer)) {
@@ -7986,10 +10573,422 @@ function getRelevantState(db, userId) {
     submissions: db.submissions.filter((item) => item.studentId === userId || db.homework.some((homework) => homework.id === item.homeworkId && homework.teacherId === userId)),
     courseMaterials: visibleCourseMaterials(db, userId).map(publicCourseMaterial),
     learningProfile: ensureLearningProfile(db, userId),
-    wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId).slice(0, 60),
+    wrongNotes: (db.wrongNotes || []).filter((item) => item.userId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.userId)))).slice(0, 300),
+    studentMastery: (db.studentMastery || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 500),
+    misconceptionRecords: (db.misconceptionRecords || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 300),
+    prePostAssessments: (db.prePostAssessments || []).filter((item) => item.studentId === userId).slice(0, 100),
+    learningPathRecommendations: (db.learningPathRecommendations || []).filter((item) => item.studentId === userId).slice(0, 50),
+    nodeMasterySnapshots: (db.nodeMasterySnapshots || []).filter((item) => item.studentId === userId).slice(0, 500),
+    experimentSubmissions: (db.experimentSubmissions || []).filter((item) => item.studentId === userId).slice(0, 100),
+    learningEvidence: (db.learningEvidence || []).filter((item) => item.studentId === userId || (user.role === "teacher" && db.classes.some((klass) => klass.teacherId === userId && (klass.studentIds || []).includes(item.studentId)))).slice(0, 500),
+    studentReflections: (db.studentReflections || []).filter((item) => item.studentId === userId).slice(0, 80),
+    knowledgeCorrections: (db.knowledgeCorrections || []).filter((item) => item.studentId === userId).slice(0, 80),
+    aiAnswerReviews: (db.aiAnswerReviews || []).filter((item) => item.studentId === userId).slice(0, 80),
+    learningCycles: (db.learningCycles || []).filter((item) => item.studentId === userId).slice(0, 20),
+    studentNodeAnnotations: (db.studentNodeAnnotations || []).filter((item) => item.studentId === userId).slice(0, 200),
+    studentEthicsSettings: getStudentEthicsSettings(db, userId),
+    studentDataDeletionRequests: (db.studentDataDeletionRequests || []).filter((item) => item.studentId === userId).slice(0, 20),
     learningAnalytics: learningAnalytics(db, userId),
+    studentPortfolio: user.role === "student" ? buildStudentPortfolio(db, userId) : null,
     agentRuns: (db.agentRuns || []).filter((item) => item.userId === userId).slice(0, 30)
   };
+}
+
+function reportDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || "");
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function reportCompactText(value, maxLength = 120) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function reportScorePercent(value) {
+  const normalized = normalizeLearningScore(value);
+  return normalized === null ? "" : Math.round(normalized * 100);
+}
+
+function reportHtmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function reportEventLabel(type) {
+  return {
+    ai_diagnosis: "AI 诊断",
+    ai_question: "AI 问答",
+    dify_diagnosis: "AI 诊断",
+    knowledge_test_evaluate: "知识测验",
+    homework_grade_confirmed: "作业批改确认",
+    wrong_note: "错题记录",
+    ai_answer_review: "AI 审辩",
+    knowledge_point_corrected: "知识点纠正",
+    student_node_annotation: "图谱节点证据",
+    data_deletion_request: "数据管理",
+    manual_mastery_update: "掌握度调整",
+    student_mastery_snapshot: "掌握度快照"
+  }[String(type || "")] || String(type || "学习事件");
+}
+
+function reportStatusLabel(status) {
+  return {
+    submitted: "已提交",
+    review_pending: "待教师确认",
+    graded: "已批改"
+  }[String(status || "")] || String(status || "未提交");
+}
+
+function sectionColumns(rows = []) {
+  const seen = new Set();
+  rows.forEach((row) => Object.keys(row || {}).forEach((key) => seen.add(key)));
+  return Array.from(seen);
+}
+
+function buildAdminExportReport(db) {
+  const students = (db.users || [])
+    .filter((user) => user.role === "student")
+    .sort((a, b) => String(a.createdAt || a.id).localeCompare(String(b.createdAt || b.id)));
+  const studentIds = new Set(students.map((student) => student.id));
+  const aliasByStudentId = new Map(students.map((student, index) => [student.id, `S${String(index + 1).padStart(3, "0")}`]));
+  const classById = new Map((db.classes || []).map((klass) => [klass.id, klass]));
+  const homeworkById = new Map((db.homework || []).map((item) => [item.id, item]));
+  const graphById = new Map((db.knowledgeGraphs || []).map((item) => [item.id, item]));
+  const userById = new Map((db.users || []).map((user) => [user.id, user]));
+  const profileByUserId = new Map((db.learningProfiles || []).map((profile) => [profile.userId, profile]));
+  const events = (db.learningEvents || []).filter((event) => studentIds.has(event.studentId));
+
+  const classNamesForStudent = (student) => {
+    const ids = new Set(Array.isArray(student.classIds) ? student.classIds : []);
+    (db.classes || []).forEach((klass) => {
+      if ((klass.studentIds || []).includes(student.id)) ids.add(klass.id);
+    });
+    const names = Array.from(ids).map((id) => classById.get(id)?.name).filter(Boolean);
+    return names.length ? names.join("、") : (student.className || "未加入班级");
+  };
+  const eventsForStudent = (studentId) => events
+    .filter((event) => event.studentId === studentId)
+    .sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")));
+
+  const anonymousStudents = students.map((student) => {
+    const profile = profileByUserId.get(student.id) || {};
+    const studentEvents = eventsForStudent(student.id);
+    const masteryItems = Object.values(profile.mastery || {});
+    const averageMastery = masteryItems.length
+      ? `${Math.round(masteryItems.reduce((sum, item) => sum + Number(item.score || 0), 0) / masteryItems.length * 100)}%`
+      : "未诊断";
+    return {
+      匿名编号: aliasByStudentId.get(student.id),
+      班级: classNamesForStudent(student),
+      学习事件数: studentEvents.length,
+      AI对话数: (db.conversations || []).filter((conv) => conv.userId === student.id).length,
+      作业提交数: (db.submissions || []).filter((item) => item.studentId === student.id).length,
+      错题数: (db.wrongNotes || []).filter((item) => item.userId === student.id).length,
+      平均掌握度: averageMastery,
+      最近活动: reportDate(studentEvents.at(-1)?.occurredAt || profile.updatedAt || student.updatedAt || student.createdAt)
+    };
+  });
+
+  const learningTimeline = events
+    .sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")))
+    .map((event) => ({
+      匿名编号: aliasByStudentId.get(event.studentId),
+      时间: reportDate(event.occurredAt || event.createdAt),
+      类型: reportEventLabel(event.eventType),
+      学科: event.subject || "",
+      知识点: event.knowledgePoint || "",
+      分数: event.score === null || event.score === undefined ? "" : `${reportScorePercent(event.score)}%`,
+      来源: event.source || "",
+      摘要: reportCompactText(event.payload?.prompt || event.payload?.question || event.payload?.homeworkTitle || event.payload?.evidence || event.payload?.analysis || "", 140)
+    }));
+
+  const prePostScores = students.map((student) => {
+    const scored = [];
+    eventsForStudent(student.id).forEach((event) => {
+      if (event.score !== null && event.score !== undefined) scored.push({ at: event.occurredAt || event.createdAt, score: event.score, source: reportEventLabel(event.eventType), topic: event.knowledgePoint || "" });
+    });
+    (db.submissions || []).filter((item) => item.studentId === student.id && item.score !== undefined).forEach((submission) => {
+      const homework = homeworkById.get(submission.homeworkId);
+      scored.push({ at: submission.gradedAt || submission.confirmedAt || submission.updatedAt || submission.createdAt, score: submission.score, source: "作业成绩", topic: homework?.title || "" });
+    });
+    (db.diagnosisResults || []).filter((item) => item.studentId === student.id && item.masteryScore !== null && item.masteryScore !== undefined).forEach((result) => {
+      scored.push({ at: result.createdAt, score: result.masteryScore, source: result.modelOrWorkflow || "诊断结果", topic: result.topic || "" });
+    });
+    scored.sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+    const first = scored[0];
+    const last = scored.at(-1);
+    const pre = reportScorePercent(first?.score);
+    const post = reportScorePercent(last?.score);
+    return {
+      匿名编号: aliasByStudentId.get(student.id),
+      前测时间: reportDate(first?.at),
+      前测来源: first?.source || "",
+      前测知识点: first?.topic || "",
+      前测成绩: pre === "" ? "" : `${pre}%`,
+      后测时间: reportDate(last?.at),
+      后测来源: last?.source || "",
+      后测知识点: last?.topic || "",
+      后测成绩: post === "" ? "" : `${post}%`,
+      变化: pre === "" || post === "" ? "暂无成对数据" : `${post - pre >= 0 ? "+" : ""}${post - pre}%`,
+      记录数: scored.length
+    };
+  });
+
+  const aiConversationSummary = (db.conversations || [])
+    .filter((conv) => studentIds.has(conv.userId))
+    .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
+    .map((conv) => {
+      const messages = Array.isArray(conv.messages) ? conv.messages : [];
+      const userMessages = messages.filter((message) => message.role === "user");
+      const assistantMessages = messages.filter((message) => message.role === "assistant");
+      return {
+        匿名编号: aliasByStudentId.get(conv.userId),
+        对话标题: conv.title || "新的对话",
+        模式: conv.mode || "",
+        开始时间: reportDate(conv.createdAt),
+        最近更新: reportDate(conv.updatedAt),
+        轮次数: Math.max(userMessages.length, assistantMessages.length),
+        学生问题摘要: reportCompactText(userMessages.map((message) => message.content).join("；"), 180),
+        AI回答摘要: reportCompactText(assistantMessages.map((message) => message.content).join("；"), 180)
+      };
+    });
+
+  const masteryGroups = new Map();
+  events.filter((event) => event.knowledgePoint && event.score !== null && event.score !== undefined).forEach((event) => {
+    const key = `${event.studentId}:${event.subject || ""}:${event.knowledgePoint}`;
+    const items = masteryGroups.get(key) || [];
+    items.push(event);
+    masteryGroups.set(key, items);
+  });
+  (db.studentMastery || []).filter((item) => studentIds.has(item.studentId)).forEach((item) => {
+    const key = `${item.studentId}:${item.subject || ""}:${item.knowledgePoint}`;
+    if (!masteryGroups.has(key)) masteryGroups.set(key, [{ ...item, eventType: "student_mastery_snapshot", occurredAt: item.updatedAt }]);
+  });
+  const masteryChanges = Array.from(masteryGroups.values()).map((items) => {
+    items.sort((a, b) => String(a.occurredAt || a.createdAt || "").localeCompare(String(b.occurredAt || b.createdAt || "")));
+    const first = items[0];
+    const last = items.at(-1);
+    const start = reportScorePercent(first?.score);
+    const end = reportScorePercent(last?.score);
+    return {
+      匿名编号: aliasByStudentId.get(last.studentId),
+      学科: last.subject || first.subject || "",
+      知识点: last.knowledgePoint || first.knowledgePoint || "",
+      关联图谱: graphById.get(last.graphId || first.graphId)?.title || "",
+      初始掌握度: start === "" ? "" : `${start}%`,
+      当前掌握度: end === "" ? "" : `${end}%`,
+      变化: start === "" || end === "" ? "暂无变化" : `${end - start >= 0 ? "+" : ""}${end - start}%`,
+      最近证据: reportEventLabel(last.eventType),
+      最近更新时间: reportDate(last.occurredAt || last.createdAt)
+    };
+  });
+
+  const homeworkResults = (db.submissions || [])
+    .filter((submission) => studentIds.has(submission.studentId))
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))
+    .map((submission) => {
+      const homework = homeworkById.get(submission.homeworkId);
+      const klass = homework ? classById.get(homework.classId) : null;
+      const teacher = homework ? userById.get(homework.teacherId) : null;
+      return {
+        匿名编号: aliasByStudentId.get(submission.studentId),
+        班级: klass?.name || "",
+        作业或测验: homework?.title || submission.homeworkId || "",
+        学科: homework?.subject || klass?.subject || "",
+        教师: teacher?.name || "",
+        状态: reportStatusLabel(submission.status),
+        分数: submission.score === undefined ? "" : `${reportScorePercent(submission.score)}%`,
+        AI建议分: submission.aiSuggestedScore === undefined ? "" : `${reportScorePercent(submission.aiSuggestedScore)}%`,
+        提交时间: reportDate(submission.createdAt || submission.updatedAt),
+        批改时间: reportDate(submission.gradedAt || submission.confirmedAt),
+        反馈摘要: reportCompactText(submission.comment || submission.aiComment || submission.feedback?.reliability || "", 160)
+      };
+    });
+
+  const testResults = events
+    .filter((event) => event.eventType === "knowledge_test_evaluate")
+    .sort((a, b) => String(b.occurredAt || b.createdAt || "").localeCompare(String(a.occurredAt || a.createdAt || "")))
+    .map((event) => ({
+      匿名编号: aliasByStudentId.get(event.studentId),
+      时间: reportDate(event.occurredAt || event.createdAt),
+      学科: event.subject || "",
+      知识点: event.knowledgePoint || "",
+      题目ID: event.payload?.questionId || "",
+      本题正确率: event.payload?.accuracy === undefined ? "" : `${Math.round(Number(event.payload.accuracy || 0))}%`,
+      整体正确率: event.payload?.overall?.accuracy === undefined ? (event.score === undefined ? "" : `${reportScorePercent(event.score)}%`) : `${Math.round(Number(event.payload.overall.accuracy || 0))}%`,
+      掌握判断: event.payload?.overall?.masteryLevel || "",
+      缺失要点: Array.isArray(event.payload?.missing) ? event.payload.missing.join("、") : ""
+    }));
+
+  const wrongNoteChanges = (db.wrongNotes || [])
+    .filter((note) => studentIds.has(note.userId))
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+    .map((note) => ({
+      匿名编号: aliasByStudentId.get(note.userId),
+      时间: reportDate(note.createdAt),
+      来源: note.source || "",
+      知识点: note.topic || "",
+      错题摘要: reportCompactText(note.question, 160),
+      错答摘要: reportCompactText(note.answer, 120),
+      错因分析: reportCompactText(note.analysis, 160),
+      改进建议: reportCompactText(note.recommendation, 160)
+    }));
+
+  const reflectionPattern = /反思|复盘|总结|心得|收获|困惑|计划|自评/;
+  const studentReflections = [];
+  (db.conversations || []).filter((conv) => studentIds.has(conv.userId)).forEach((conv) => {
+    (conv.messages || []).filter((message) => message.role === "user" && reflectionPattern.test(String(message.content || ""))).forEach((message) => {
+      studentReflections.push({ 匿名编号: aliasByStudentId.get(conv.userId), 时间: reportDate(message.createdAt || conv.updatedAt), 来源: conv.title || "AI 对话", 摘要: reportCompactText(message.content, 220) });
+    });
+  });
+  wrongNoteChanges.forEach((note) => {
+    if (reflectionPattern.test(`${note.错题摘要} ${note.错答摘要} ${note.错因分析}`)) {
+      studentReflections.push({ 匿名编号: note.匿名编号, 时间: note.时间, 来源: `错题反思：${note.知识点}`, 摘要: reportCompactText([note.错题摘要, note.错因分析, note.改进建议].filter(Boolean).join("；"), 220) });
+    }
+  });
+  studentReflections.sort((a, b) => String(b.时间 || "").localeCompare(String(a.时间 || "")));
+
+  const teacherGuidance = [];
+  (db.submissions || []).filter((submission) => studentIds.has(submission.studentId) && (submission.comment || submission.aiComment || submission.feedback)).forEach((submission) => {
+    const homework = homeworkById.get(submission.homeworkId);
+    const teacher = homework ? userById.get(homework.teacherId) : null;
+    teacherGuidance.push({
+      匿名编号: aliasByStudentId.get(submission.studentId),
+      时间: reportDate(submission.confirmedAt || submission.gradedAt || submission.aiGradedAt || submission.updatedAt),
+      教师: teacher?.name || "",
+      类型: submission.comment ? "教师评价" : "AI批改建议",
+      关联任务: homework?.title || submission.homeworkId || "",
+      记录摘要: reportCompactText(submission.comment || submission.aiComment || submission.feedback?.reliability || "", 220)
+    });
+  });
+  (db.conversations || []).filter((conv) => ["teacher", "admin"].includes(userById.get(conv.userId)?.role)).forEach((conv) => {
+    const owner = userById.get(conv.userId);
+    const messages = Array.isArray(conv.messages) ? conv.messages : [];
+    teacherGuidance.push({ 匿名编号: "全班/备课", 时间: reportDate(conv.updatedAt || conv.createdAt), 教师: owner?.name || "", 类型: "教师 AI 指导记录", 关联任务: conv.title || "教师对话", 记录摘要: reportCompactText(messages.map((message) => message.content).join("；"), 220) });
+  });
+  teacherGuidance.sort((a, b) => String(b.时间 || "").localeCompare(String(a.时间 || "")));
+
+  const sections = [
+    { key: "anonymousStudents", title: "匿名学生列表", rows: anonymousStudents },
+    { key: "learningTimeline", title: "学习周期时间线", rows: learningTimeline },
+    { key: "prePostScores", title: "前测/后测成绩", rows: prePostScores },
+    { key: "aiConversationSummary", title: "AI 对话摘要", rows: aiConversationSummary },
+    { key: "masteryChanges", title: "知识图谱掌握度变化", rows: masteryChanges },
+    { key: "homeworkResults", title: "作业结果", rows: homeworkResults },
+    { key: "testResults", title: "测验结果", rows: testResults },
+    { key: "wrongNoteChanges", title: "错题变化", rows: wrongNoteChanges },
+    { key: "studentReflections", title: "学生反思摘录", rows: studentReflections },
+    { key: "teacherGuidance", title: "教师评价或指导记录", rows: teacherGuidance }
+  ].map((section) => ({ ...section, columns: sectionColumns(section.rows) }));
+
+  return {
+    generatedAt: now(),
+    scope: "管理员端匿名学习数据导出",
+    summary: {
+      students: students.length,
+      classes: (db.classes || []).length,
+      learningEvents: learningTimeline.length,
+      aiConversations: aiConversationSummary.length,
+      homeworkResults: homeworkResults.length,
+      testResults: testResults.length,
+      wrongNotes: wrongNoteChanges.length,
+      reflections: studentReflections.length,
+      teacherGuidance: teacherGuidance.length
+    },
+    sections
+  };
+}
+
+function adminReportJson(report) {
+  return JSON.stringify(report, null, 2);
+}
+
+function adminReportCsv(report) {
+  const rows = [["区块", "序号", "字段", "值"]];
+  report.sections.forEach((section) => {
+    if (!section.rows.length) rows.push([section.title, "", "状态", "暂无数据"]);
+    section.rows.forEach((row, index) => {
+      Object.entries(row).forEach(([key, value]) => rows.push([section.title, index + 1, key, value]));
+    });
+  });
+  return `\uFEFF${rows.map((row) => row.map(csvCell).join(",")).join("\r\n")}`;
+}
+
+function adminReportHtml(report, { print = false } = {}) {
+  const summaryCards = Object.entries(report.summary || {}).map(([key, value]) => `
+    <article><span>${reportHtmlEscape(key)}</span><strong>${reportHtmlEscape(value)}</strong></article>
+  `).join("");
+  const sections = report.sections.map((section) => {
+    const columns = section.columns.length ? section.columns : ["状态"];
+    const rows = section.rows.length ? section.rows : [{ 状态: "暂无数据" }];
+    return `
+      <section>
+        <h2>${reportHtmlEscape(section.title)}</h2>
+        <table>
+          <thead><tr>${columns.map((column) => `<th>${reportHtmlEscape(column)}</th>`).join("")}</tr></thead>
+          <tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${reportHtmlEscape(row[column] ?? "")}</td>`).join("")}</tr>`).join("")}</tbody>
+        </table>
+      </section>
+    `;
+  }).join("");
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>管理员匿名学习数据导出</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; color: #132033; background: #f5f8fb; }
+    header { margin-bottom: 22px; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    h2 { margin: 28px 0 12px; font-size: 18px; }
+    p { margin: 0; color: #627086; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
+    .summary article { padding: 14px; border: 1px solid #dbe5ee; border-radius: 8px; background: #fff; }
+    .summary span { display: block; color: #627086; font-size: 12px; }
+    .summary strong { display: block; margin-top: 6px; color: #145f85; font-size: 24px; }
+    section { page-break-inside: avoid; margin-bottom: 18px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid #dbe5ee; padding: 8px 10px; text-align: left; vertical-align: top; font-size: 12px; line-height: 1.55; }
+    th { background: #eaf3f8; color: #16354a; font-weight: 700; }
+    @media print { body { padding: 14mm; background: #fff; } th, td { font-size: 10px; } }
+  </style>
+</head>
+<body>
+  <header><h1>管理员匿名学习数据导出</h1><p>生成时间：${reportHtmlEscape(reportDate(report.generatedAt))}</p></header>
+  <div class="summary">${summaryCards}</div>
+  ${sections}
+  ${print ? "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 300));</script>" : ""}
+</body>
+</html>`;
+}
+
+function buildAdminExportPayload(db, format = "json") {
+  const report = buildAdminExportReport(db);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const normalizedFormat = ["json", "csv", "html", "pdf"].includes(format) ? format : "json";
+  if (normalizedFormat === "csv") return { format: "csv", fileName: `admin-learning-export-${stamp}.csv`, mime: "text/csv;charset=utf-8", content: adminReportCsv(report), report };
+  if (normalizedFormat === "html" || normalizedFormat === "pdf") {
+    return {
+      format: normalizedFormat,
+      fileName: normalizedFormat === "pdf" ? `admin-learning-export-${stamp}-print.html` : `admin-learning-export-${stamp}.html`,
+      mime: "text/html;charset=utf-8",
+      content: adminReportHtml(report, { print: normalizedFormat === "pdf" }),
+      report
+    };
+  }
+  return { format: "json", fileName: `admin-learning-export-${stamp}.json`, mime: "application/json;charset=utf-8", content: adminReportJson(report), report };
 }
 
 async function handleApi(req, res, pathname, searchParams) {
@@ -7997,16 +10996,20 @@ async function handleApi(req, res, pathname, searchParams) {
   const db = readDb();
 
   if (method === "GET" && pathname === "/api/healthz") {
+    const storage = dbStorageMetadata();
     return send(res, 200, {
       ok: true,
       status: "ok",
       version: process.env.npm_package_version || "1.0.0",
       time: now(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing"
+      storage: storage.label,
+      storageDriver: storage.driver,
+      storagePath: storage.path
     });
   }
 
   if (method === "GET" && pathname === "/api/readyz") {
+    const storage = dbStorageMetadata();
     const checks = {
       dataDirWritable: checkDataDirWritable(),
       runtimeDirWritable: checkRuntimeDirWritable(),
@@ -8016,7 +11019,9 @@ async function handleApi(req, res, pathname, searchParams) {
       difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
       difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
       difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
+      storage: storage.label,
+      storageDriver: storage.driver,
+      storagePath: storage.path,
       uploadSessions: uploadSessions.size,
       graphJobs: graphJobs.size
     };
@@ -8045,77 +11050,18 @@ async function handleApi(req, res, pathname, searchParams) {
     });
   }
 
-  if (method === "GET" && pathname === "/api/admin/overview") {
+  if (method === "GET" && pathname === "/api/admin/export") {
     const actor = requireActor(req, db);
     requireRole(actor, ["admin"]);
-    cleanupGraphJobs();
-    const checks = {
-      dataDirWritable: checkDataDirWritable(),
-      runtimeDirWritable: checkRuntimeDirWritable(),
-      sessionSecretConfigured: SESSION_SECRET_CONFIGURED,
-      cookieSecure: process.env.COOKIE_SECURE === "true",
-      difyWorkflowConfigured: isDifyWorkflowConfigured(),
-      difyStudentWorkflowConfigured: isDifyStudentWorkflowConfigured(),
-      difyTeacherWorkflowConfigured: isDifyTeacherWorkflowConfigured(),
-      difyCallbackTokenConfigured: isDifyCallbackTokenConfigured(),
-      storage: fs.existsSync(DB_PATH) ? "json-atomic" : "initializing",
-      uploadSessions: uploadSessions.size,
-      graphJobs: graphJobs.size
-    };
-    const warnings = [];
-    if (!checks.sessionSecretConfigured) warnings.push("未配置强随机 SESSION_SECRET，仅适合本地开发");
-    if (!checks.difyStudentWorkflowConfigured) warnings.push("未配置有效 DIFY_STUDENT_WORKFLOW_API_KEY 或 DIFY_WORKFLOW_API_KEY，学生端 AI 助教会返回配置错误");
-    if (!checks.difyTeacherWorkflowConfigured) warnings.push("未配置有效 DIFY_TEACHER_WORKFLOW_API_KEY，教师端教学 AI 助教会返回配置错误");
-    if (!checks.difyCallbackTokenConfigured) warnings.push("未配置强随机 DIFY_CALLBACK_TOKEN，Dify 回调接口将拒绝默认令牌");
-    if (process.env.NODE_ENV === "production" && !checks.cookieSecure) warnings.push("生产环境建议启用 COOKIE_SECURE=true 并使用 HTTPS");
-    const recentUsers = (db.users || [])
-      .map(publicUser)
-      .sort((a, b) => new Date(b.lastLoginAt || b.createdAt || 0) - new Date(a.lastLoginAt || a.createdAt || 0))
-      .slice(0, 12);
-    const graphJobList = Array.from(graphJobs.values())
-      .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
-      .slice(0, 20)
-      .map(publicGraphJob);
-    const counts = {
-      users: db.users.length,
-      teachers: db.users.filter((user) => user.role === "teacher").length,
-      students: db.users.filter((user) => user.role === "student").length,
-      materials: db.courseMaterials.length,
-      publicMaterials: db.courseMaterials.filter((item) => item.global).length,
-      graphs: db.knowledgeGraphs.length,
-      publicGraphs: db.knowledgeGraphs.filter((item) => item.global).length,
-      classes: db.classes.length,
-      homework: db.homework.length,
-      submissions: db.submissions.length,
-      failedJobs: graphJobList.filter((job) => job.status === "failed").length
-    };
-    return send(res, 200, {
-      ok: true,
-      overview: {
-        counts,
-        checks,
-        warnings,
-        health: { status: "ok", storage: checks.storage },
-        ready: { status: warnings.length ? "warning" : "ready" },
-        recentUsers,
-        graphJobs: graphJobList,
-        auditLogs: (db.auditLogs || []).slice(0, 80)
-      }
-    });
-  }
-
-  if (method === "POST" && pathname === "/api/admin/backup") {
-    const actor = requireActor(req, db);
-    requireRole(actor, ["admin"]);
-    ensureDataDir();
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const fileName = `db-backup-${stamp}.json`;
-    const target = path.join(BACKUP_DIR, fileName);
-    fs.copyFileSync(DB_PATH, target);
-    recordAudit(db, actor, "admin.backup", { resourceType: "backup", resourceId: fileName }, req);
+    const format = String(searchParams.get("format") || "json").toLowerCase();
+    const payload = buildAdminExportPayload(db, format);
+    recordAudit(db, actor, "admin.export", {
+      resourceType: "adminExport",
+      resourceId: payload.fileName,
+      meta: { format: payload.format, summary: payload.report.summary }
+    }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, fileName, path: target });
+    return send(res, 200, { ok: true, ...payload });
   }
 
   if (method === "POST" && pathname === "/api/auth/register") {
@@ -8257,6 +11203,180 @@ async function handleApi(req, res, pathname, searchParams) {
     return send(res, 200, { ok: true, state: getRelevantState(db, actor.id) });
   }
 
+  if (method === "GET" && pathname === "/api/student/portfolio") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const anonymous = ["1", "true", "yes"].includes(String(searchParams.get("anonymous") || "").toLowerCase());
+    return send(res, 200, { ok: true, portfolio: buildStudentPortfolio(db, userId, { anonymous }) });
+  }
+
+  if (method === "GET" && pathname === "/api/student/portfolio/export") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const format = String(searchParams.get("format") || "json").toLowerCase();
+    const anonymous = ["1", "true", "yes"].includes(String(searchParams.get("anonymous") || "").toLowerCase());
+    const payload = buildStudentPortfolioExportPayload(db, userId, format, { anonymous });
+    recordAudit(db, actor, "student.portfolio_export", {
+      resourceType: "studentPortfolio",
+      resourceId: userId,
+      meta: { format: payload.format, anonymous, evidence: payload.portfolio.learningCycle.evidenceCounts }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, ...payload });
+  }
+
+  if (method === "GET" && pathname === "/api/student/learning-cycle/templates") {
+    requireRole(actor, ["student", "admin", "teacher"]);
+    return send(res, 200, { ok: true, templates: learningCycleTemplateLibrary() });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle/suggest") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const suggestion = suggestLearningCycleFromProfile(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_suggest", {
+      resourceType: "learningCycle",
+      resourceId: userId,
+      meta: { title: suggestion.title, subject: suggestion.subject, focusNodes: suggestion.focusNodes }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, suggestion, templates: learningCycleTemplateLibrary() });
+  }
+
+  if (method === "GET" && pathname === "/api/student/learning-cycle") {
+    requireRole(actor, ["student", "admin"]);
+    const userId = queryUserId(searchParams, actor, "userId", "student");
+    const portfolio = buildStudentPortfolio(db, userId);
+    return send(res, 200, { ok: true, cycle: portfolio.learningCycle, portfolio });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const cycle = upsertStudentLearningCycle(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_upsert", {
+      resourceType: "learningCycle",
+      resourceId: cycle.id,
+      meta: { title: cycle.title, subject: cycle.subject, status: cycle.status }
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, cycle: buildStudentPortfolio(db, userId).learningCycle, portfolio: buildStudentPortfolio(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/learning-cycle/tasks") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const cycle = updateLearningCycleTask(db, userId, body);
+    recordAudit(db, actor, "student.learning_cycle_task", {
+      resourceType: "learningCycle",
+      resourceId: cycle.id,
+      meta: { taskKey: body.taskKey || body.key, done: body.done }
+    }, req);
+    writeDb(db);
+    const portfolio = buildStudentPortfolio(db, userId);
+    return send(res, 200, { ok: true, cycle: portfolio.learningCycle, portfolio, learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/reflections") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createStudentReflection(db, userId, body);
+    recordAudit(db, actor, "student.reflection_create", {
+      resourceType: "studentReflection",
+      resourceId: result.reflection.id,
+      meta: { topic: result.reflection.knowledgePoint, contextType: result.reflection.contextType }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/knowledge-corrections") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = applyKnowledgeCorrection(db, userId, body);
+    const correctionEvent = recordLearningEvent(db, { studentId: userId, eventType: "misconception_intervention", source: "student-correction", knowledgePoint: result.correction.correctedTopic, nodeId: body.nodeId || "", payload: { correctionId: result.correction.id, fromTopic: result.correction.fromTopic, correctedTopic: result.correction.correctedTopic, intervention: body.intervention || "订正与变式练习" }, evidenceType: "intervention" });
+    result.correction.eventId = correctionEvent?.id || "";
+    const misconception = (db.misconceptionRecords || []).find((item) => item.id === result.correction.misconceptionId || (item.studentId === userId && item.misconceptionType === result.correction.fromTopic));
+    if (misconception) { misconception.status = "intervened"; misconception.lastSeen = now(); misconception.interventionHistory = [...(misconception.interventionHistory || []), { at: now(), action: "correction_submitted", detail: result.correction.reason || "学生完成订正", evidenceId: result.correction.id }].slice(-20); }
+    recordAudit(db, actor, "student.knowledge_correction", {
+      resourceType: "knowledgeCorrection",
+      resourceId: result.correction.id,
+      meta: { fromTopic: result.correction.fromTopic, correctedTopic: result.correction.correctedTopic }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/ai-answer-reviews") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createAiAnswerReview(db, userId, body);
+    recordAudit(db, actor, "student.ai_answer_review", {
+      resourceType: "aiAnswerReview",
+      resourceId: result.review.id,
+      meta: { topic: result.review.topic, reviewType: result.review.reviewType, accepted: result.review.accepted }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/node-annotations") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const result = createStudentNodeAnnotation(db, userId, body);
+    recordAudit(db, actor, "student.node_annotation", {
+      resourceType: "studentNodeAnnotation",
+      resourceId: result.annotation.id,
+      meta: { graphId: result.annotation.graphId, nodeId: result.annotation.nodeId, status: result.annotation.status }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, ...result, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/ethics-settings") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const settings = updateStudentEthicsSettings(db, userId, body);
+    recordAudit(db, actor, "student.ethics_settings", {
+      resourceType: "studentEthicsSettings",
+      resourceId: userId,
+      meta: settings
+    }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, settings, portfolio: buildStudentPortfolio(db, userId), learningAnalytics: learningAnalytics(db, userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/student/data-deletion-requests") {
+    const body = await readBody(req);
+    requireRole(actor, ["student", "admin"]);
+    const userId = actor.role === "admin" && body.userId ? String(body.userId) : actor.id;
+    ensureActorCanUseId(actor, userId, "student");
+    const request = requestStudentDataDeletion(db, userId, body);
+    recordAudit(db, actor, "student.data_deletion_request", {
+      resourceType: "studentDataDeletionRequest",
+      resourceId: request.id,
+      meta: { scopes: request.scopes }
+    }, req);
+    writeDb(db);
+    return send(res, 201, { ok: true, request, requests: (db.studentDataDeletionRequests || []).filter((item) => item.studentId === userId).slice(0, 20), portfolio: buildStudentPortfolio(db, userId) });
+  }
+
   if (method === "POST" && pathname === "/api/knowledge-tests/generate") {
     const body = await readBody(req);
     requireRole(actor, ["student", "admin"]);
@@ -8264,7 +11384,9 @@ async function handleApi(req, res, pathname, searchParams) {
     const quiz = buildKnowledgeTestQuestions(db, userId, {
       subject: String(body.subject || ""),
       materialId: String(body.materialId || body.material_id || ""),
-      count: body.count
+      count: Math.min(5, Math.max(3, Number(body.count || 4))),
+      phase: String(body.phase || "diagnostic"),
+      nodeId: String(body.nodeId || body.node_id || "")
     });
     recordAudit(db, actor, "knowledge_test.generate", {
       resourceType: "knowledgeTest",
@@ -8283,7 +11405,51 @@ async function handleApi(req, res, pathname, searchParams) {
       subject: String(body.subject || ""),
       materialId: String(body.materialId || body.material_id || ""),
       attempts: body.attempts || [],
-      questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions
+      questionCount: body.questionCount || body.question_count || body.totalQuestions || body.total_questions,
+      phase: String(body.phase || body.question?.phase || "diagnostic"),
+      previousAccuracy: Number(body.previousAccuracy || body.previous_accuracy || 0)
+    });
+    const learningEvent = recordLearningEvent(db, {
+      studentId: userId,
+      eventType: "knowledge_test_evaluate",
+      source: "knowledge-test",
+      subject: String(body.subject || body.question?.subject || ""),
+      knowledgePoint: result.topic,
+      graphId: String(body.question?.graphId || ""),
+      nodeId: String(body.question?.nodeId || ""),
+      score: result.overall?.masteryScore ?? result.overall?.accuracy ?? result.accuracy,
+      payload: {
+        quizId: String(body.quizId || body.quiz_id || ""),
+        questionId: String(body.question?.id || ""),
+        prompt: body.question?.prompt || "",
+        answer: body.answer || "",
+        accuracy: result.accuracy,
+        overall: result.overall,
+        matched: result.matched,
+        missing: result.missing
+      },
+      idempotencyKey: String(body.quizId || body.quiz_id || "") && String(body.question?.id || "")
+        ? `knowledge-test:${body.quizId || body.quiz_id}:${body.question.id}:${result.overall?.answered || ""}`
+        : ""
+    });
+    recordDiagnosisResult(db, {
+      studentId: userId,
+      eventId: learningEvent?.id || "",
+      topic: result.topic,
+      masteryScore: result.overall?.masteryScore ?? result.overall?.accuracy ?? result.accuracy,
+      masteryLevel: result.overall?.masteryLevel || result.masteryLevel || "",
+      errorTags: [],
+      missingPoints: result.missing || [],
+      evidence: body.question?.citations || [],
+      finalAnswer: result.feedback || "",
+      modelOrWorkflow: "knowledge-test",
+      idempotencyKey: learningEvent?.id ? `knowledge-test-diagnosis:${learningEvent.id}` : ""
+    });
+    syncStudentMasteryFromProfile(db, userId, [result.topic], {
+      subject: String(body.subject || body.question?.subject || ""),
+      graphId: String(body.question?.graphId || ""),
+      nodeId: String(body.question?.nodeId || ""),
+      lastEventId: learningEvent?.id || ""
     });
     recordAudit(db, actor, "knowledge_test.evaluate", {
       resourceType: "knowledgeTest",
@@ -8536,6 +11702,28 @@ async function handleApi(req, res, pathname, searchParams) {
     if (!visibleKnowledgeGraphs(db, actor.id).some((item) => item.id === graph.id)) return sendError(res, 403, "无权查看该图谱");
     return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
   }
+  if (method === "PUT" && params) {
+    const body = await readBody(req);
+    const graph = db.knowledgeGraphs.find((item) => item.id === params.id);
+    if (!graph) return notFound(res);
+    if (actor.role !== "admin" && (graph.ownerId !== actor.id || graph.global)) return sendError(res, 403, "只能编辑自己未公开的图谱");
+    if (body.nodeId) {
+      const node = graph.nodes.find((item) => String(item.id) === String(body.nodeId));
+      if (!node) return sendError(res, 404, "知识点不存在");
+      const fields = ["label", "group", "details", "learningGoal", "masteryStandard"];
+      fields.forEach((key) => { if (body[key] !== undefined) node[key] = String(body[key] || "").slice(0, 1000); });
+      ["prerequisites", "misconceptions", "diagnosticQuestions", "remediationResources", "verificationQuestions"].forEach((key) => {
+        if (body[key] !== undefined) node[key] = Array.isArray(body[key]) ? body[key].map((item) => String(item).trim()).filter(Boolean).slice(0, 20) : String(body[key] || "").split(/\n|；|;/).map((item) => item.trim()).filter(Boolean).slice(0, 20);
+      });
+    }
+    if (Array.isArray(body.links)) {
+      graph.links = body.links.map((link) => ({ source: String(link.source), target: String(link.target), label: String(link.label || "关联").slice(0, 100), type: String(link.type || "semantic").slice(0, 40), pedagogy: String(link.pedagogy || "").slice(0, 300) })).slice(0, 1000);
+    }
+    graph.updatedAt = now();
+    recordAudit(db, actor, "graph.update", { resourceType: "graph", resourceId: graph.id, meta: { nodeId: body.nodeId || "", links: Array.isArray(body.links) ? body.links.length : undefined } }, req);
+    writeDb(db);
+    return send(res, 200, { ok: true, graph: enhanceGraphForEducation(graph) });
+  }
   if (method === "DELETE" && params) {
     const userId = queryUserId(searchParams, actor);
     const index = db.knowledgeGraphs.findIndex((item) => item.id === params.id);
@@ -8705,9 +11893,47 @@ async function handleApi(req, res, pathname, searchParams) {
       analysis: String(body.analysis || "").slice(0, 500),
       recommendation: String(body.recommendation || "").slice(0, 500)
     });
+    recordLearningEvent(db, {
+      studentId: body.userId,
+      eventType: "wrong_note",
+      source: note.source,
+      knowledgePoint: note.topic,
+      payload: {
+        wrongNoteId: note.id,
+        question: note.question,
+        answer: note.answer,
+        analysis: note.analysis,
+        recommendation: note.recommendation
+      },
+      idempotencyKey: `wrong-note:${note.id}`
+    });
     recordAudit(db, actor, "wrong_note.create", { resourceType: "wrongNote", resourceId: note.id, meta: { topic: note.topic } }, req);
     writeDb(db);
     return send(res, 201, { ok: true, wrongNote: note, learningAnalytics: learningAnalytics(db, body.userId) });
+  }
+
+  if (method === "POST" && pathname === "/api/learning-data/pre-post") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const assessment = createPrePostAssessment(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "assessment_completed", source: assessment.assessmentType, score: assessment.score, payload: { assessmentId: assessment.id, nodeScores: assessment.nodeScores }, evidenceType: "assessment" });
+    writeDb(db); return send(res, 201, { ok: true, assessment, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/path-recommendations") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const path = createLearningPathRecommendation(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "learning_path_recommended", source: "path-engine", payload: { pathId: path.id, reason: path.reason, targetNodes: path.targetNodes }, evidenceType: "learning_path" });
+    writeDb(db); return send(res, 201, { ok: true, path, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/experiment-submissions") {
+    const body = await readBody(req); assertRequired(body, ["studentId", "experimentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const submission = createExperimentSubmissionRecord(db, body);
+    const event = recordLearningEvent(db, { studentId: body.studentId, eventType: "experiment_submitted", source: "experiment-workshop", payload: { experimentSubmissionId: submission.id, experimentId: submission.experimentId, resultSummary: submission.resultSummary }, evidenceType: "experiment" });
+    appendLearningEvidence(db, { studentId: body.studentId, evidenceType: "experiment", eventId: event?.id || "", summary: submission.resultSummary });
+    writeDb(db); return send(res, 201, { ok: true, submission, event });
+  }
+  if (method === "POST" && pathname === "/api/learning-data/evidence") {
+    const body = await readBody(req); assertRequired(body, ["studentId"]); ensureActorCanUseId(actor, body.studentId, "student");
+    const evidence = appendLearningEvidence(db, body); writeDb(db); return send(res, 201, { ok: true, evidence });
   }
 
   if (method === "POST" && pathname === "/api/mastery/update") {
@@ -8716,6 +11942,23 @@ async function handleApi(req, res, pathname, searchParams) {
     const topics = Array.isArray(body.topics) ? body.topics.map(String) : [String(body.topic || "")];
     const delta = Number.isFinite(Number(body.delta)) ? Number(body.delta) : 0.08;
     const profile = updateTopicMastery(db, body.userId, topics, delta, String(body.evidence || "用户在对话中标记掌握"));
+    const learningEvent = recordLearningEvent(db, {
+      studentId: body.userId,
+      eventType: "manual_mastery_update",
+      source: "user-action",
+      subject: String(body.subject || ""),
+      knowledgePoint: topics[0] || "",
+      score: profile.mastery?.[topics[0]]?.score,
+      payload: {
+        topics,
+        delta,
+        evidence: String(body.evidence || "")
+      }
+    });
+    syncStudentMasteryFromProfile(db, body.userId, topics, {
+      subject: String(body.subject || ""),
+      lastEventId: learningEvent?.id || ""
+    });
     recordAudit(db, actor, "mastery.update", { resourceType: "learningProfile", resourceId: body.userId, meta: { topics } }, req);
     writeDb(db);
     return send(res, 200, { ok: true, profile, learningAnalytics: learningAnalytics(db, body.userId) });
@@ -8819,6 +12062,7 @@ async function handleApi(req, res, pathname, searchParams) {
       mode: body.mode || "ideal",
       components: Array.isArray(body.components) ? body.components : [],
       notes: String(body.notes || ""),
+      experiment: sanitizeExperimentRecord(body.experiment),
       updatedAt: now()
     };
     if (existing) {
@@ -8829,6 +12073,12 @@ async function handleApi(req, res, pathname, searchParams) {
     }
     const model = { id: uid("model"), ...payload, createdAt: now() };
     db.models.unshift(model);
+    if (model.experiment?.workshop) {
+      const workshop = model.experiment.workshop;
+      const experimentSubmission = createExperimentSubmissionRecord(db, { studentId: body.userId, experimentId: workshop.experimentKey || model.id, artifacts: workshop.evidenceFiles || [], resultSummary: workshop.runResult || "", aiFeedback: workshop.conclusionCheck?.detail || "", reflection: { findings: workshop.findings || "", mismatch: workshop.mismatch || "", improvement: workshop.improvement || "" }, modelId: model.id });
+      const event = recordLearningEvent(db, { studentId: body.userId, eventType: "experiment_submitted", source: "experiment-workshop", subject: model.subject, payload: { experimentSubmissionId: experimentSubmission.id, experimentId: experimentSubmission.experimentId, resultSummary: experimentSubmission.resultSummary }, evidenceType: "experiment" });
+      appendLearningEvidence(db, { studentId: body.userId, evidenceType: "experiment", eventId: event?.id || "", summary: experimentSubmission.resultSummary });
+    }
     recordAudit(db, actor, "model.create", { resourceType: "model", resourceId: model.id }, req);
     writeDb(db);
     return send(res, 201, { ok: true, model });
@@ -8842,13 +12092,15 @@ async function handleApi(req, res, pathname, searchParams) {
     const prompt = String(body.prompt || "").trim();
     if (!prompt) return sendError(res, 400, "算法需求不能为空");
     if (prompt.length > 1200) return sendError(res, 400, "算法需求不能超过 1200 字");
+    const codeMode = String(body.codeMode || "teaching").slice(0, 40);
+    const difficulty = String(body.difficulty || "standard").slice(0, 40);
     const hits = searchCourseKnowledge(db, body.userId, prompt, { subject, limit: 5 });
     const relevantHits = hits.filter((hit) => Number(hit.score || 0) >= 0.8);
     let rawGenerated = null;
     let openAiError = null;
     if (isConfiguredSecret(OPENAI_API_KEY)) {
       try {
-        rawGenerated = await generateAlgorithmWithOpenAI(prompt, subject, null, relevantHits);
+        rawGenerated = await generateAlgorithmWithOpenAI(prompt + "\nCode mode: " + codeMode + "\nDifficulty: " + difficulty, subject, null, relevantHits);
       } catch (error) {
         openAiError = error;
       }
@@ -8860,6 +12112,9 @@ async function handleApi(req, res, pathname, searchParams) {
       rawGenerated = localAlgorithmGeneration(prompt, subject, openAiError ? publicGenerationFallbackReason(openAiError) : "OpenAI API Key 未配置");
     }
     const generated = await verifyGeneratedAlgorithm(rawGenerated, prompt, subject);
+    if (!generated.explanation) generated.explanation = simpleAlgorithmExplanation(prompt, generated, relevantHits, { codeMode, difficulty });
+    const workflow = buildModelCodeWorkflow({ hits: relevantHits, generated });
+    const experiment = buildExperimentRecord({ userId: body.userId, subject, prompt, codeMode, difficulty, generated: { ...generated, workflow }, hits: relevantHits });
     recordAudit(db, actor, "model.code_generate", {
       resourceType: "modelCode",
       resourceId: "",
@@ -8871,13 +12126,17 @@ async function handleApi(req, res, pathname, searchParams) {
       }
     }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, ...generated });
+    return send(res, 200, { ok: true, ...generated, agentName: "ML Lab Code Agent", codeMode, difficulty, workflow, experiment });
   }
 
   if (method === "POST" && pathname === "/api/model-code/run") {
     const body = await readBody(req);
     assertRequired(body, ["userId", "code"]);
-    const result = await runModelCodeSnippet(body.code);
+    const subject = normalizeSubject(body.subject || "machine learning");
+    const prompt = String(body.prompt || body.title || "repair and run machine learning lab code").slice(0, 1200);
+    const contextHits = body.autoRepair ? searchCourseKnowledge(db, body.userId, prompt, { subject, limit: 5 }).filter((hit) => Number(hit.score || 0) >= 0.8) : [];
+    const result = body.autoRepair ? await runModelCodeWithAutoRepair({ code: body.code, prompt, subject, contextHits }) : await runModelCodeSnippet(body.code);
+    const workflow = buildModelCodeWorkflow({ hits: contextHits, generated: { sourceType: "manual", repairAttempts: result.repairAttempts || 0, verifiedRun: result }, run: result, repairHistory: result.repairHistory || [] });
     recordAudit(db, actor, "model.code_run", {
       resourceType: "modelCode",
       resourceId: "",
@@ -8887,11 +12146,13 @@ async function handleApi(req, res, pathname, searchParams) {
         success: result.success,
         exitCode: result.exitCode,
         timedOut: result.timedOut,
-        durationMs: result.durationMs
+        durationMs: result.durationMs,
+        autoRepair: Boolean(body.autoRepair),
+        repairAttempts: result.repairAttempts || 0
       }
     }, req);
     writeDb(db);
-    return send(res, 200, { ok: true, ...result });
+    return send(res, 200, { ok: true, ...result, workflow });
   }
 
   params = routePattern(pathname, "/api/models/:id");
@@ -9347,6 +12608,13 @@ async function handleApi(req, res, pathname, searchParams) {
         description: body.description,
         answer: body.answer
       })),
+      taskType: String(body.taskType || "standard").slice(0, 60),
+      errorTag: String(body.errorTag || "").slice(0, 160),
+      difficulty: String(body.difficulty || "基础").slice(0, 40),
+      dueAt: body.dueAt ? String(body.dueAt).slice(0, 60) : "",
+      resources: Array.isArray(body.resources) ? body.resources.map((item) => String(item).slice(0, 180)).slice(0, 12) : [],
+      targetStudentIds: Array.isArray(body.targetStudentIds) ? body.targetStudentIds.map(String).slice(0, 500) : [],
+      remediationMetrics: { baselineErrorCount: Math.max(0, Number(body.baselineErrorCount || 0)), baselineStudentCount: Math.max(0, Number(body.baselineStudentCount || 0)), completedCount: 0, improvedCount: 0, errorEliminatedCount: 0 },
       attachments: Array.isArray(body.attachments) ? body.attachments : [],
       createdAt: now(),
       updatedAt: now()
@@ -9371,6 +12639,11 @@ async function handleApi(req, res, pathname, searchParams) {
     if (body.title !== undefined) homework.title = String(body.title || homework.title);
     if (body.description !== undefined) homework.description = String(body.description || "");
     if (body.answer !== undefined) homework.answer = String(body.answer || "");
+    if (body.taskType !== undefined) homework.taskType = String(body.taskType || "standard").slice(0, 60);
+    if (body.errorTag !== undefined) homework.errorTag = String(body.errorTag || "").slice(0, 160);
+    if (body.difficulty !== undefined) homework.difficulty = String(body.difficulty || "基础").slice(0, 40);
+    if (body.dueAt !== undefined) homework.dueAt = String(body.dueAt || "").slice(0, 60);
+    if (Array.isArray(body.resources)) homework.resources = body.resources.map((item) => String(item).slice(0, 180)).slice(0, 12);
     if (body.rubric !== undefined || body.answer !== undefined || body.description !== undefined || body.title !== undefined) {
       homework.rubric = parseRubricInput(body.rubric !== undefined ? body.rubric : homework.rubricText, homework);
       homework.rubricText = rubricToText(homework.rubric);
@@ -9482,6 +12755,43 @@ async function handleApi(req, res, pathname, searchParams) {
       topics,
       score: submission.score,
       minutes: 5
+    });
+    const learningEvent = recordLearningEvent(db, {
+      studentId: submission.studentId,
+      classId: homework.classId,
+      teacherId: homework.teacherId,
+      eventType: "homework_grade_confirmed",
+      source: "teacher-confirmed-grade",
+      subject: homework.subject || "",
+      knowledgePoint: topics[0] || "",
+      homeworkId: homework.id,
+      submissionId: submission.id,
+      score: submission.score,
+      payload: {
+        homeworkTitle: homework.title,
+        topics,
+        comment: submission.comment,
+        gradeType: submission.gradeType,
+        feedback: submission.feedback || null
+      },
+      idempotencyKey: `homework-grade:${submission.id}:${submission.confirmedAt}`
+    });
+    recordDiagnosisResult(db, {
+      studentId: submission.studentId,
+      eventId: learningEvent?.id || "",
+      topic: topics[0] || homework.title || "",
+      masteryScore: submission.score,
+      masteryLevel: profile.mastery?.[topics[0]]?.status || "",
+      errorTags: [],
+      missingPoints: submission.feedback?.missing || [],
+      evidence: submission.feedback?.rubricResults || [],
+      finalAnswer: submission.comment || submission.aiComment || "",
+      modelOrWorkflow: "teacher-confirmed-grade",
+      idempotencyKey: learningEvent?.id ? `homework-grade-diagnosis:${learningEvent.id}` : ""
+    });
+    syncStudentMasteryFromProfile(db, submission.studentId, topics, {
+      subject: homework.subject || "",
+      lastEventId: learningEvent?.id || ""
     });
     if (submission.score < 75 && topics[0]) {
       addWrongNote(db, submission.studentId, {

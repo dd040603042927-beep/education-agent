@@ -283,10 +283,11 @@ async function main() {
     });
     const adminCookie = String(adminLogin.response.headers.get("set-cookie") || "").split(";")[0];
     assert(adminLogin.response.ok && adminLogin.payload.user?.role === "admin", "built-in admin should be able to log in");
-    const adminOverview = await request("/api/admin/overview", { cookie: adminCookie });
-    assert(adminOverview.response.ok && adminOverview.payload.overview?.counts?.users >= 3, "admin overview should load after RBAC");
-    const adminBackup = await request("/api/admin/backup", { method: "POST", cookie: adminCookie, body: {} });
-    assert(adminBackup.response.ok && adminBackup.payload.fileName?.endsWith(".json"), "admin backup should write to configured backup directory");
+    const adminExport = await request("/api/admin/export?format=json", { cookie: adminCookie });
+    assert(adminExport.response.ok && adminExport.payload.report?.summary?.students >= 1, "admin export should load after RBAC");
+    assert(adminExport.payload.report?.sections?.some((section) => section.title === "匿名学生列表"), "admin export should include anonymous student list");
+    const adminCsvExport = await request("/api/admin/export?format=csv", { cookie: adminCookie });
+    assert(adminCsvExport.response.ok && adminCsvExport.payload.fileName?.endsWith(".csv") && adminCsvExport.payload.content?.includes("学习周期时间线"), "admin CSV export should include required sections");
 
     const weakRegister = await request("/api/auth/register", {
       method: "POST",

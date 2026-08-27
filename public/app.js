@@ -23,7 +23,9 @@ const state = {
     attempts: [],
     summary: null,
     sourceNotice: "",
-    sourceMaterials: []
+    sourceMaterials: [],
+    phase: "diagnostic",
+    previousAccuracy: 0
   },
   graphJobs: [],
   activeConversationId: null,
@@ -41,8 +43,11 @@ const state = {
   aiSubmissionId: "",
   aiAnswerDepth: "layered",
   aiStudentAnswer: "",
+  pendingAiPrompt: "",
   aiContextEditorOpen: false,
   aiInsightTab: "workflow",
+  cycleSettingsOpen: false,
+  cycleViewMode: "",
   modelSubject: "",
   modelMode: "ideal",
   modelComponents: [],
@@ -55,8 +60,19 @@ const state = {
   modelCodeRunning: false,
   modelRunResult: "",
   modelAlgorithmPrompt: "",
+  modelCodeMode: "teaching",
+  modelDifficulty: "standard",
   modelAlgorithmGenerating: false,
   modelGenerationInfo: null,
+  modelExperimentRecord: null,
+  mlWorkshop: {
+    experimentKey: "logistic-iris",
+    findings: "",
+    mismatch: "",
+    improvement: "",
+    evidenceFiles: [],
+    conclusionCheck: null
+  },
   mathFunctionExpression: "sin(x)",
   mathFunctionXMin: "-10",
   mathFunctionXMax: "10",
@@ -64,7 +80,10 @@ const state = {
   activeThreadId: null,
   selectedMessages: new Set(),
   selectedClassId: null,
+  classManageOpen: false,
+  studentCourseClassId: null,
   classTool: null,
+  classLearningView: "topic",
   homeworkModal: null,
   homeworkDetailId: null,
   teacherHomeworkDetailId: null,
@@ -76,7 +95,7 @@ const state = {
   materialRagResult: null,
   profilePanel: null,
   chatTool: null,
-  adminOverview: null,
+  adminExport: null,
   graphViews: {},
   graphNodeModal: null,
   graphLayer: "overview",
@@ -85,6 +104,7 @@ const state = {
   graphSearch: "",
   graphNodeFilter: "all",
   graphDetailOpen: true,
+  graphMaximized: false,
   graphRelationFilters: ["contains", "prerequisite", "misconception"],
   graphJob: null,
   graphJobTimer: null,
@@ -108,6 +128,13 @@ const AI_MODE_OPTIONS = [
   { key: "practice", label: "练习", title: "练习模式", hint: "生成题目、测验和解析" },
   { key: "grade", label: "批改", title: "批改模式", hint: "检查答案并诊断错因" },
   { key: "plan", label: "规划", title: "规划模式", hint: "制定复习路径和计划" }
+];
+const STUDENT_AI_TASK_MODES = [
+  { key: "concept", workflowType: "knowledge_qa", label: "概念理解", mode: "explain", depth: "layered", hint: "分层解释、生活类比、反例与关联知识点", answerLabel: "我的原始理解", answerPlaceholder: "先用自己的话解释概念，例如：我认为正则化的作用是...", promptPlaceholder: "输入想理解的机器学习概念，例如：为什么逻辑回归要使用交叉熵损失？" },
+  { key: "derivation", label: "公式推导", mode: "explain", depth: "full", hint: "推导步骤、符号说明与易错点检查", answerLabel: "我的推导思路", answerPlaceholder: "先写已知条件、符号含义或你的推导步骤", promptPlaceholder: "输入需要推导的公式，例如：请帮我检查逻辑回归梯度下降的推导。" },
+  { key: "code", label: "代码实验", mode: "guided", depth: "layered", hint: "定位报错、解释参数、提示修改而非代做", answerLabel: "我的代码 / 报错", answerPlaceholder: "粘贴 Python 或 sklearn 代码、报错信息，以及你已尝试的修改", promptPlaceholder: "说明实验目标或报错现象，例如：LogisticRegression 收敛警告如何排查？" },
+  { key: "diagnosis", workflowType: "misconception_classification", label: "错因诊断", mode: "grade", depth: "layered", hint: "先作答，再定位错因、证据与补救任务", answerLabel: "我的答案与思路", answerPlaceholder: "先提交选择题答案、简答思路、公式推导或代码片段", promptPlaceholder: "写出题目或希望 AI 检查的知识点；AI 将基于你的作答进行诊断。" },
+  { key: "review", workflowType: "personalized_path", label: "考前巩固", mode: "plan", depth: "layered", hint: "按薄弱点安排优先级、时间、题目与资源", answerLabel: "我最不确定的内容", answerPlaceholder: "列出薄弱知识点、考试范围或可用复习时间", promptPlaceholder: "例如：根据我的薄弱点安排今晚 90 分钟的逻辑回归复习任务。" }
 ];
 const AI_DEPTH_OPTIONS = [
   { key: "brief", label: "简洁" },
@@ -167,12 +194,21 @@ const GRAPH_RELATION_FILTERS = [
   { key: "review", label: "路径" }
 ];
 const GRAPH_NODE_FILTERS = [
-  { key: "all", label: "全部" },
-  { key: "weak", label: "薄弱" },
+  { key: "all", label: "我的路径" },
+  { key: "weak", label: "当前薄弱" },
   { key: "mastered", label: "已掌握" },
-  { key: "core", label: "重点" },
-  { key: "resource", label: "有资料" },
-  { key: "exercise", label: "有练习" }
+  { key: "misconception", label: "误区节点" },
+  { key: "exercise", label: "验证任务" },
+  { key: "resource", label: "有资料" }
+];
+
+const ML_GRAPH_MODULES = [
+  { key: "foundation", label: "机器学习基础", short: "任务、数据与泛化", terms: ["监督学习", "无监督学习", "训练集", "测试集", "特征", "标签", "偏差", "方差", "泛化"] },
+  { key: "preprocess", label: "数据预处理", short: "清洗、缩放与划分", terms: ["缺失值", "标准化", "归一化", "特征选择", "训练验证测试", "特征工程"] },
+  { key: "regression", label: "回归模型", short: "线性回归与优化", terms: ["线性回归", "最小二乘", "梯度下降", "正则化", "回归评价", "均方误差"] },
+  { key: "classification", label: "分类模型", short: "分类算法与混淆矩阵", terms: ["逻辑回归", "KNN", "近邻", "朴素贝叶斯", "决策树", "支持向量机", "SVM", "混淆矩阵"] },
+  { key: "evaluation", label: "模型评估与优化", short: "泛化、指标与调参", terms: ["交叉验证", "过拟合", "欠拟合", "学习率", "超参数", "ROC", "AUC", "Precision", "Recall", "F1"] },
+  { key: "clustering", label: "聚类与综合应用", short: "聚类、降维与建模流程", terms: ["K-Means", "K-means", "聚类", "降维", "PCA", "聚类指标", "项目建模"] }
 ];
 
 const ICON_PATHS = {
@@ -189,7 +225,18 @@ const ICON_PATHS = {
   refresh: `<path d="M21 12a9 9 0 0 1-15.3 6.4"/><path d="M3 12A9 9 0 0 1 18.3 5.6"/><path d="M18 2v4h-4"/><path d="M6 22v-4h4"/>`,
   lab: `<path d="M10 2v6l-5.5 9.5A3 3 0 0 0 7 22h10a3 3 0 0 0 2.5-4.5L14 8V2"/><path d="M8 2h8"/><path d="M7 16h10"/>`,
   school: `<path d="m3 10 9-6 9 6-9 6Z"/><path d="M5 12v5c2 2 12 2 14 0v-5"/><path d="M12 16v5"/>`,
-  admin: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>`
+  admin: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>`,
+  search: `<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>`,
+  chevronDown: `<path d="m6 9 6 6 6-6"/>`,
+  maximize: `<path d="M8 3H3v5"/><path d="M21 8V3h-5"/><path d="M3 16v5h5"/><path d="M16 21h5v-5"/>`,
+  minimize: `<path d="M8 3v5H3"/><path d="M16 3v5h5"/><path d="M8 21v-5H3"/><path d="M16 21v-5h5"/>`,
+  zoomIn: `<circle cx="11" cy="11" r="7"/><path d="M11 8v6"/><path d="M8 11h6"/><path d="m20 20-3.5-3.5"/>`,
+  zoomOut: `<circle cx="11" cy="11" r="7"/><path d="M8 11h6"/><path d="m20 20-3.5-3.5"/>`,
+  image: `<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10.5" r="1.5"/><path d="m21 15-5-5L5 19"/>`,
+  target: `<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/>`,
+  branch: `<circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 6h8"/><path d="M7 8l4 8"/><path d="m17 8-4 8"/>`,
+  columns: `<rect x="3" y="4" width="7" height="16" rx="1"/><rect x="14" y="4" width="7" height="16" rx="1"/>`,
+  atom: `<circle cx="12" cy="12" r="1.5"/><path d="M19 12c0 2.8-3.1 5-7 5s-7-2.2-7-5 3.1-5 7-5 7 2.2 7 5Z"/><path d="M15.5 18.1c-2.4 1.4-5.7-.3-7.6-3.7S6.4 7.1 8.8 5.7s5.7.3 7.6 3.7 1.5 7.3-.9 8.7Z"/><path d="M8.5 18.1c2.4 1.4 5.7-.3 7.6-3.7s1.5-7.3-.9-8.7-5.7.3-7.6 3.7-1.5 7.3.9 8.7Z"/>`
 };
 
 function iconSvg(name, label = "") {
@@ -205,16 +252,23 @@ const teacherMenus = [
   { key: "materials", icon: "files", label: "课程资料", section: "资源" },
   { key: "models", icon: "lab", label: "模型实验室", section: "资源" },
   { key: "classes", icon: "users", label: "班级管理", section: "管理" },
-  { key: "admin", icon: "admin", label: "运营面板", section: "管理", adminOnly: true },
   { key: "chat", icon: "message", label: "师生消息", section: "沟通" },
   { key: "profile", icon: "user", label: "个人信息", section: "账户" }
 ];
 
+const adminMenus = [
+  { key: "admin", icon: "admin", label: "数据导出", section: "管理" }
+];
+
 const studentMenus = [
-  { key: "ai", icon: "bot", label: "AI 助教", section: "学习" },
-  { key: "graph", icon: "network", label: "知识图谱", section: "学习" },
-  { key: "homework", icon: "clipboard", label: "作业提交", section: "学习" },
-  { key: "models", icon: "lab", label: "模型实验室", section: "资源" },
+  { key: "home", icon: "home", label: "学习周期驾驶舱", section: "学习" },
+  { key: "ai", icon: "bot", label: "AI 诊断与审辩", section: "学习" },
+  { key: "graph", icon: "network", label: "我的学习路径", section: "学习" },
+  { key: "portfolio", icon: "files", label: "学习证据档案", section: "学习" },
+  { key: "showcase", icon: "clipboard", label: "学习周期申报", section: "学习" },
+  { key: "courses", icon: "school", label: "我的课程", section: "学习" },
+  { key: "homework", icon: "clipboard", label: "节点练习/作业", section: "学习" },
+  { key: "models", icon: "lab", label: "学习作品/实验", section: "资源" },
   { key: "chat", icon: "message", label: "站内消息", section: "沟通" },
   { key: "profile", icon: "user", label: "个人信息", section: "账户" }
 ];
@@ -332,6 +386,7 @@ const MODEL_TEMPLATES = {
     { key: "ml-knn-template", title: "KNN 分类", types: ["ml-knn"], hint: "运行 Iris 分类示例，修改 K 值和距离度量。" },
     { key: "ml-linear-template", title: "线性回归", types: ["ml-linear-regression"], hint: "运行合成回归数据，观察参数和 R2。" },
     { key: "ml-logistic-template", title: "逻辑回归", types: ["ml-logistic-regression"], hint: "运行二分类示例，查看概率输出。" },
+    { key: "ml-tree-template", title: "决策树过拟合", types: ["ml-decision-tree"], hint: "比较不同树深度下的训练集与测试集表现。" },
     { key: "ml-kmeans-template", title: "K-Means", types: ["ml-kmeans"], hint: "运行三簇聚类示例，查看轮廓系数。" }
   ]
 };
@@ -833,6 +888,13 @@ print("预测:", predictions)`
   }
 };
 
+const ML_WORKSHOP_EXPERIMENTS = [
+  { key: "linear-house", title: "线性回归预测房价", ability: "数据划分、训练与误差分析", dataset: "小型房价特征数据集：面积、房间数、区域编码与房价", templateKey: "ml-linear-template", type: "ml-linear-regression", nodes: ["线性回归", "最小二乘", "评价指标"], steps: ["划分训练集与测试集", "训练线性回归模型", "比较预测值与真实值", "分析误差来源"], signals: ["误差", "预测", "测试集", "R2"] },
+  { key: "logistic-iris", title: "逻辑回归分类鸢尾花", ability: "分类流程、决策边界与错误样本分析", dataset: "Iris 鸢尾花数据集", templateKey: "ml-logistic-template", type: "ml-logistic-regression", nodes: ["逻辑回归", "混淆矩阵", "分类评价"], steps: ["划分训练集与测试集", "训练逻辑回归", "输出准确率与混淆矩阵", "分析错误样本"], signals: ["混淆矩阵", "准确率", "错误", "分类"] },
+  { key: "knn-k", title: "KNN 参数比较", ability: "理解超参数 K 对模型结果的影响", dataset: "Iris 小型分类数据集", templateKey: "ml-knn-template", type: "ml-knn", nodes: ["KNN", "K 值选择", "分类评价"], steps: ["设置多个 K 值", "分别训练并预测", "比较准确率", "解释 K 值变化原因"], signals: ["K", "准确率", "参数", "比较"] },
+  { key: "tree-overfit", title: "决策树过拟合实验", ability: "理解泛化能力与剪枝", dataset: "分类数据集，比较不同树深度", templateKey: "ml-tree-template", type: "ml-decision-tree", nodes: ["决策树", "过拟合", "欠拟合", "模型评估"], steps: ["设置不同 max_depth", "比较训练集与测试集性能", "识别过拟合", "提出剪枝结论"], signals: ["训练", "测试", "过拟合", "深度"] }
+];
+
 function labConfigForSubject(subject) {
   return MODEL_LABS[subject] || MODEL_LABS.通用;
 }
@@ -890,7 +952,8 @@ function isTeacherLike() {
 }
 
 function defaultPageForRole(role = state.user?.role) {
-  return role === "student" ? "graph" : "ai";
+  if (role === "admin") return "admin";
+  return role === "student" ? "home" : "ai";
 }
 
 function allVisibleGraphs() {
@@ -993,6 +1056,7 @@ function reconcileSubjectDefaults() {
 }
 
 function menuForCurrentUser() {
+  if (state.user?.role === "admin") return adminMenus;
   const menus = isTeacherLike() ? teacherMenus : studentMenus;
   return menus.filter((item) => !item.adminOnly || state.user?.role === "admin");
 }
@@ -1000,7 +1064,7 @@ function menuForCurrentUser() {
 function currentPageTitle() {
   const menu = menuForCurrentUser().find((item) => item.key === state.page);
   if (menu) return menu.label;
-  return state.page === "admin" ? "运营面板" : "AI 助教";
+  return state.page === "admin" ? "数据导出" : "AI 助教";
 }
 
 function showToast(message, type = "ok") {
@@ -1023,6 +1087,18 @@ function authRoleExtraCopy(role) {
 
 function setAuthSubmitting(form, submitting, busyText) {
   const button = form?.querySelector('button[type="submit"]');
+  if (!button) return;
+  if (submitting) {
+    button.dataset.idleText = button.textContent;
+    button.textContent = busyText;
+    button.disabled = true;
+  } else {
+    button.textContent = button.dataset.idleText || button.textContent;
+    button.disabled = false;
+  }
+}
+
+function setButtonBusy(button, submitting, busyText = "处理中...") {
   if (!button) return;
   if (submitting) {
     button.dataset.idleText = button.textContent;
@@ -1119,6 +1195,8 @@ function resetSessionSelectionState() {
   }
   state.selectedGraphId = null;
   state.selectedClassId = null;
+  state.classManageOpen = false;
+  state.studentCourseClassId = null;
   state.classTool = null;
   state.activeConversationId = null;
   state.activeThreadId = null;
@@ -1153,6 +1231,7 @@ function resetSessionSelectionState() {
   state.graphFocusNodeId = null;
   state.graphSelectedNodeId = null;
   state.graphSearch = "";
+  state.graphMaximized = false;
   state.graphJob = null;
   state.conversationContextMenu = null;
   state.graphUploadAbort = null;
@@ -1171,9 +1250,14 @@ async function loadState() {
   localStorage.setItem("edu-user", JSON.stringify(state.user));
   reconcileSubjectDefaults();
   if (state.selectedClassId && !state.data.classes.some((klass) => klass.id === state.selectedClassId)) state.selectedClassId = null;
+  if (!state.selectedClassId) state.classManageOpen = false;
   if (!state.selectedClassId && state.data.classes.length) state.selectedClassId = state.data.classes[0].id;
+  if (state.studentCourseClassId && !state.data.classes.some((klass) => klass.id === state.studentCourseClassId)) state.studentCourseClassId = null;
   const visibleGraphs = graphListForCurrentRole();
-  if (state.selectedGraphId && !visibleGraphs.some((graph) => graph.id === state.selectedGraphId)) state.selectedGraphId = null;
+  if (state.selectedGraphId && !visibleGraphs.some((graph) => graph.id === state.selectedGraphId)) {
+    state.selectedGraphId = null;
+    state.graphMaximized = false;
+  }
   if (state.materialDetailId && !state.data.courseMaterials?.some((material) => material.id === state.materialDetailId)) state.materialDetailId = null;
   if (!state.materialDetailId && state.data.courseMaterials?.length) state.materialDetailId = state.data.courseMaterials[0].id;
   if (state.activeThreadId && !state.data.chatThreads.some((thread) => thread.id === state.activeThreadId)) state.activeThreadId = null;
@@ -1266,14 +1350,17 @@ function renderNavSections(menus) {
 }
 
 function renderBottomNav(menus) {
-  const quickKeys = ["ai", "graph", "homework", "models", "chat"];
+  const quickKeys = state.user?.role === "student"
+    ? ["home", "ai", "graph", "portfolio", "homework"]
+    : ["ai", "graph", "homework", "models", "chat"];
   const items = quickKeys.map((key) => menus.find((item) => item.key === key)).filter(Boolean);
+  if (!items.length) return "";
   return `
     <nav class="bottom-nav" aria-label="手机端高频入口">
       ${items.map((item) => `
         <button class="${state.page === item.key ? "active" : ""}" data-page="${item.key}" title="${escapeHtml(item.label)}">
           ${iconSvg(item.icon, item.label)}
-          <span>${escapeHtml(item.key === "homework" ? "作业" : item.key === "graph" ? "图谱" : item.key === "chat" ? "消息" : item.label.replace(" 助教", ""))}</span>
+          <span>${escapeHtml(item.key === "homework" ? "作业" : item.key === "graph" ? "图谱" : item.key === "chat" ? "消息" : item.key === "portfolio" ? "档案" : item.key === "home" ? "首页" : item.label.replace(" 助教", ""))}</span>
         </button>
       `).join("")}
     </nav>
@@ -1285,7 +1372,7 @@ function renderAuth() {
     <main class="auth-shell">
       <section class="auth-visual">
         <div class="brand-mark">🧠</div>
-        <h1>智慧教育智能体平台</h1>
+        <h1>智学伴</h1>
         <p>教师端与学生端共用一套账号体系，注册时选择身份，系统自动分配 8 位 ID。</p>
         <div class="auth-points">
           <span>知识图谱</span>
@@ -1410,11 +1497,13 @@ function renderAuth() {
 }
 
 function renderShell() {
-  const teacherSide = isTeacherLike();
+  const isAdmin = state.user?.role === "admin";
+  const teacherSide = state.user?.role === "teacher";
   const menus = menuForCurrentUser();
   const classes = state.data?.classes || [];
-  const pageTitle = currentPageTitle();
-  const identity = teacherSide
+  const identity = isAdmin
+    ? "数据导出"
+    : teacherSide
     ? (state.user.subject || preferredSubject() || "未设置学科")
     : studentClassSummary(classes);
   if (state.page === "history") state.page = "ai";
@@ -1422,7 +1511,7 @@ function renderShell() {
     <div class="layout ${state.navOpen ? "drawer-open" : ""}">
       <header class="mobile-topbar">
         <div>
-          <strong>智慧教育</strong>
+          <strong>智学伴</strong>
           <span>${escapeHtml(roleName(state.user.role))} · ${escapeHtml(identity)}</span>
         </div>
         <button type="button" id="mobileMenuBtn" title="打开菜单">${iconSvg("menu", "菜单")}</button>
@@ -1430,28 +1519,28 @@ function renderShell() {
       <div class="drawer-backdrop" id="drawerBackdrop"></div>
       <aside class="sidebar">
         <div class="side-brand">
-          <strong>${teacherSide ? "教学中枢" : "学习索引"}</strong>
-          <span>${escapeHtml(state.user.name)}（${roleName(state.user.role)}）</span>
-          <small>ID：${state.user.id}</small>
+          <div class="brand-lockup">
+            <span class="brand-logo">${iconSvg("school")}</span>
+            <strong>智学伴</strong>
+          </div>
+          <div class="side-identity">
+            <span>${escapeHtml(state.user.name)}（${roleName(state.user.role)}）</span>
+            <div class="side-id-row">
+              <small>ID：${state.user.id}</small>
+              <div class="side-actions">
+                <button class="mini side-action-button" type="button" id="refreshBtn" title="刷新数据">${iconSvg("refresh", "刷新")}</button>
+                ${isAdmin ? "" : `<button class="mini side-action-button" type="button" data-page="profile" title="个人信息">${iconSvg("user", "个人信息")}</button>`}
+              </div>
+            </div>
+          </div>
         </div>
-        <div class="section-label">${teacherSide ? "教师端" : "学生端"}</div>
+        <div class="section-label">${isAdmin ? "管理员端" : teacherSide ? "教师端" : "学生端"}</div>
         <nav class="nav">
           ${renderNavSections(menus)}
         </nav>
         <button id="logoutBtn" class="ghost wide">退出登录</button>
       </aside>
       <main class="main">
-        <header class="topbar">
-          <div class="topbar-title">
-            <strong>智慧教育智能体平台</strong>
-            <span>${escapeHtml(pageTitle)}</span>
-          </div>
-          <div class="topbar-actions">
-            <span>${escapeHtml(roleName(state.user.role))} · ${escapeHtml(identity)}</span>
-            <button class="mini" type="button" id="refreshBtn" title="刷新数据">${iconSvg("refresh", "刷新")}</button>
-            <button class="mini" type="button" data-page="profile" title="个人信息">${iconSvg("user", "个人信息")}</button>
-          </div>
-        </header>
         <section id="content" class="content"></section>
       </main>
       <div class="floating-tools">
@@ -1561,11 +1650,14 @@ function renderContent() {
   const content = document.getElementById("content");
   if (state.page === "history") state.page = "ai";
   if (state.page === "home") state.page = defaultPageForRole();
+  if (state.user?.role === "admin" && state.page !== "admin") state.page = "admin";
   if (state.user?.role === "student" && state.page === "materials") state.page = "graph";
+  if (state.page !== "graph") state.graphMaximized = false;
   const main = document.querySelector(".main");
   main?.classList.toggle("ai-main", state.page === "ai");
   main?.classList.toggle("model-main", state.page === "models");
   main?.classList.toggle("ml-model-main", state.page === "models" && state.modelSubject === "机器学习");
+  document.body?.classList.toggle("graph-page-maximized", state.page === "graph" && state.graphMaximized);
   const contentClasses = ["content"];
   if (state.page === "ai") contentClasses.push("ai-content");
   if (state.page === "graph") contentClasses.push("graph-content");
@@ -1573,7 +1665,10 @@ function renderContent() {
   if (state.page === "models" && state.modelSubject === "机器学习") contentClasses.push("ml-model-content");
   if (state.page === "graph" && state.user?.role === "student") contentClasses.push("student-graph-content");
   if (state.page === "materials") contentClasses.push("materials-content");
+  if (state.page === "courses") contentClasses.push("courses-content");
   if (state.page === "homework") contentClasses.push("homework-content");
+  if (state.page === "portfolio") contentClasses.push("portfolio-content");
+  if (state.page === "showcase") contentClasses.push("showcase-content");
   if (state.page === "chat") contentClasses.push("chat-content");
   if (state.page === "profile") contentClasses.push("profile-content");
   if (state.page === "classes") contentClasses.push("class-content");
@@ -1584,6 +1679,9 @@ function renderContent() {
     graph: renderGraphPage,
     ai: renderAiPage,
     materials: renderMaterialsPage,
+    courses: renderStudentCoursesPage,
+    portfolio: renderStudentPortfolioPage,
+    showcase: renderCaseShowcasePage,
     models: renderModelPage,
     chat: renderChatPage,
     classes: renderClassPage,
@@ -1602,6 +1700,9 @@ function bindCurrentPage() {
     graph: bindGraphPage,
     ai: bindAiPage,
     materials: bindMaterialsPage,
+    courses: bindStudentCoursesPage,
+    portfolio: bindStudentPortfolioPage,
+    showcase: bindCaseShowcasePage,
     models: bindModelPage,
     chat: bindChatPage,
     classes: bindClassPage,
@@ -1757,94 +1858,1100 @@ function renderTeacherSetupChecklist(data) {
   `;
 }
 
+function currentStudentPortfolio() {
+  const fallback = {
+    summary: { student: state.user || {}, subject: preferredSubject(), averageMastery: null, latestActivity: "" },
+    learningCycle: {
+      title: "机器学习第 5-6 章，4 周学习周期",
+      subject: preferredSubject(),
+      goals: ["理解 KNN、逻辑回归、SVM 等核心算法"],
+      currentStage: { activeLabel: "前测诊断", progress: 0, stages: [] },
+      evidenceCounts: {},
+      evidenceRequirements: { aiDialogues: 3, knowledgeTests: 2, reflections: 1, learningOutputs: 1, wrongFixes: 1 },
+      tasks: [],
+      rangeText: "第 1 周 到 第 4 周",
+      requiredEvidenceText: "至少 3 次 AI 对话、2 次测试、1 份反思、1 个学习产出"
+    },
+    timeline: [],
+    masteryComparison: [],
+    aiSupportRecords: [],
+    works: [],
+    misconceptionTrajectory: [],
+    reflections: state.data?.studentReflections || [],
+    reflectionExcerpts: [],
+    corrections: [],
+    aiReviews: state.data?.aiAnswerReviews || [],
+    nodeAnnotations: state.data?.studentNodeAnnotations || [],
+    collaboration: {},
+    ethics: { settings: state.data?.studentEthicsSettings || {} },
+    innovation: {
+      title: "证据驱动的 AI 学习闭环",
+      thesis: "AI 支持诊断、路径推荐、证据记录和反思引导，学生保留自主判断。",
+      loop: ["前测诊断", "学习目标设定", "AI + 知识图谱学习", "节点练习/作业", "错因修正", "后测与反思"],
+      positioning: "创新点应表述为学习方式、评价方式和 AI 使用方式的改变，而不是技术组件堆叠。",
+      points: [
+        { title: "证据驱动的 AI 自主学习闭环", summary: "完成诊断、学习、测试、修正、反思、再诊断的完整周期。", evidence: [], evaluationValue: "支撑学习过程记录。" },
+        { title: "知识图谱驱动的个性化学习路径", summary: "围绕具体知识节点推荐学习路径。", evidence: [], evaluationValue: "支撑个性化学习。" },
+        { title: "AI 诊断与学生反思结合的元认知培养", summary: "推动学生从获得答案转向管理自己的学习。", evidence: [], evaluationValue: "支撑个人反思。" },
+        { title: "学生参与校验 AI 的批判性学习机制", summary: "学生纠正定位、评价可靠性、查看引用来源。", evidence: [], evaluationValue: "支撑规范使用 AI。" },
+        { title: "自动生成学习证据档案", summary: "自动组织对话、测试、错题、图谱、反思和成果。", evidence: [], evaluationValue: "支撑学习评价和案例申报。" }
+      ],
+      differentiators: []
+    },
+    graphRagProfileCoupling: {},
+    declarationEvidencePack: {},
+    showcase: {}
+  };
+  return state.data?.studentPortfolio || fallback;
+}
+
+function portfolioEvidenceCount(key) {
+  const counts = currentStudentPortfolio().learningCycle?.evidenceCounts || {};
+  return Number(counts[key] || 0);
+}
+
+function renderStageStrip(stage = {}) {
+  const stages = Array.isArray(stage.stages) ? stage.stages : [];
+  if (!stages.length) return "";
+  return `
+    <div class="cycle-stage-strip">
+      ${stages.map((item) => `
+        <span class="${item.done ? "done" : item.key === stage.activeKey ? "active" : ""}">
+          <b></b>${escapeHtml(item.label)}
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderEvidenceMiniStats(counts = {}) {
+  const items = [
+    ["AI 对话", counts.aiDialogues || 0],
+    ["知识测试", counts.knowledgeTests || 0],
+    ["掌握变化", counts.masteryChanges || 0],
+    ["错题", counts.wrongNotes || 0],
+    ["反思", counts.reflections || 0],
+    ["AI 审辩", counts.aiReviews || 0],
+    ["作品/实验", Number(counts.homeworkOutputs || 0) + Number(counts.modelExperiments || 0)]
+  ];
+  return `
+    <div class="evidence-mini-stats">
+      ${items.map(([label, value]) => `<span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(label)}</small></span>`).join("")}
+    </div>
+  `;
+}
+
+function cycleTaskStatusClass(task = {}) {
+  return `status-${String(task.statusKey || (task.done ? "done" : "not_started")).replace(/_/g, "-")}`;
+}
+
+function renderCycleTaskTracker(cycle = {}, limit = 7, readOnly = false) {
+  const tasks = Array.isArray(cycle.tasks) ? cycle.tasks.slice(0, limit) : [];
+  return `
+    <div class="cycle-task-tracker">
+      ${tasks.map((task) => `
+        <article class="${task.done ? "done" : "pending"} ${cycleTaskStatusClass(task)}">
+          <div>
+            <strong>${escapeHtml(task.label || task.shortLabel || "学习任务")}</strong>
+            <span>${escapeHtml(task.evidence || "")}</span>
+            <small>${escapeHtml(task.evidenceType || "学习证据")} · ${escapeHtml(task.gap || task.statusText || "")}</small>
+          </div>
+          <b>${escapeHtml(task.statusLabel || task.statusText || `${task.value || 0}/${task.target || 1}`)}</b>
+          ${readOnly ? "" : `
+            <select class="cycle-task-status-select" data-cycle-task-status="${escapeHtml(task.key)}" aria-label="更新任务状态">
+              ${[
+                ["not_started", "未开始"],
+                ["in_progress", "进行中"],
+                ["submitted", "已提交"],
+                ["archived", "已入档"],
+                ["needs_reflection", "需反思"],
+                ["done", "已完成"]
+              ].map(([value, label]) => `<option value="${value}" ${task.statusKey === value ? "selected" : ""}>${label}</option>`).join("")}
+            </select>
+          `}
+        </article>
+      `).join("") || emptyBlock("暂无周期任务。保存一个学习周期后会自动生成前测、AI 学习、测试、错因、反思、后测和产出任务。")}
+    </div>
+  `;
+}
+
+function renderLearningCycleEditor(cycle = {}) {
+  const req = cycle.evidenceRequirements || {};
+  const templates = Array.isArray(cycle.templateLibrary) ? cycle.templateLibrary : [];
+  const weeklyPlanText = (cycle.weeklyPlan || []).map((item) => {
+    const tasks = Array.isArray(item.tasks) && item.tasks.length ? `：${item.tasks.join("；")}` : "";
+    return `${item.week || ""}${item.title ? `：${item.title}` : ""}${tasks}`;
+  }).join("\n");
+  return `
+    <section class="panel cycle-editor ${state.cycleSettingsOpen ? "open" : "closed"}">
+      <div class="split-head">
+        <div>
+          <h3>设置周期</h3>
+          <p class="hint">学生可以使用模板，也可以按自己的薄弱点自定义本轮学习周期。</p>
+        </div>
+        <button class="mini" type="button" data-cycle-settings-toggle>${state.cycleSettingsOpen ? "收起" : "打开设置"}</button>
+      </div>
+      ${state.cycleSettingsOpen ? `
+      <form class="cycle-editor-form" data-learning-cycle-form>
+        <input type="hidden" name="id" value="${escapeHtml(cycle.virtual ? "" : cycle.id || "")}" />
+        <div class="form-grid two">
+          <label>选择周期模板
+            <select name="templateKey" data-cycle-template-select>
+              <option value="">学生自定义周期</option>
+              ${templates.map((template) => `<option value="${escapeHtml(template.key)}" ${cycle.templateKey === template.key ? "selected" : ""}>${escapeHtml(template.name || template.title)}</option>`).join("")}
+            </select>
+          </label>
+          <label>查看方式
+            <select name="viewMode" data-cycle-view-mode-select>
+              <option value="stage" ${(cycle.viewMode || state.cycleViewMode) !== "week" ? "selected" : ""}>按闭环阶段看</option>
+              <option value="week" ${(cycle.viewMode || state.cycleViewMode) === "week" ? "selected" : ""}>按周看</option>
+            </select>
+          </label>
+        </div>
+        <label>周期名称<input name="title" value="${escapeHtml(cycle.title || "")}" placeholder="机器学习 KNN 与逻辑回归专题学习" /></label>
+        <div class="form-grid two">
+          <label>学科/专题<input name="subject" value="${escapeHtml(cycle.subject || preferredSubject())}" /></label>
+          <label>时间范围<input name="range" value="${escapeHtml(cycle.rangeText || "第 1 周 到 第 4 周")}" placeholder="第 1 周 到 第 4 周" /></label>
+        </div>
+        <label>学习目标<textarea name="goals" rows="3" placeholder="每行一个目标">${escapeHtml((cycle.goals || []).join("\n"))}</textarea></label>
+        <label>核心图谱节点<textarea name="focusNodes" rows="2" placeholder="例如：KNN、距离度量、K 值选择、逻辑回归">${escapeHtml((cycle.focusNodes || []).join("\n"))}</textarea></label>
+        <div class="form-grid two">
+          <label>推荐测试节点<textarea name="recommendedTestNodes" rows="2" placeholder="每行一个测试节点">${escapeHtml((cycle.recommendedTestNodes || []).join("\n"))}</textarea></label>
+          <label>周计划<textarea name="weeklyPlan" rows="4" placeholder="第 1 周：前测诊断：完成 KNN 前测；标注薄弱节点">${escapeHtml(weeklyPlanText)}</textarea></label>
+        </div>
+        <div class="cycle-requirements-grid">
+          <label>AI 对话<input name="aiDialogues" type="number" min="0" max="20" value="${Number(req.aiDialogues ?? 3)}" /></label>
+          <label>测试次数<input name="knowledgeTests" type="number" min="0" max="20" value="${Number(req.knowledgeTests ?? 2)}" /></label>
+          <label>反思份数<input name="reflections" type="number" min="0" max="20" value="${Number(req.reflections ?? 1)}" /></label>
+          <label>学习产出<input name="learningOutputs" type="number" min="0" max="20" value="${Number(req.learningOutputs ?? 1)}" /></label>
+        </div>
+        <p class="hint">证据要求会用于首页进度、学习档案和参赛展示页，不会覆盖已有学习记录。</p>
+        <div class="actions compact-actions">
+          <button class="primary" type="submit">保存学习周期</button>
+          <button class="mini" type="button" data-cycle-ai-suggest>AI 生成周期建议</button>
+        </div>
+      </form>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderCycleGapList(cycle = {}) {
+  const gaps = Array.isArray(cycle.evidenceGaps) ? cycle.evidenceGaps : [];
+  const shown = gaps.slice(0, 5);
+  return `
+    <div class="cycle-gap-list">
+      ${shown.map((item) => `
+        <button type="button" data-dashboard-page="${escapeHtml(item.page || "portfolio")}">
+          <strong>${escapeHtml(item.gap || item.label)}</strong>
+          <span>${escapeHtml(item.nextAction || item.evidenceType || "")}</span>
+        </button>
+      `).join("") || `<article class="cycle-gap-done"><strong>证据链已完整</strong><span>可以进入学习档案生成周期完成报告和匿名申报包。</span></article>`}
+    </div>
+  `;
+}
+
+function renderCyclePlanView(cycle = {}) {
+  const mode = state.cycleViewMode || cycle.viewMode || "stage";
+  const tasks = Array.isArray(cycle.tasks) ? cycle.tasks : [];
+  const weeks = Array.isArray(cycle.weeklyPlan) ? cycle.weeklyPlan : [];
+  return `
+    <section class="panel dashboard-card cycle-plan-card">
+      <div class="split-head">
+        <div>
+          <h3>${mode === "week" ? "周视图" : "闭环阶段视图"}</h3>
+          <p class="hint">${mode === "week" ? "按实施周期展示每周任务，适合参赛录屏说明完整实施过程。" : "按前测、AI 学习、测试、修正、反思、后测展示证据链。"}</p>
+        </div>
+        <div class="segmented-control cycle-view-toggle">
+          <button type="button" class="${mode !== "week" ? "active" : ""}" data-cycle-view-mode="stage">阶段</button>
+          <button type="button" class="${mode === "week" ? "active" : ""}" data-cycle-view-mode="week">周</button>
+        </div>
+      </div>
+      ${mode === "week" ? `
+        <div class="cycle-week-list">
+          ${weeks.map((week) => `
+            <article>
+              <strong>${escapeHtml(week.week || "本周")}</strong>
+              <span>${escapeHtml(week.title || "")}</span>
+              <ul>${(week.tasks || []).map((task) => `<li>${escapeHtml(task)}</li>`).join("")}</ul>
+            </article>
+          `).join("") || emptyBlock("暂无周计划。打开“设置周期”后可以选择模板或自定义每周任务。")}
+        </div>
+      ` : `
+        <div class="cycle-stage-list">
+          ${tasks.slice(0, 6).map((task, index) => `
+            <article class="${cycleTaskStatusClass(task)}">
+              <b>${index + 1}</b>
+              <div>
+                <strong>${escapeHtml(task.label || task.shortLabel)}</strong>
+                <span>${escapeHtml(task.evidenceType || "")} · ${escapeHtml(task.statusLabel || "")}</span>
+                <p>${escapeHtml(task.nextAction || task.evidence || "")}</p>
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function renderCycleCompletionCard(cycle = {}) {
+  const report = cycle.completionReport || {};
+  return `
+    <section class="panel dashboard-card cycle-completion-card">
+      <div class="split-head">
+        <div>
+          <h3>学习周期完成报告</h3>
+          <p class="hint">${escapeHtml(report.statusText || "周期达到 100% 后自动生成。")}</p>
+        </div>
+        <button class="mini" type="button" data-dashboard-page="portfolio">查看档案</button>
+      </div>
+      <div class="cycle-report-summary">
+        <strong>${escapeHtml(report.ready ? (report.title || "周期完成报告") : "待生成")}</strong>
+        <p>${escapeHtml(report.summary || "完成前测、AI 学习、知识测试、错因修正、反思、后测和学习产出后自动生成。")}</p>
+      </div>
+      ${report.ready ? `<div class="cycle-report-chips">
+        <span>${Number(report.masteryChange?.improvedTopics || 0)} 个知识点提升</span>
+        <span>${Number(report.misconceptionChange?.wrongNotes || 0)} 条错因记录</span>
+        <span>${Number(report.citationSummary?.count || 0)} 条引用来源</span>
+      </div>` : ""}
+    </section>
+  `;
+}
+
+function renderAnswerFirstCard(cycle = {}) {
+  const topic = (cycle.focusNodes || [])[0] || (cycle.recommendedTestNodes || [])[0] || "KNN";
+  return `
+    <section class="panel dashboard-card answer-first-card">
+      <div class="split-head">
+        <div>
+          <h3>先作答再求助</h3>
+          <p class="hint">先保留原始理解，再让 AI 基于你的答案诊断误区，避免直接要答案。</p>
+        </div>
+        <span>入档为 AI 诊断证据</span>
+      </div>
+      <form class="answer-first-form" data-answer-first-form>
+        <label>知识点<input name="knowledgePoint" value="${escapeHtml(topic)}" /></label>
+        <label>我的原始理解<textarea name="studentAnswer" rows="4" required placeholder="先写你自己的解释、解题思路或不确定点"></textarea></label>
+        <button class="primary" type="submit">让 AI 诊断</button>
+      </form>
+    </section>
+  `;
+}
+
+function renderPortfolioExportActions(compact = false) {
+  const anonymousDefault = currentStudentPortfolio().ethics?.settings?.anonymousExportDefault || state.data?.studentEthicsSettings?.anonymousExportDefault;
+  return `
+    <div class="actions compact-actions portfolio-export-actions ${compact ? "compact" : ""}">
+      <button class="primary" type="button" data-portfolio-export="html">导出档案</button>
+      <button class="mini" type="button" data-portfolio-export="pdf">PDF</button>
+      <button class="mini" type="button" data-portfolio-export="csv">CSV</button>
+      <button class="mini" type="button" data-portfolio-export="json">JSON</button>
+      <button class="mini" type="button" data-portfolio-export="application">申报素材</button>
+      <button class="mini" type="button" data-portfolio-export="script">视频脚本</button>
+      <label class="check-line export-anonymous"><input type="checkbox" data-portfolio-anonymous ${anonymousDefault ? "checked" : ""} />匿名</label>
+    </div>
+  `;
+}
+
+function renderPortfolioTimelineList(items = [], limit = 6) {
+  const shown = items.slice(0, limit);
+  return `
+    <div class="portfolio-timeline-list">
+      ${shown.map((item) => `
+        <article>
+          <time>${escapeHtml(fmtTime(item.time))}</time>
+          <div>
+            <strong>${escapeHtml(item.title || item.type || "学习事件")}</strong>
+            <span>${escapeHtml(item.type || "")}${item.score ? ` · ${escapeHtml(item.score)}` : ""}${item.source ? ` · ${escapeHtml(item.source)}` : ""}</span>
+            ${item.summary ? `<p>${escapeHtml(item.summary)}</p>` : ""}
+          </div>
+        </article>
+      `).join("") || emptyBlock("暂无学习事件。完成 AI 对话、知识测试、作业或反思后会形成时间线。")}
+    </div>
+  `;
+}
+
+function renderMasteryComparisonRows(rows = [], limit = 8) {
+  const shown = rows.slice(0, limit);
+  return `
+    <div class="portfolio-table-list mastery-comparison-list">
+      ${shown.map((item) => `
+        <article>
+          <strong>${escapeHtml(item.topic)}</strong>
+          <span>前测 ${escapeHtml(item.startText)} · 当前 ${escapeHtml(item.currentText)} · ${escapeHtml(item.changeText)}</span>
+          <div class="mastery-meter small"><span style="width:${item.current === null || item.current === undefined ? 0 : clamp(Number(item.current || 0), 0, 1) * 100}%"></span></div>
+        </article>
+      `).join("") || emptyBlock("暂无前后测对比。完成知识测试或 AI 诊断后会显示每个知识点的变化。")}
+    </div>
+  `;
+}
+
+function renderInnovationLoopCard(portfolio = currentStudentPortfolio()) {
+  const innovation = portfolio.innovation || {};
+  const loop = Array.isArray(innovation.loop) ? innovation.loop : [];
+  const points = Array.isArray(innovation.points) ? innovation.points : [];
+  return `
+    <section class="panel innovation-loop-card">
+      <div class="split-head">
+        <div>
+          <h3>${escapeHtml(innovation.title || "证据驱动的 AI 学习闭环")}</h3>
+          <p class="hint">${escapeHtml(innovation.thesis || "AI 支持诊断、推荐、证据记录和反思引导，学生保留自主判断。")}</p>
+          ${innovation.positioning ? `<p class="hint innovation-positioning">${escapeHtml(innovation.positioning)}</p>` : ""}
+        </div>
+      </div>
+      <div class="innovation-loop-strip">
+        ${loop.map((item, index) => `<span><b>${index + 1}</b>${escapeHtml(item)}</span>`).join("")}
+      </div>
+      ${points.length ? `
+        <div class="innovation-point-grid">
+          ${points.slice(0, 5).map((point, index) => `
+            <article>
+              <span>${index + 1}</span>
+              <div>
+                <strong>${escapeHtml(point.title || "")}</strong>
+                <p>${escapeHtml(point.summary || "")}</p>
+                ${(point.evidence || []).length ? `<small>证据：${escapeHtml((point.evidence || []).join("；"))}</small>` : ""}
+                ${point.evaluationValue ? `<em>${escapeHtml(point.evaluationValue)}</em>` : ""}
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      ` : (innovation.differentiators || []).length ? `
+        <div class="innovation-point-list">
+          ${innovation.differentiators.slice(0, 5).map((item) => `<p>${escapeHtml(item)}</p>`).join("")}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderGraphRagProfileCard(portfolio = currentStudentPortfolio()) {
+  const item = portfolio.graphRagProfileCoupling || {};
+  const path = Array.isArray(item.recommendedPath) ? item.recommendedPath : [];
+  return `
+    <section class="panel portfolio-section graph-profile-card">
+      <div class="split-head">
+        <div>
+          <h3>${escapeHtml(item.title || "GraphRAG + 学习画像")}</h3>
+          <p class="hint">${escapeHtml(item.description || "AI 回答绑定课程资料和图谱节点，学习行为回写画像并影响推荐路径。")}</p>
+        </div>
+        <span>${Number(item.ragCitationCount || 0)} 引用</span>
+      </div>
+      <div class="graph-profile-stats">
+        <span><strong>${Number(item.graphEvidenceCount || 0)}</strong><small>图谱证据</small></span>
+        <span><strong>${Number(item.profileEvidenceCount || 0)}</strong><small>画像证据</small></span>
+        <span><strong>${(item.weakDrivenTopics || []).length}</strong><small>画像驱动弱点</small></span>
+      </div>
+      <div class="portfolio-card-list">
+        ${path.slice(0, 6).map((step) => `
+          <article class="graph-path-explain-card">
+            <strong>${escapeHtml(step.topic)}</strong>
+            <span>${escapeHtml(step.current === null || step.current === undefined ? "未诊断" : percentText(step.current))} · ${escapeHtml(step.action || "")}</span>
+            <p><b>为什么先学：</b>${escapeHtml(step.why || "由学习画像和当前薄弱节点推荐。")}</p>
+            <p><b>错因关系：</b>${escapeHtml(step.misconceptionRelation || "暂无显式错因，建议用前测验证。")}</p>
+            <p><b>前置知识：</b>${escapeHtml((step.prerequisites || []).join("、") || "本章基础概念")}</p>
+            <p><b>验证任务：</b>${escapeHtml(step.verification || "完成一道同知识点变式题。")}</p>
+            <p><b>未掌握下一步：</b>${escapeHtml(step.fallback || "回到前置节点补学。")}</p>
+          </article>
+        `).join("") || emptyBlock("暂无画像驱动推荐。完成诊断后会显示图谱路径。")}
+      </div>
+    </section>
+  `;
+}
+
+function renderDeclarationEvidencePack(pack = {}) {
+  const chart = Array.isArray(pack.masteryChart) ? pack.masteryChart : [];
+  const eventCounts = Object.entries(pack.eventTypeCounts || {}).slice(0, 8);
+  const innovationPoints = Array.isArray(pack.innovationPoints) ? pack.innovationPoints : [];
+  const applicationSections = Array.isArray(pack.applicationSections) ? pack.applicationSections : [];
+  const videoScript = Array.isArray(pack.videoScriptOutline) ? pack.videoScriptOutline : [];
+  return `
+    <section class="panel portfolio-section declaration-pack-card portfolio-wide">
+      <div class="split-head">
+        <div>
+          <h3>${escapeHtml(pack.title || "自动生成申报证据包")}</h3>
+          <p class="hint">${escapeHtml(pack.anonymization || "可导出匿名版，隐藏学生身份并保留证据摘要。")}</p>
+        </div>
+        <strong>${pack.ready ? "已生成" : "待形成"}</strong>
+      </div>
+      <div class="declaration-grid">
+        <div class="declaration-chart">
+          <h4>掌握度变化图</h4>
+          ${chart.slice(0, 8).map((item) => `
+            <article>
+              <span>${escapeHtml(compactText(item.topic, 18))}</span>
+              <div><i style="width:${clamp(Number(item.start || 0), 0, 1) * 100}%"></i><b style="width:${clamp(Number(item.current || 0), 0, 1) * 100}%"></b></div>
+              <em>${escapeHtml(item.changeText || "")}</em>
+            </article>
+          `).join("") || emptyBlock("暂无掌握度图表数据。")}
+        </div>
+        <div class="declaration-events">
+          <h4>过程记录分布</h4>
+          ${eventCounts.map(([label, count]) => `<p><strong>${escapeHtml(label)}</strong><span>${escapeHtml(count)}</span></p>`).join("") || emptyBlock("暂无事件分布。")}
+        </div>
+      </div>
+      <div class="declaration-materials">
+        ${(pack.exportMaterials || []).map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
+      </div>
+      ${applicationSections.length ? `
+        <div class="declaration-application-sections">
+          <h4>申报页固定结构</h4>
+          ${applicationSections.map((item, index) => `
+            <article>
+              <b>${index + 1}</b>
+              <div>
+                <strong>${escapeHtml(item.title)}</strong>
+                <p>${escapeHtml(item.summary || "")}</p>
+                ${(item.evidence || []).length ? `<small>${escapeHtml((item.evidence || []).join("；"))}</small>` : ""}
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${videoScript.length ? `
+        <div class="video-script-preview">
+          <h4>3-5 分钟视频脚本提纲</h4>
+          ${videoScript.slice(0, 4).map((item) => `<p><strong>${escapeHtml(item.time)} ${escapeHtml(item.shot)}</strong><span>${escapeHtml(item.narration || "")}</span></p>`).join("")}
+        </div>
+      ` : ""}
+      ${innovationPoints.length ? `
+        <div class="declaration-innovation-points">
+          <h4>申报创新点对应</h4>
+          ${innovationPoints.slice(0, 5).map((item) => `<article><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.summary)}</p><small>${escapeHtml((item.evidence || []).join("；"))}</small></article>`).join("")}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderLearningEffectPanel(panel = {}, compact = false) {
+  const metrics = Array.isArray(panel.metrics) ? panel.metrics : [];
+  const Tag = compact ? "div" : "section";
+  return `
+    <${Tag} class="${compact ? "" : "panel portfolio-section"} learning-effect-panel ${compact ? "compact-effect-panel" : "portfolio-wide"}">
+      <div class="split-head">
+        <div>
+          <h3>${escapeHtml(panel.title || "前后对比学习成效")}</h3>
+          <p>${escapeHtml(panel.summary || "完成前测、后测和反思后，这里会自动汇总学习增益。")}</p>
+        </div>
+        <strong>${escapeHtml(panel.learningGainText || "待形成")}</strong>
+      </div>
+      <div class="effect-metric-grid">
+        ${metrics.map((metric) => `
+          <article>
+            <strong>${escapeHtml(metric.label)}</strong>
+            <div class="effect-before-after">
+              <span><small>前</small>${escapeHtml(metric.before || "待形成")}</span>
+              <span><small>后</small>${escapeHtml(metric.after || "待形成")}</span>
+            </div>
+            <p>${escapeHtml(metric.change || "")}</p>
+            <em>${escapeHtml(metric.evidence || metric.source || "")}</em>
+          </article>
+        `).join("") || emptyBlock("暂无成效数据。完成前测、练习、错因修正和后测后会形成。")}
+      </div>
+      ${(panel.evidenceSources || []).length ? `<div class="effect-source-strip">${panel.evidenceSources.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}
+    </${Tag}>
+  `;
+}
+
+function renderCollaborationEvidencePanel(collaboration = {}) {
+  const group = collaboration.groupSpace || {};
+  const roles = Array.isArray(group.roles) ? group.roles : [];
+  const questions = Array.isArray(group.questionPool) ? group.questionPool : [];
+  const timeline = Array.isArray(group.timeline) ? group.timeline : [];
+  return `
+    <section class="panel portfolio-section collaboration-evidence-panel">
+      <div class="split-head">
+        <div>
+          <h3>群体协作学习</h3>
+          <p>${escapeHtml(collaboration.contributionHint || "可作为轻量小组空间，记录问题池、分工、AI 摘要和贡献证据。")}</p>
+        </div>
+        <strong>${Number(collaboration.chatThreads || 0)} 组</strong>
+      </div>
+      <div class="collab-grid">
+        <article><strong>共建知识图谱</strong><p>${escapeHtml(group.graphCoBuild || "可从图谱标注和学习卡片沉淀贡献。")}</p></article>
+        <article><strong>小组问题池</strong><p>${escapeHtml(questions.slice(0, 4).join("；") || "暂无问题池，可从错题和 AI 追问生成。")}</p></article>
+        <article><strong>AI 讨论摘要</strong><p>${escapeHtml(group.aiDiscussionSummary || "暂无讨论摘要。")}</p></article>
+        <article><strong>同伴互评</strong><p>${escapeHtml(group.peerReview || "可在作业或项目提交后补充同伴互评。")}</p></article>
+      </div>
+      <div class="collab-role-list">
+        ${roles.map((item) => `<span><strong>${escapeHtml(item.role)}</strong>${escapeHtml(item.evidence || "")}</span>`).join("")}
+      </div>
+      ${timeline.length ? `<div class="portfolio-timeline-list collab-timeline">${timeline.map((item) => `<article><time>${escapeHtml(fmtTime(item.time))}</time><div><strong>${escapeHtml(item.title || "协作事件")}</strong><p>${escapeHtml(item.summary || "")}</p></div></article>`).join("")}</div>` : ""}
+    </section>
+  `;
+}
+
+function aiReviewTypeLabel(type = "") {
+  return {
+    accepted: "我采纳",
+    partial_accept: "我部分采纳",
+    challenge: "我质疑",
+    ai_error: "我发现 AI 错误",
+    citation_needed: "需要资料引用验证",
+    topic_error: "知识点定位错误",
+    unclear_explanation: "解释不清",
+    citation_issue: "引用不准",
+    over_helping: "过度代答"
+  }[String(type || "")] || type || "AI 审辩";
+}
+
+function renderAiReviewList(reviews = []) {
+  return `
+    <div class="portfolio-card-list ai-review-list">
+      ${reviews.slice(0, 8).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.topic || item.reviewType || "AI 审辩记录")}</strong>
+          <span>${escapeHtml(fmtTime(item.createdAt))} · ${escapeHtml(aiReviewTypeLabel(item.reviewType))} · ${item.trustScore === null || item.trustScore === undefined ? "未评分" : percentText(item.trustScore)}</span>
+          <p>${escapeHtml(item.finalJudgment || item.comment || item.studentAction || "学生已记录对 AI 回答的判断。")}</p>
+          ${item.verificationNeed ? `<small>${escapeHtml(item.verificationNeed)}</small>` : ""}
+        </article>
+      `).join("") || emptyBlock("暂无 AI 审辩记录。可在 AI 侧栏标记定位错误、解释不清或引用不准。")}
+    </div>
+  `;
+}
+
+function renderStructuredReflectionForm(context = {}) {
+  const subject = context.subject || currentStudentPortfolio().summary?.subject || preferredSubject();
+  const topic = context.knowledgePoint || context.topic || "";
+  return `
+    <form class="reflection-form stack" data-reflection-form>
+      <input type="hidden" name="contextType" value="${escapeHtml(context.contextType || "learning")}" />
+      <input type="hidden" name="contextId" value="${escapeHtml(context.contextId || "")}" />
+      <input type="hidden" name="contextTitle" value="${escapeHtml(context.contextTitle || "")}" />
+      <input type="hidden" name="subject" value="${escapeHtml(subject)}" />
+      <label>知识点<input name="knowledgePoint" value="${escapeHtml(topic)}" placeholder="例如：K 近邻、逻辑回归、支持向量机" /></label>
+      <label>我原来的理解是什么？<textarea name="originalUnderstanding" rows="2" required placeholder="写下自己的原始理解或解题思路"></textarea></label>
+      <label>AI 帮我发现了什么问题？<textarea name="aiDiscovery" rows="2" required placeholder="记录 AI 指出的误区、证据或追问"></textarea></label>
+      <label>我是否同意 AI 的解释？<textarea name="aiAgreement" rows="2" placeholder="写下同意、部分同意或不同意的理由"></textarea></label>
+      <label>我修改了哪些知识点或学习策略？<textarea name="strategyChange" rows="2" required placeholder="记录修正后的理解和学习策略变化"></textarea></label>
+      <label>我还不确定什么？<textarea name="uncertainty" rows="2" placeholder="记录仍需验证的问题"></textarea></label>
+      <label>哪些地方 AI 没帮上忙？<textarea name="aiLimitation" rows="2" placeholder="记录 AI 没有解释清楚、引用不足或需要人工判断的地方"></textarea></label>
+      <label>下一次学习计划是什么？<textarea name="nextPlan" rows="2" required placeholder="写下一步测试、复习或实验计划"></textarea></label>
+      <label>我如何避免过度依赖 AI？<textarea name="antiOverreliance" rows="2" placeholder="例如：先作答、查引用、做验证题、保留最终判断"></textarea></label>
+      <label>AI 使用边界<input name="aiUseBoundary" value="AI 用于提示、引用和诊断；最终理解、作答和反思由学生确认。" /></label>
+      <button class="primary" type="submit">保存反思</button>
+    </form>
+  `;
+}
+
 function renderStudentHomePage() {
+  const portfolio = currentStudentPortfolio();
+  const cycle = portfolio.learningCycle || {};
+  const counts = cycle.evidenceCounts || {};
   const homework = state.data.homework || [];
   const submissions = state.data.submissions || [];
-  const graphs = state.data.knowledgeGraphs || [];
   const classes = state.data.classes || [];
-  const materials = state.data.courseMaterials || [];
-  const conversations = state.data.conversations || [];
-  const wrongNotes = state.data.wrongNotes || [];
-  const analytics = state.data.learningAnalytics || {};
   const submittedIds = new Set(submissions.filter((item) => item.studentId === state.user.id).map((item) => item.homeworkId));
   const pendingHomework = homework.filter((item) => !submittedIds.has(item.id));
-  const latestConversation = conversations[0];
-  const hasRealMastery = Number(analytics.summary?.count || 0) > 0;
-  const weak = hasRealMastery ? (analytics.summary?.weak || []) : [];
+  const masteryRows = portfolio.masteryComparison || [];
+  const weakTopics = masteryRows.filter((item) => Number(item.current || 0) < 0.58).slice(0, 4);
+  const masteredTopics = masteryRows.filter((item) => Number(item.current || 0) >= 0.78);
+  const consolidatingTopics = masteryRows.filter((item) => Number(item.current || 0) >= 0.58 && Number(item.current || 0) < 0.78);
+  const riskTopics = weakTopics.length ? weakTopics : (portfolio.misconceptionTrajectory || []).slice(0, 2);
+  const nextTask = cycle.nextTask || (cycle.tasks || []).find((task) => !task.done) || {};
+  const stageProgress = Number(cycle.currentStage?.progress || 0);
+  const stageLabel = cycle.currentStage?.activeLabel || "概念辨析与损失函数";
+  const focusTopic = cycle.focusNodes?.[0] || weakTopics[0]?.topic || "逻辑回归与损失函数";
+  const primaryRiskTopic = riskTopics[0]?.topic || "过拟合与欠拟合区分";
+  const effectPanel = portfolio.effectPanel || {};
+  const effectMetrics = Array.isArray(effectPanel.metrics) ? effectPanel.metrics : [];
+  const scoreMetric = effectMetrics.find((item) => /测|分|得分/.test(item.label || "")) || effectMetrics[0] || {};
+  const growthDrivers = effectMetrics.slice(0, 3).map((item) => item.label).filter(Boolean);
+  const evidenceItems = [
+    { label: "诊断", value: counts.knowledgeTests || 0 },
+    { label: "订正", value: counts.wrongNotes || counts.wrongFixes || portfolio.corrections?.length || 0 },
+    { label: "AI 对话", value: counts.aiDialogues || 0 },
+    { label: "实验作品", value: counts.learningOutputs || portfolio.works?.length || 0 },
+    { label: "反思", value: counts.reflections || portfolio.reflections?.length || 0 }
+  ];
+  const recommendationSteps = [
+    { title: "概念辨析", detail: "先完成“交叉熵损失”概念辨析题", page: "graph" },
+    { title: "微课回看", detail: "再观看“梯度下降更新过程”微课", page: "graph" },
+    { title: "代码验证", detail: "最后完成逻辑回归代码实验的第 2 步", page: "models" }
+  ];
+  if (!state.cycleViewMode) state.cycleViewMode = cycle.viewMode || "stage";
   return `
-    <div class="workbench-page student-home-workbench">
-    <section class="workbench-title">
-      <div>
-        <h2>学习首页</h2>
-        <p>作业、复习、图谱和最近对话集中展示；掌握度只来自真实问答、测验或批改记录。</p>
-      </div>
-      <div class="actions compact-actions">
-        <button class="primary" data-dashboard-page="ai">问 AI</button>
-        <button class="mini" data-dashboard-page="homework">作业</button>
-        <button class="mini" data-dashboard-page="graph">图谱</button>
-        <button class="mini" data-dashboard-page="models">实验室</button>
-      </div>
-    </section>
-    <section class="dashboard-stats compact">
-      ${renderDashboardStat("待完成作业", pendingHomework.length, submissions.length ? `${submissions.length} 份已提交` : "尚未提交")}
-      ${renderDashboardStat("真实掌握记录", analytics.summary?.count || 0, hasRealMastery ? `平均 ${percentText(analytics.summary.average)}` : "暂无真实诊断")}
-      ${renderDashboardStat("错题记录", wrongNotes.length, wrongNotes[0] ? wrongNotes[0].topic : "完成练习后生成")}
-      ${renderDashboardStat("可学习图谱", graphs.length, "由教师开放或自己生成")}
-    </section>
-    <div class="home-workbench-grid student">
+    <div class="workbench-page student-home-workbench learning-cycle-home ml-cockpit-home">
+      <section class="ml-cockpit-heading">
+        <div>
+          <span class="cycle-eyebrow">机器学习个性化学习驾驶舱</span>
+          <h2>你好，${escapeHtml(state.user?.name || "同学")}。让诊断决定下一步学习。</h2>
+          <p>当前围绕“学什么、卡在哪里、下一步做什么”组织你的学习路径与成效证据。</p>
+        </div>
+        <button class="mini" type="button" data-cycle-settings-open>调整学习周期</button>
+      </section>
+
+      <section class="ml-cockpit-top-grid">
+        <article class="panel ml-current-task-card">
+          <div class="cockpit-card-kicker"><span>我现在学什么</span><span>${escapeHtml(cycle.rangeText || "本周学习任务")}</span></div>
+          <h3>正在攻克：${escapeHtml(focusTopic)}</h3>
+          <p>${escapeHtml((cycle.goals || []).join("；") || "理解逻辑回归的分类边界，能解释损失函数并完成一次代码验证。")}</p>
+          <div class="ml-task-meta"><span>当前阶段：${escapeHtml(stageLabel)}</span><span>预计 35 分钟</span></div>
+          <div class="ml-progress-row"><div><i style="width:${Math.max(4, Math.min(stageProgress, 100))}%"></i></div><strong>${stageProgress}%</strong></div>
+          <button class="primary" type="button" data-dashboard-page="${escapeHtml(nextTask.page || "graph")}">继续学习</button>
+        </article>
+        <article class="panel ml-diagnosis-card">
+          <div class="cockpit-card-kicker"><span>我卡在哪里</span><span>诊断驱动</span></div>
+          <h3>学习诊断摘要</h3>
+          <p>点击任一状态，定位到知识图谱的对应节点。</p>
+          <div class="ml-diagnosis-summary">
+            <button type="button" data-cockpit-graph-filter="mastered"><strong>${masteredTopics.length}</strong><span>已掌握</span></button>
+            <button type="button" data-cockpit-graph-filter="weak"><strong>${consolidatingTopics.length}</strong><span>待巩固</span></button>
+            <button type="button" class="risk" data-cockpit-graph-filter="misconception"><strong>${riskTopics.length}</strong><span>存在错因风险</span></button>
+          </div>
+          <p class="ml-risk-copy">优先处理：${escapeHtml(primaryRiskTopic)}</p>
+        </article>
+      </section>
+
+      <section class="ml-cockpit-mid-grid">
+        <article class="panel ml-recommendation-card">
+          <div class="split-head"><div><span class="cockpit-section-label">下一步做什么</span><h3>今日个性化建议</h3></div><button class="mini" data-dashboard-page="ai">让 AI 诊断</button></div>
+          <ol class="ml-recommendation-list">
+            ${recommendationSteps.map((item, index) => `<li><b>${index + 1}</b><button type="button" data-dashboard-page="${item.page}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.detail)}</span></button></li>`).join("")}
+          </ol>
+        </article>
+        <article class="panel ml-growth-card">
+          <div class="split-head"><div><span class="cockpit-section-label">学习成效</span><h3>前测 / 后测成长</h3></div><strong class="ml-growth-rate">${escapeHtml(effectPanel.learningGainText || "持续积累中")}</strong></div>
+          <div class="ml-score-strip">
+            <span><small>前测分</small><b>${escapeHtml(scoreMetric.before || "待测")}</b></span>
+            <span><small>当前分</small><b>${escapeHtml(scoreMetric.after || (portfolio.summary?.averageMastery !== null && portfolio.summary?.averageMastery !== undefined ? percentText(portfolio.summary.averageMastery) : "待测"))}</b></span>
+            <span><small>后测分</small><b>${escapeHtml(effectPanel.postScore || "待后测")}</b></span>
+          </div>
+          <p>成长来自：${escapeHtml(growthDrivers.join("、") || "完成前测、概念订正与针对性练习后自动归因")}</p>
+        </article>
+      </section>
+
+      <section class="ml-cockpit-bottom-grid">
+        <article class="panel ml-misconception-card">
+          <div class="split-head"><div><span class="cockpit-section-label">错因追踪</span><h3>先修正，再进入下一模块</h3></div><button class="mini" data-cockpit-graph-filter="misconception">查看节点</button></div>
+          <p>你在“${escapeHtml(primaryRiskTopic)}”中连续出现概念混淆，建议完成 2 道变式题后再进入模型评估模块。</p>
+          <div class="ml-correction-tags"><span>错因：概念边界混淆</span><span>建议：变式练习 x2</span></div>
+        </article>
+        <article class="panel ml-evidence-card">
+          <div class="split-head"><div><span class="cockpit-section-label">学习证据</span><h3>每一步都可追溯</h3></div><button class="mini" data-dashboard-page="portfolio">进入档案</button></div>
+          <div class="ml-evidence-counts">${evidenceItems.map((item) => `<button type="button" data-dashboard-page="portfolio"><strong>${item.value}</strong><span>${escapeHtml(item.label)}</span></button>`).join("")}</div>
+        </article>
+      </section>
+
+      <details class="secondary-content disclosure-panel">
+        <summary>查看本轮完整计划与证据任务</summary>
+        <div class="disclosure-body">
+          ${renderLearningCycleEditor(cycle)}
+          <div class="cycle-dashboard-grid">
       ${!classes.length ? `
         <section class="panel dashboard-card home-wide-card student-onboarding">
           <div class="split-head">
             <div>
               <h3>还没有加入班级</h3>
-              <p class="hint">${materials.length ? "已有教师公开资料可用；加入班级后会同步显示该班作业和消息。" : "加入班级后会看到该班作业和消息；资料只展示老师公开为学生可检索的内容。"}</p>
+              <p class="hint">加入班级后会同步显示班级作业、小组共学记录和教师反馈。</p>
             </div>
             <button class="primary" data-dashboard-page="homework">输入邀请码加入</button>
           </div>
         </section>
       ` : ""}
-      ${graphs.length ? `
-        <section class="panel dashboard-card">
-          <div class="split-head">
-            <h3>可学习图谱</h3>
-            <button class="mini" data-dashboard-page="graph">进入图谱</button>
+      <section class="panel dashboard-card cycle-task-card">
+        <div class="split-head">
+          <h3>周期任务追踪</h3>
+          <button class="mini" data-dashboard-page="graph">进入图谱</button>
+        </div>
+        <div class="cycle-task-list">
+          ${(cycle.tasks || []).filter((task) => !task.done).slice(0, 4).map((task, index) => `<button type="button" data-dashboard-page="${escapeHtml(task.page || "portfolio")}"><b>${index + 1}</b><span><strong>${escapeHtml(task.label)}</strong><small>${escapeHtml(task.statusLabel || "")} · ${escapeHtml(task.evidenceType || "")} · ${escapeHtml(task.gap || "")}</small>${escapeHtml(task.nextAction || task.evidence || "")}</span></button>`).join("") || `<button type="button" data-dashboard-page="graph"><b>1</b><span><strong>进入知识图谱</strong><small>定位薄弱节点并完成本轮诊断任务</small></span></button>`}
+        </div>
+      </section>
+      <section class="panel dashboard-card cycle-activity-card">
+        <div class="split-head">
+          <h3>当前学习活动</h3>
+          <button class="mini" data-dashboard-page="ai">问 AI</button>
+        </div>
+        <div class="cycle-action-grid">
+          ${renderDashboardAction("ai", "AI 对话", "先作答，再让 AI 诊断理解缺口", true)}
+          ${renderDashboardAction("graph", "图谱节点学习", "按掌握状态复习并完成节点验证")}
+          ${renderDashboardAction("graph", "知识测试", "生成题目、作答、诊断、反思、入档")}
+          ${renderDashboardAction("models", "代码实验", "上传或运行算法实验作为作品证据")}
+        </div>
+      </section>
+      <section class="panel dashboard-card cycle-feedback-card">
+        <div class="split-head">
+          <h3>证据与反馈</h3>
+          <button class="mini" data-dashboard-page="portfolio">学习档案</button>
+        </div>
+        <div class="dashboard-list">
+          ${weakTopics.map((item) => `<article><strong>${escapeHtml(item.topic)}</strong><span>当前 ${escapeHtml(item.currentText)} · ${escapeHtml(item.changeText)} · 需要巩固</span></article>`).join("") || `<article><strong>暂无薄弱点</strong><span>完成前测、AI 诊断或作业批改后会显示。</span></article>`}
+          ${(portfolio.corrections || []).slice(0, 2).map((item) => `<article><strong>已纠正：${escapeHtml(item.correctedTopic)}</strong><span>原识别 ${escapeHtml(item.fromTopic || "未记录")} · ${fmtTime(item.createdAt)}</span></article>`).join("")}
+        </div>
+      </section>
+      ${renderAnswerFirstCard(cycle)}
+      ${renderCyclePlanView(cycle)}
+      ${renderCycleCompletionCard(cycle)}
+      <section class="panel dashboard-card cycle-timeline-card">
+        <div class="split-head">
+          <h3>学习时间线</h3>
+          <button class="mini" data-dashboard-page="portfolio">查看完整档案</button>
+        </div>
+        ${renderPortfolioTimelineList(portfolio.timeline || [], 5)}
+      </section>
+      <section class="panel dashboard-card cycle-task-progress-card">
+        <div class="split-head">
+          <h3>周期任务追踪</h3>
+          <span>${Number(cycle.currentStage?.progress || 0)}%</span>
+        </div>
+        ${renderCycleTaskTracker(cycle, 6)}
+      </section>
+      <section class="panel dashboard-card cycle-reflection-card">
+        <div class="split-head">
+          <h3>待完成反思</h3>
+          <span>${counts.reflections || 0} 条已入档</span>
+        </div>
+        ${renderStructuredReflectionForm({ contextType: "cycle", contextTitle: cycle.title || "学习周期", subject: cycle.subject || preferredSubject() })}
+      </section>
           </div>
-          <div class="dashboard-list compact">
-            ${graphs.slice(0, 4).map((graph) => `<article><strong>${escapeHtml(graph.title)}</strong><span>${escapeHtml(graph.subject)} · ${(graph.nodes || []).length} 个知识点 · ${graph.global ? "教师已开放" : "个人图谱"}</span></article>`).join("")}
-          </div>
-        </section>
-      ` : ""}
-      <section class="panel dashboard-card home-priority-card">
-        <div class="split-head">
-          <h3>今日学习</h3>
-          <button class="mini" data-dashboard-page="homework">作业提交</button>
         </div>
-        <div class="dashboard-list">
-          ${pendingHomework.slice(0, 4).map((item) => `<article><strong>${escapeHtml(item.title)}</strong><span>${fmtTime(item.createdAt)} · 双击作业卡片查看并提交</span></article>`).join("") || renderDashboardEmpty("当前没有待完成作业。可以进入对话或知识图谱继续复习。", "ai", "开始提问")}
-        </div>
-      </section>
-      <section class="panel dashboard-card">
-        <div class="split-head">
-          <h3>真实诊断</h3>
-          <button class="mini" data-dashboard-page="graph">查看图谱</button>
-        </div>
-        <div class="dashboard-list">
-          ${weak.slice(0, 4).map((item) => `<article><strong>${escapeHtml(item.topic)}</strong><span>掌握度 ${percentText(item.score)} · ${escapeHtml(item.status || "需要复习")}</span></article>`).join("") || renderDashboardEmpty("暂无真实薄弱点。完成一次问答或教师确认批改后会生成学习画像。", "ai", "做一次诊断")}
-        </div>
-      </section>
-      <section class="panel dashboard-card">
-        <div class="split-head">
-          <h3>继续学习</h3>
-          <button class="mini" data-dashboard-page="ai">打开对话</button>
-        </div>
-        <div class="dashboard-list">
-          ${latestConversation ? `<article><strong>${escapeHtml(latestConversation.title || "最近对话")}</strong><span>${escapeHtml(aiModeLabel(latestConversation.mode || "qa"))} · ${fmtTime(latestConversation.updatedAt)}</span></article>` : renderDashboardEmpty("还没有学习对话。可以先问一个概念、一道题或一个复习计划。", "ai", "发起第一次对话")}
-          ${wrongNotes.slice(0, 3).map((note) => `<article><strong>${escapeHtml(note.topic || "错题")}</strong><span>${escapeHtml(compactText(note.analysis || note.question || "", 56))}</span></article>`).join("")}
-        </div>
-      </section>
-    </div>
+      </details>
     </div>
   `;
+}
+
+function renderAiSupportRecords(records = []) {
+  return `
+    <div class="portfolio-card-list">
+      ${records.slice(0, 8).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.topic || "AI 支持")}</strong>
+          <span>${escapeHtml(fmtTime(item.time))} · ${escapeHtml(item.confidence || "置信度待确认")}</span>
+          <p>${escapeHtml(item.prompt || item.help || "")}</p>
+          ${item.citations?.length ? `<small>引用：${escapeHtml(item.citations.join("、"))}</small>` : `<small>暂无引用或等待工作流返回引用。</small>`}
+        </article>
+      `).join("") || emptyBlock("暂无 AI 支持记录。完成一次 AI 对话后会显示帮助方式、引用资料和采纳记录。")}
+    </div>
+  `;
+}
+
+function renderWorkEvidence(works = []) {
+  return `
+    <div class="portfolio-card-list">
+      ${works.slice(0, 10).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.title || "作品证据")}</strong>
+          <span>${escapeHtml(item.type || "")} · ${escapeHtml(fmtTime(item.time))} · ${escapeHtml([item.status, item.score].filter(Boolean).join(" · "))}</span>
+          <p>${escapeHtml(item.summary || "已作为学习产出入档。")}</p>
+        </article>
+      `).join("") || emptyBlock("暂无作品证据。提交作业、上传项目报告或保存模型实验后会显示。")}
+    </div>
+  `;
+}
+
+function renderNodeAnnotationEvidence(items = []) {
+  return `
+    <div class="portfolio-card-list node-annotation-evidence">
+      ${items.slice(0, 10).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.nodeLabel || "图谱节点")}</strong>
+          <span>${escapeHtml(item.graphTitle || "知识图谱")} · ${escapeHtml(item.statusLabel || "")}${item.favorite ? " · 已收藏" : ""}${item.fromAiAnswer ? " · AI 学习卡片" : ""}</span>
+          <p>${escapeHtml(item.explanation || item.evidenceTitle || "学生已把该节点作为学习证据入档。")}</p>
+        </article>
+      `).join("") || emptyBlock("暂无图谱建构证据。进入知识图谱节点后，可收藏、标注掌握状态、写自己的解释，并把 AI 回答转成学习卡片。")}
+    </div>
+  `;
+}
+
+function renderMisconceptionTrajectory(items = []) {
+  return `
+    <div class="portfolio-card-list misconception-list">
+      ${items.slice(0, 8).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.topic)}</strong>
+          <p><b>原理解：</b>${escapeHtml(item.before || "待补充")}</p>
+          <p><b>问题：</b>${escapeHtml(item.issue || "待补充")}</p>
+          <p><b>修正：</b>${escapeHtml(item.after || "待补充")}</p>
+        </article>
+      `).join("") || emptyBlock("暂无错因变化。错题本、AI 诊断和反思会共同形成修正轨迹。")}
+    </div>
+  `;
+}
+
+function renderReflectionList(reflections = []) {
+  return `
+    <div class="portfolio-card-list reflection-list">
+      ${reflections.slice(0, 10).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.knowledgePoint || item.contextTitle || "学习反思")}</strong>
+          <span>${escapeHtml(fmtTime(item.createdAt))} · ${escapeHtml(item.contextType || "learning")}</span>
+          <p><b>原理解：</b>${escapeHtml(item.originalUnderstanding || "未填写")}</p>
+          <p><b>AI 发现：</b>${escapeHtml(item.aiDiscovery || "未填写")}</p>
+          <p><b>我的判断：</b>${escapeHtml(item.aiAgreement || "未填写")}</p>
+          <p><b>策略变化：</b>${escapeHtml(item.strategyChange || "未填写")}</p>
+          <p><b>AI 局限：</b>${escapeHtml(item.aiLimitation || "未填写")}</p>
+          <p><b>下一步：</b>${escapeHtml(item.nextPlan || "未填写")}</p>
+          <p><b>避免依赖：</b>${escapeHtml(item.antiOverreliance || item.aiUseBoundary || "未填写")}</p>
+        </article>
+      `).join("") || emptyBlock("暂无结构化反思。保存一次反思后会显示学习策略变化和 AI 使用边界。")}
+    </div>
+  `;
+}
+
+function renderEthicsSettingsPanel(portfolio = currentStudentPortfolio()) {
+  const settings = {
+    aiUseDisclosure: true,
+    citationRequired: true,
+    uncertaintyNotice: true,
+    dataConsent: true,
+    anonymousExportDefault: true,
+    requireOriginalAnswerFirst: true,
+    allowTeacherPrivateConversationAccess: false,
+    aiFinalAnswerBlocked: true,
+    ...(portfolio.ethics?.settings || state.data?.studentEthicsSettings || {})
+  };
+  const checked = (key) => settings[key] ? "checked" : "";
+  return `
+    <section class="panel portfolio-section portfolio-wide ethics-settings-panel">
+      <div class="split-head">
+        <div>
+          <h3>AI 使用规范与学术诚信</h3>
+          <p class="hint">把 AI 辅助、引用、隐私授权和先作答再求助前台化，避免参赛评审误解为 AI 代学。</p>
+        </div>
+      </div>
+      <form class="ethics-settings-form" data-ethics-settings-form>
+        <label class="check-line"><input type="checkbox" name="aiUseDisclosure" ${checked("aiUseDisclosure")} />展示 AI 使用声明</label>
+        <label class="check-line"><input type="checkbox" name="citationRequired" ${checked("citationRequired")} />AI 回答强制记录引用来源</label>
+        <label class="check-line"><input type="checkbox" name="uncertaintyNotice" ${checked("uncertaintyNotice")} />低置信度和不确定性提示</label>
+        <label class="check-line"><input type="checkbox" name="dataConsent" ${checked("dataConsent")} />授权本学习周期数据进入个人档案</label>
+        <label class="check-line"><input type="checkbox" name="anonymousExportDefault" ${checked("anonymousExportDefault")} />默认匿名导出</label>
+        <label class="check-line"><input type="checkbox" name="requireOriginalAnswerFirst" ${checked("requireOriginalAnswerFirst")} />先作答再求助</label>
+        <label class="check-line"><input type="checkbox" name="aiFinalAnswerBlocked" ${checked("aiFinalAnswerBlocked")} />AI 内容不直接作为最终答案</label>
+        <label class="check-line"><input type="checkbox" name="allowTeacherPrivateConversationAccess" ${checked("allowTeacherPrivateConversationAccess")} />允许教师查看私密对话全文</label>
+        <button class="primary" type="submit">保存规范设置</button>
+      </form>
+      <details class="privacy-request-box">
+        <summary>个人学习数据管理</summary>
+        <form data-data-deletion-request-form>
+          <label>清理范围<input name="scopes" value="learningEvents,studentReflections,aiAnswerReviews,studentNodeAnnotations" /></label>
+          <label>原因说明<input name="reason" placeholder="例如：本轮演示结束后申请清理个人学习记录" /></label>
+          <button class="danger" type="submit">提交删除申请</button>
+        </form>
+        <div class="portfolio-card-list compact">
+          ${(state.data?.studentDataDeletionRequests || []).slice(0, 3).map((item) => `<article><strong>${escapeHtml(item.status || "requested")}</strong><span>${escapeHtml(fmtTime(item.createdAt))}</span><p>${escapeHtml((item.scopes || []).join("、"))}</p></article>`).join("") || `<p class="hint">暂无删除申请。为防止误删，系统先记录申请并进入审计日志。</p>`}
+        </div>
+      </details>
+    </section>
+  `;
+}
+
+function renderGrowthEvidencePack(portfolio) {
+  const cycle = portfolio.learningCycle || {};
+  const counts = cycle.evidenceCounts || {};
+  const comparison = portfolio.masteryComparison || [];
+  const first = comparison.slice().sort((a, b) => String(a.firstAt || a.lastAt || "").localeCompare(String(b.firstAt || b.lastAt || "")))[0] || {};
+  const weak = comparison.filter((item) => Number(item.current || 0) < 0.58).slice(0, 3);
+  const effect = portfolio.effectPanel || {};
+  const evidenceSections = [
+    { key: "start", label: "学习起点", icon: "01", title: "我从哪里出发", summary: `前测 ${first.startText || "待形成"} · 初始掌握度 ${first.startText || percentText(portfolio.summary?.averageMastery || 0) || "待诊断"}`, items: [weak.length ? `初始薄弱点：${weak.map((item) => item.topic).join("、")}` : "初始薄弱点将在前测后自动归档", `前测知识点：${comparison.length || "待形成"} 个`] },
+    { key: "process", label: "过程证据", icon: "02", title: "我怎样学习", summary: "AI 诊断、学习路径和练习过程均可追溯", items: [`AI 诊断/对话：${counts.aiDialogues || 0} 次`, `知识测试：${counts.knowledgeTests || 0} 次`, `订正记录：${counts.corrections || counts.wrongNotes || 0} 条`] },
+    { key: "misconception", label: "错因轨迹", icon: "03", title: "我如何修正", summary: `${(portfolio.misconceptionTrajectory || []).length} 条错因记录，显示干预与复测结果`, items: (portfolio.misconceptionTrajectory || []).slice(0, 2).map((item) => `${item.topic}：${item.currentStatus || "持续追踪"}`) },
+    { key: "outcome", label: "成果证据", icon: "04", title: "我学会了什么", summary: `掌握度提升 ${effect.learningGainText || "持续积累中"}`, items: [`后测成绩：${effect.postScore || "待后测"}`, `实验/作品：${counts.modelExperiments || counts.learningOutputs || 0} 件`, `能力变化：${effect.masteryImproved || 0} 个知识点改善`] },
+    { key: "reflection", label: "学习反思", icon: "05", title: "我怎样理解并迁移", summary: `${counts.reflections || 0} 份结构化反思`, items: ["原来怎么想 → 为什么错 → 如何修正 → 如何迁移", ...(portfolio.reflectionExcerpts || []).slice(0, 1).map((item) => item.text)] },
+    { key: "teacher", label: "教师评价", icon: "06", title: "教师如何确认成长", summary: `${(portfolio.teacherEvaluations || []).length} 条教师反馈`, items: (portfolio.teacherEvaluations || []).slice(0, 2).map((item) => item.comment || item.summary || "教师已查看学习过程") }
+  ];
+  return `
+    <section class="panel growth-evidence-pack">
+      <div class="growth-pack-head"><div><span class="cycle-eyebrow">LEARNING GROWTH EVIDENCE PACK</span><h2>我的学习成长证据包</h2><p>把学习起点、学习过程、错因修正、成果变化、个人反思和教师确认组织成一份可导出的成长证据。</p></div><strong>${Number(cycle.currentStage?.progress || 0)}%<small>学习周期完成度</small></strong></div>
+      <div class="growth-pack-grid">
+        ${evidenceSections.map((item) => `<article class="growth-pack-card evidence-${item.key}"><div class="growth-pack-card-top"><span>${item.icon}</span><b>${item.label}</b></div><h3>${item.title}</h3><p>${escapeHtml(item.summary)}</p><ul>${item.items.map((line) => `<li>${escapeHtml(line || "待补充")}</li>`).join("")}</ul></article>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderMisconceptionEvidenceCards(items = []) {
+  return `<div class="misconception-evidence-grid">${items.slice(0, 6).map((item) => `
+    <article class="misconception-evidence-card"><div class="split-head"><h3>${escapeHtml(item.topic || "待归类错因")}</h3><span class="${item.currentStatus === "已消除" ? "status-good" : "status-risk"}">${escapeHtml(item.currentStatus || "追踪中")}</span></div>
+    <dl><div><dt>首次发现</dt><dd>${escapeHtml(item.firstFound || fmtTime(item.time) || "待记录")}</dd></div><div><dt>AI 诊断</dt><dd>${escapeHtml(item.issue || "指标概念混淆")}</dd></div><div><dt>干预方式</dt><dd>${escapeHtml(item.intervention || "概念对比微课 + 变式题")}</dd></div><div><dt>复测结果</dt><dd>${escapeHtml(item.retestResult || "待复测")}</dd></div></dl><p class="misconception-transfer"><b>迁移提示：</b>${escapeHtml(item.transfer || "完成新场景变式题，验证是否能迁移。")}</p></article>
+  `).join("") || emptyBlock("暂无错因轨迹。完成前测、诊断或订正后会生成单个错因追踪卡。")}</div>`;
+}
+
+function renderStudentPortfolioPage() {
+  if (state.user.role !== "student") return emptyBlock("学习档案仅面向学生账号。");
+  const portfolio = currentStudentPortfolio();
+  const cycle = portfolio.learningCycle || {};
+  const counts = cycle.evidenceCounts || {};
+  return `
+    <div class="portfolio-page-shell">
+      <section class="workbench-title portfolio-title">
+        <div>
+          <h2>我的学习成长证据包</h2>
+          <p>${escapeHtml(cycle.title || "学习周期")} · ${escapeHtml(portfolio.summary?.student?.name || state.user.name)} · ${escapeHtml(portfolio.summary?.subject || preferredSubject())}</p>
+        </div>
+        ${renderPortfolioExportActions()}
+      </section>
+      ${renderGrowthEvidencePack(portfolio)}
+      <section class="panel portfolio-section portfolio-wide misconception-tracking-section">
+        <div class="split-head"><div><h3>单个错因追踪</h3><p class="hint">从首次发现到复测消除，保留每一次干预如何改变理解的证据。</p></div><span>${(portfolio.misconceptionTrajectory || []).length} 条</span></div>
+        ${renderMisconceptionEvidenceCards(portfolio.misconceptionTrajectory || [])}
+      </section>
+      <section class="panel portfolio-cycle-panel">
+        <div class="split-head">
+          <div>
+            <h3>学习闭环证据链</h3>
+            <p class="hint">前测诊断、AI 学习、知识测试、错因修正、反思总结和后测都记录为可导出的学习证据。</p>
+          </div>
+          <strong>${Number(cycle.currentStage?.progress || 0)}%</strong>
+        </div>
+        ${renderStageStrip(cycle.currentStage)}
+        ${renderEvidenceMiniStats(counts)}
+        ${renderCycleTaskTracker(cycle, 6)}
+        ${renderLearningCycleEditor(cycle)}
+      </section>
+      <details class="secondary-content disclosure-panel portfolio-more-panel">
+        <summary>查看完整学习档案与管理工具</summary>
+        <div class="disclosure-body">
+          ${renderInnovationLoopCard(portfolio)}
+          <div class="portfolio-grid">
+        ${renderGraphRagProfileCard(portfolio)}
+        ${renderLearningEffectPanel(portfolio.effectPanel || {})}
+        ${renderDeclarationEvidencePack(portfolio.declarationEvidencePack || {})}
+        <section class="panel portfolio-section portfolio-wide">
+          <div class="split-head">
+            <h3>学习时间线</h3>
+            <span>${(portfolio.timeline || []).length} 条</span>
+          </div>
+          ${renderPortfolioTimelineList(portfolio.timeline || [], 14)}
+        </section>
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>前测/后测对比</h3>
+            <span>${(portfolio.masteryComparison || []).length} 个知识点</span>
+          </div>
+          ${renderMasteryComparisonRows(portfolio.masteryComparison || [], 10)}
+        </section>
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>AI 支持记录</h3>
+            <span>${(portfolio.aiSupportRecords || []).length} 条</span>
+          </div>
+          ${renderAiSupportRecords(portfolio.aiSupportRecords || [])}
+        </section>
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>AI 审辩记录</h3>
+            <span>${(portfolio.aiReviews || []).length} 条</span>
+          </div>
+          ${renderAiReviewList(portfolio.aiReviews || [])}
+        </section>
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>作品证据</h3>
+            <span>${(portfolio.works || []).length} 条</span>
+          </div>
+          ${renderWorkEvidence(portfolio.works || [])}
+        </section>
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>图谱建构证据</h3>
+            <span>${(portfolio.nodeAnnotations || []).length} 条</span>
+          </div>
+          ${renderNodeAnnotationEvidence(portfolio.nodeAnnotations || [])}
+        </section>
+        ${renderCollaborationEvidencePanel(portfolio.collaboration || {})}
+        <section class="panel portfolio-section">
+          <div class="split-head">
+            <h3>错因变化</h3>
+            <span>${(portfolio.misconceptionTrajectory || []).length} 条</span>
+          </div>
+          ${renderMisconceptionTrajectory(portfolio.misconceptionTrajectory || [])}
+        </section>
+        <section class="panel portfolio-section portfolio-wide">
+          <div class="split-head">
+            <h3>个人反思</h3>
+            <span>${(portfolio.reflections || []).length} 条</span>
+          </div>
+          ${renderReflectionList(portfolio.reflections || [])}
+        </section>
+        <section class="panel portfolio-section portfolio-wide">
+          <div class="split-head">
+            <h3>新增结构化反思</h3>
+            <span>直接作为参赛材料</span>
+          </div>
+          ${renderStructuredReflectionForm({ contextType: "portfolio", contextTitle: "学习档案", subject: portfolio.summary?.subject || preferredSubject() })}
+        </section>
+        ${renderEthicsSettingsPanel(portfolio)}
+      </div>
+    </div>
+  `;
+}
+
+function bindStudentPortfolioPage() {
+  bindDashboardPageLinks();
+  bindPortfolioExportActions();
+  bindLearningCycleForms();
+  bindReflectionForms();
+  bindEthicsSettingsForms();
+}
+
+function renderCaseShowcasePage() {
+  if (state.user.role !== "student") return emptyBlock("学习周期申报页当前面向学生学习案例。");
+  const portfolio = currentStudentPortfolio();
+  const showcase = portfolio.showcase || {};
+  const effect = showcase.effect || {};
+  const cycle = portfolio.learningCycle || {};
+  const pack = portfolio.declarationEvidencePack || {};
+  const sections = Array.isArray(pack.applicationSections) && pack.applicationSections.length ? pack.applicationSections : [
+    { title: "学习问题", summary: showcase.background || "", evidence: [] },
+    { title: "AI介入方案", summary: showcase.intervention || "", evidence: [] },
+    { title: "完整学习周期", summary: `${cycle.title || "学习周期"}；${cycle.rangeText || ""}`, evidence: (cycle.tasks || []).map((task) => `${task.label}：${task.statusText || task.statusLabel}`) },
+    { title: "成效数据", summary: portfolio.effectPanel?.summary || "", evidence: [] },
+    { title: "个人反思", summary: (portfolio.reflectionExcerpts || [])[0]?.text || "", evidence: [] },
+    { title: "推广价值", summary: showcase.transfer || "", evidence: [] },
+    { title: "伦理规范", summary: portfolio.ethics?.aiStatement || "", evidence: [] }
+  ];
+  return `
+    <div class="showcase-page-shell">
+      <section class="showcase-hero panel">
+        <div>
+          <span class="cycle-eyebrow">学习周期申报页</span>
+          <h2>${escapeHtml(cycle.title || "AI 支持的学习闭环案例")}</h2>
+          <p>${escapeHtml(showcase.background || "学生围绕一个完整学习周期形成学习过程、成效证据和个人反思。")}</p>
+          ${renderStageStrip(cycle.currentStage)}
+        </div>
+        <aside>
+          ${renderPortfolioExportActions(true)}
+        </aside>
+      </section>
+      <section class="dashboard-stats compact showcase-stats">
+        ${renderDashboardStat("学习事件", effect.evidenceEvents || 0, "全周期过程记录")}
+        ${renderDashboardStat("前后测知识点", effect.prePostTopics || 0, `${effect.masteryImproved || 0} 个提升`)}
+        ${renderDashboardStat("错题/反思", Number(effect.wrongNotes || 0) + Number(effect.reflections || 0), "元认知证据")}
+        ${renderDashboardStat("AI 证据", portfolio.aiSupportRecords?.length || 0, "引用与诊断记录")}
+      </section>
+      <section class="showcase-application-flow">
+        ${sections.map((item, index) => `
+          <article class="panel showcase-section-card">
+            <b>${index + 1}</b>
+            <div>
+              <h3>${escapeHtml(item.title)}</h3>
+              <p>${escapeHtml(item.summary || "")}</p>
+              ${(item.evidence || []).length ? `<div class="showcase-evidence-tags">${(item.evidence || []).slice(0, 6).map((evidence) => `<span>${escapeHtml(evidence)}</span>`).join("")}</div>` : ""}
+              ${item.title === "完整学习周期" ? renderCycleTaskTracker(cycle, 6, true) : ""}
+              ${item.title === "成效数据" ? renderLearningEffectPanel(portfolio.effectPanel || {}, true) : ""}
+              ${item.title === "个人反思" ? `<div class="portfolio-card-list">${(portfolio.reflectionExcerpts || []).slice(0, 5).map((reflection) => `<article><strong>${escapeHtml(reflection.topic || "反思")}</strong><span>${escapeHtml(fmtTime(reflection.time))}</span><p>${escapeHtml(reflection.text || "")}</p></article>`).join("") || emptyBlock("暂无反思摘录。")}</div>` : ""}
+            </div>
+          </article>
+        `).join("")}
+      </section>
+      <div class="showcase-grid">
+        ${renderGraphRagProfileCard(portfolio)}
+        ${renderDeclarationEvidencePack(pack)}
+        ${renderCollaborationEvidencePanel(portfolio.collaboration || {})}
+          </div>
+        </div>
+      </details>
+    </div>
+  `;
+}
+
+function bindCaseShowcasePage() {
+  bindDashboardPageLinks();
+  bindPortfolioExportActions();
 }
 
 function renderHomePage() {
@@ -1853,6 +2960,17 @@ function renderHomePage() {
 
 function bindHomePage() {
   bindDashboardPageLinks();
+  bindPortfolioExportActions();
+  bindLearningCycleForms();
+  bindReflectionForms();
+  document.querySelectorAll("[data-cockpit-graph-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.page = "graph";
+      state.graphNodeFilter = button.dataset.cockpitGraphFilter || "all";
+      state.graphLayer = state.graphNodeFilter === "all" ? "overview" : "diagnosis";
+      renderShell();
+    });
+  });
 }
 
 function bindDashboardPageLinks() {
@@ -1860,6 +2978,413 @@ function bindDashboardPageLinks() {
     button.addEventListener("click", () => {
       state.page = button.dataset.dashboardPage;
       renderShell();
+    });
+  });
+}
+
+async function downloadStudentPortfolio(format, anonymous = false) {
+  const printWindow = format === "pdf" ? window.open("", "_blank", "noopener,noreferrer") : null;
+  let payload;
+  try {
+    const query = new URLSearchParams({ format });
+    if (anonymous) query.set("anonymous", "1");
+    payload = await api(`/api/student/portfolio/export?${query.toString()}`);
+  } catch (error) {
+    if (printWindow) printWindow.close();
+    throw error;
+  }
+  if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+  if (payload.format === "pdf") {
+    const blob = new Blob([payload.content], { type: payload.mime || "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    if (printWindow) printWindow.location.href = url;
+    else window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
+    showToast("已打开学习档案 PDF 打印页");
+    return;
+  }
+  downloadText(payload.fileName, payload.content, payload.mime || "text/plain;charset=utf-8");
+  showToast(`已导出 ${payload.fileName}`);
+}
+
+function bindPortfolioExportActions() {
+  document.querySelectorAll("[data-portfolio-export]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        const scope = button.closest(".portfolio-export-actions") || document;
+        const anonymous = Boolean(scope.querySelector("[data-portfolio-anonymous]")?.checked);
+        await downloadStudentPortfolio(button.dataset.portfolioExport, anonymous);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+}
+
+function bindLearningCycleForms() {
+  const cycle = currentStudentPortfolio().learningCycle || {};
+  const templates = Array.isArray(cycle.templateLibrary) ? cycle.templateLibrary : [];
+  const lines = (value) => Array.isArray(value) ? value.join("\n") : String(value || "");
+  const weeklyLines = (items = []) => (items || []).map((item) => {
+    const tasks = Array.isArray(item.tasks) && item.tasks.length ? `：${item.tasks.join("；")}` : "";
+    return `${item.week || ""}${item.title ? `：${item.title}` : ""}${tasks}`;
+  }).join("\n");
+  const fillCycleForm = (form, item = {}) => {
+    if (!form || !item) return;
+    const setValue = (name, value) => {
+      const control = form.querySelector(`[name="${name}"]`);
+      if (control) control.value = value ?? "";
+    };
+    setValue("templateKey", item.templateKey || item.key || "");
+    setValue("title", item.title || "");
+    setValue("subject", item.subject || preferredSubject());
+    setValue("range", [item.startLabel || "第 1 周", item.endLabel || "第 4 周"].filter(Boolean).join(" 到 "));
+    setValue("goals", lines(item.goals || []));
+    setValue("focusNodes", lines(item.focusNodes || []));
+    setValue("recommendedTestNodes", lines(item.recommendedTestNodes || []));
+    setValue("weeklyPlan", weeklyLines(item.weeklyPlan || []));
+    const req = item.evidenceRequirements || {};
+    setValue("aiDialogues", Number(req.aiDialogues ?? 3));
+    setValue("knowledgeTests", Number(req.knowledgeTests ?? 2));
+    setValue("reflections", Number(req.reflections ?? 1));
+    setValue("learningOutputs", Number(req.learningOutputs ?? 1));
+  };
+
+  document.querySelectorAll("[data-cycle-settings-toggle], [data-cycle-settings-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.cycleSettingsOpen = button.hasAttribute("data-cycle-settings-open") ? true : !state.cycleSettingsOpen;
+      renderContent();
+    });
+  });
+
+  document.querySelectorAll("[data-cycle-view-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.cycleViewMode = button.dataset.cycleViewMode || "stage";
+      renderContent();
+    });
+  });
+
+  document.querySelectorAll("[data-learning-cycle-form]").forEach((form) => {
+    form.querySelector("[data-cycle-template-select]")?.addEventListener("change", (event) => {
+      const selected = templates.find((template) => template.key === event.currentTarget.value);
+      if (selected) fillCycleForm(form, selected);
+    });
+
+    form.querySelector("[data-cycle-ai-suggest]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const raw = Object.fromEntries(new FormData(form).entries());
+      setButtonBusy(button, true, "生成中...");
+      try {
+        const payload = await api("/api/student/learning-cycle/suggest", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            templateKey: raw.templateKey,
+            focusNodes: raw.focusNodes,
+            startLabel: String(raw.range || "").split(/到|至|-|—/)[0] || "第 1 周",
+            endLabel: String(raw.range || "").split(/到|至|-|—/)[1] || "第 4 周"
+          }
+        });
+        fillCycleForm(form, payload.suggestion || {});
+        showToast("已根据学习画像生成周期建议，请确认后保存");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const raw = Object.fromEntries(new FormData(form).entries());
+      const rangeParts = String(raw.range || "").split(/到|至|-|—/).map((item) => item.trim()).filter(Boolean);
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const payload = await api("/api/student/learning-cycle", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            id: raw.id,
+            title: raw.title,
+            subject: raw.subject,
+            startLabel: rangeParts[0] || "第 1 周",
+            endLabel: rangeParts[1] || "第 4 周",
+            goals: raw.goals,
+            templateKey: raw.templateKey,
+            focusNodes: raw.focusNodes,
+            weeklyPlan: raw.weeklyPlan,
+            recommendedTestNodes: raw.recommendedTestNodes,
+            viewMode: raw.viewMode || state.cycleViewMode || "stage",
+            evidenceRequirements: {
+              aiDialogues: Number(raw.aiDialogues || 0),
+              knowledgeTests: Number(raw.knowledgeTests || 0),
+              reflections: Number(raw.reflections || 0),
+              learningOutputs: Number(raw.learningOutputs || 0),
+              wrongFixes: 1
+            }
+          }
+        });
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        await loadState();
+        renderShell();
+        showToast("学习周期已保存");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-cycle-task-status]").forEach((control) => {
+    control.addEventListener("change", async () => {
+      const cycle = currentStudentPortfolio().learningCycle || {};
+      control.disabled = true;
+      try {
+        const payload = await api("/api/student/learning-cycle/tasks", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            cycleId: cycle.virtual ? "" : cycle.id,
+            subject: cycle.subject || preferredSubject(),
+            taskKey: control.dataset.cycleTaskStatus,
+            status: control.value,
+            done: ["archived", "done"].includes(control.value),
+            note: "学生手动更新周期任务状态"
+          }
+        });
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        await loadState();
+        renderShell();
+        showToast("周期任务状态已更新");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        control.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-answer-first-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const raw = Object.fromEntries(new FormData(form).entries());
+      const studentAnswer = String(raw.studentAnswer || "").trim();
+      const knowledgePoint = String(raw.knowledgePoint || "").trim() || (cycle.focusNodes || [])[0] || "当前知识点";
+      if (!studentAnswer) return showToast("请先写下自己的原始理解", "error");
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "诊断中...");
+      try {
+        const prompt = `请只基于我的原始理解诊断「${knowledgePoint}」的理解缺口，不要直接替我完成最终答案。请指出正确点、误区、需要验证的问题、引用依据和下一步测试建议。`;
+        const payload = await api("/api/ai/chat", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            conversationId: state.activeConversationId,
+            mode: "grade",
+            subject: cycle.subject || preferredSubject() || "机器学习",
+            knowledgePoint,
+            answerDepth: state.aiAnswerDepth || "layered",
+            prompt,
+            studentAnswer
+          }
+        });
+        state.activeConversationId = payload.conversation?.id || state.activeConversationId;
+        state.aiKnowledgePoint = knowledgePoint;
+        state.aiStudentAnswer = "";
+        state.page = "ai";
+        await loadState();
+        renderShell();
+        showToast("AI 已基于原始答案完成诊断");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+}
+
+function bindEthicsSettingsForms() {
+  document.querySelectorAll("[data-ethics-settings-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const checkboxValue = (name) => Boolean(form.querySelector(`input[name="${name}"]`)?.checked);
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const payload = await api("/api/student/ethics-settings", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            aiUseDisclosure: checkboxValue("aiUseDisclosure"),
+            citationRequired: checkboxValue("citationRequired"),
+            uncertaintyNotice: checkboxValue("uncertaintyNotice"),
+            dataConsent: checkboxValue("dataConsent"),
+            anonymousExportDefault: checkboxValue("anonymousExportDefault"),
+            requireOriginalAnswerFirst: checkboxValue("requireOriginalAnswerFirst"),
+            allowTeacherPrivateConversationAccess: checkboxValue("allowTeacherPrivateConversationAccess"),
+            aiFinalAnswerBlocked: checkboxValue("aiFinalAnswerBlocked")
+          }
+        });
+        if (payload.settings) state.data.studentEthicsSettings = payload.settings;
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        await loadState();
+        renderShell();
+        showToast("AI 使用规范已保存");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-data-deletion-request-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const raw = Object.fromEntries(new FormData(form).entries());
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "提交中...");
+      try {
+        const payload = await api("/api/student/data-deletion-requests", {
+          method: "POST",
+          body: { userId: state.user.id, scopes: raw.scopes, reason: raw.reason }
+        });
+        if (payload.requests) state.data.studentDataDeletionRequests = payload.requests;
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        await loadState();
+        renderShell();
+        showToast("删除申请已记录");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+}
+
+function bindNodeAnnotationForms() {
+  document.querySelectorAll("[data-node-annotation-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const payload = await api("/api/student/node-annotations", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            ...data,
+            favorite: Boolean(form.querySelector('input[name="favorite"]')?.checked),
+            fromAiAnswer: Boolean(form.querySelector('input[name="fromAiAnswer"]')?.checked)
+          }
+        });
+        if (payload.annotation) {
+          const existing = (state.data.studentNodeAnnotations || []).filter((item) => item.id !== payload.annotation.id);
+          state.data.studentNodeAnnotations = [payload.annotation, ...existing];
+        }
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        if (payload.learningAnalytics) state.data.learningAnalytics = payload.learningAnalytics;
+        await loadState();
+        renderShell();
+        showToast("节点证据已保存到学习档案");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+}
+
+function bindReflectionForms() {
+  document.querySelectorAll("[data-reflection-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const payload = await api("/api/student/reflections", {
+          method: "POST",
+          body: { userId: state.user.id, ...data }
+        });
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        if (payload.learningAnalytics) state.data.learningAnalytics = payload.learningAnalytics;
+        await loadState();
+        renderShell();
+        showToast("反思已保存到学习档案");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+}
+
+function bindKnowledgeCorrectionForms() {
+  document.querySelectorAll("[data-topic-correction-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "归档中...");
+      try {
+        const payload = await api("/api/student/knowledge-corrections", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            subject: state.aiSubject || preferredSubject(),
+            ...data
+          }
+        });
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        if (payload.learningAnalytics) state.data.learningAnalytics = payload.learningAnalytics;
+        await loadState();
+        renderShell();
+        showToast("知识点纠正已重新归档");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
+}
+
+function bindAiReviewForms() {
+  document.querySelectorAll("[data-ai-review-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const raw = Object.fromEntries(new FormData(form).entries());
+      const button = form.querySelector('button[type="submit"]');
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const issueTags = [raw.reviewType].filter(Boolean);
+        const payload = await api("/api/student/ai-answer-reviews", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            ...raw,
+            accepted: raw.reviewType === "accepted" || raw.reviewType === "partial_accept",
+            issueTags
+          }
+        });
+        if (payload.portfolio) state.data.studentPortfolio = payload.portfolio;
+        if (payload.learningAnalytics) state.data.learningAnalytics = payload.learningAnalytics;
+        await loadState();
+        renderShell();
+        showToast("AI 审辩记录已入档");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
     });
   });
 }
@@ -1872,6 +3397,83 @@ function graphListForCurrentRole() {
   return graphs;
 }
 
+function isMachineLearningGraph(graph) {
+  return Boolean(graph && /机器学习|machine learning|动手学机器学习|ML/i.test(`${graph.subject || ""} ${graph.title || ""} ${graph.sourceName || ""}`));
+}
+
+function machineLearningGraph(graphs = graphListForCurrentRole()) {
+  return graphs.find(isMachineLearningGraph) || null;
+}
+
+function machineLearningNodeText(node) {
+  return [node?.label, node?.details, node?.misconception, node?.ontology?.layer, node?.ontology?.type, ...(node?.tags || []), ...(node?.knowledgePoints || [])].join(" ");
+}
+
+function machineLearningModuleMatches(node, module) {
+  const text = machineLearningNodeText(node);
+  return module.terms.some((term) => text.toLowerCase().includes(term.toLowerCase()));
+}
+
+function machineLearningModuleStats(graph, module) {
+  const nodes = (graph?.nodes || []).filter((node) => machineLearningModuleMatches(node, module));
+  const values = nodes.map(graphMasteryValue).filter((value) => Number.isFinite(value));
+  const average = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+  const risk = nodes.filter((node) => {
+    const value = graphMasteryValue(node);
+    return graphNodeHasWeakness(node) || (Number.isFinite(value) && value < 0.45);
+  }).length;
+  return { nodes, count: nodes.length, average, risk, mastered: nodes.filter((node) => Number(graphMasteryValue(node)) >= 0.78).length };
+}
+
+function renderMachineLearningModuleMap(graph) {
+  if (!graph) return "";
+  const selectedLabel = graphSelectedNode(graph)?.label || "逻辑回归";
+  return `
+    <section class="ml-graph-focus-header">
+      <div class="ml-graph-focus-copy">
+        <span class="cycle-eyebrow">《机器学习》课程专属图谱</span>
+        <h2>我的学习路径</h2>
+        <p>围绕六个核心模块，按掌握度、错因风险和前置依赖生成最短补弱路径。</p>
+      </div>
+      <div class="ml-graph-path-callout">
+        <span>当前推荐路径</span>
+        <strong>${escapeHtml(selectedLabel)} → 前置辨析 → 变式验证</strong>
+        <small>不是固定章节顺序，而是根据你的学习证据动态调整。</small>
+      </div>
+    </section>
+    <section class="ml-module-map" aria-label="机器学习六大模块">
+      ${ML_GRAPH_MODULES.map((module, index) => {
+        const stats = machineLearningModuleStats(graph, module);
+        const averageText = stats.average === null ? "待诊断" : `${Math.round(stats.average * 100)}%`;
+        return `<button type="button" class="ml-module-card module-${module.key}" data-ml-module="${module.key}">
+          <span class="ml-module-index">0${index + 1}</span>
+          <span><strong>${escapeHtml(module.label)}</strong><small>${escapeHtml(module.short)}</small></span>
+          <em>${averageText}</em>
+          <small>${stats.count} 个节点 · ${stats.risk ? `${stats.risk} 个高风险` : "暂无高风险"}</small>
+        </button>`;
+      }).join("")}
+    </section>
+  `;
+}
+
+function renderStudentGraphPathSummary(graph) {
+  if (!graph) return "";
+  const candidates = ML_GRAPH_MODULES.flatMap((module) => machineLearningModuleStats(graph, module).nodes.map((node) => ({ node, module })))
+    .map(({ node, module }) => ({ node, module, mastery: graphMasteryValue(node) }))
+    .filter(({ mastery }) => !Number.isFinite(mastery) || mastery < 0.58)
+    .sort((a, b) => (Number.isFinite(a.mastery) ? a.mastery : 0) - (Number.isFinite(b.mastery) ? b.mastery : 0));
+  const target = candidates[0];
+  if (!target) return `<section class="ml-shortest-path"><strong>最短补弱路径</strong><p>当前节点均有较好掌握记录，建议进入后测验证迁移应用。</p></section>`;
+  const context = graphNodeContext(graph, target.node);
+  const weakPrerequisite = graphWeaknessAttribution(graph, target.node)[0];
+  return `<section class="ml-shortest-path">
+    <div><span>个性化路径引擎</span><strong>最短补弱路径</strong></div>
+    <p>优先处理「${escapeHtml(weakPrerequisite?.label || target.node.label)}」，再回到「${escapeHtml(target.node.label)}」完成变式验证。</p>
+    <small>推荐原因：当前掌握度 ${escapeHtml(Number.isFinite(target.mastery) ? percentText(target.mastery) : "暂无记录")}，${weakPrerequisite ? `其前置节点「${escapeHtml(weakPrerequisite.label)}」仍是主要阻塞。` : "该节点是当前路径上的低掌握入口。"}</small>
+    <button class="mini primary" type="button" data-ml-focus-node="${escapeHtml(weakPrerequisite?.id || target.node.id)}">查看路径节点</button>
+  </section>`;
+}
+
 function renderGraphPage() {
   return isTeacherLike() ? renderTeacherGraphPage() : renderStudentGraphPage();
 }
@@ -1881,6 +3483,26 @@ function graphCard(graph) {
   const graphRagReady = graph.meta?.graphRagReady || graph.meta?.graphRag?.ready;
   const layerCount = Array.isArray(graph.meta?.ontologyLayers) ? graph.meta.ontologyLayers.length : 0;
   const relationTypes = Array.isArray(graph.meta?.semanticRelations) ? graph.meta.semanticRelations.length : new Set((graph.links || []).map((link) => link.type || link.label)).size;
+  if (state.user?.role === "student") {
+    const stats = graphAnalytics(graph);
+    return `
+      <article class="list-card student-graph-card ${active}" data-select-graph="${graph.id}">
+        <div>
+          <h3>${escapeHtml(graph.title)}</h3>
+          <p>${escapeHtml(graph.subject)} · ${stats.masteryEntries || 0} 个真实掌握记录 · ${stats.weakCount || 0} 个薄弱点</p>
+          <div class="graph-badges">
+            <span class="graph-badge mastered">已掌握 ${stats.masteredCount || 0}</span>
+            <span class="graph-badge warning">待巩固 ${stats.weakCount || 0}</span>
+            <span class="graph-badge">未开始 ${Math.max(0, (graph.nodes || []).length - Number(stats.masteryEntries || 0))}</span>
+          </div>
+          <small>点击进入后可查看“我如何学会它”的证据、反思和推荐测试。</small>
+        </div>
+        <div class="row-actions">
+          <button class="mini" data-dashboard-page="portfolio">学习档案</button>
+        </div>
+      </article>
+    `;
+  }
   return `
     <article class="list-card ${active}" data-select-graph="${graph.id}">
       <div>
@@ -2137,8 +3759,8 @@ function renderTeacherGraphImportTab() {
 }
 
 function renderStudentGraphPage() {
-  const graphs = graphListForCurrentRole();
-  const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || null;
+  const graphs = graphListForCurrentRole().filter((graph) => isMachineLearningGraph(graph));
+  const selected = graphs.find((graph) => graph.id === state.selectedGraphId) || machineLearningGraph(graphs);
   if (selected) return renderGraphDetailShell(graphs, selected, "student");
   const tab = state.studentGraphTab || "library";
   return `
@@ -2158,18 +3780,212 @@ function renderStudentGraphPage() {
 function renderGraphDetailShell(graphs, selected, mode = "teacher") {
   const stats = graphAnalytics(selected);
   const detailOpen = Boolean(graphExplicitSelectedNode(selected));
+  const shellClass = state.graphMaximized ? "graph-maximized" : "";
   return `
-    <section class="panel graph-detail-shell graph-dashboard-shell graph-focus-shell ${detailOpen ? "detail-open" : "detail-collapsed"} ${mode === "student" ? "student-graph-detail-shell" : "teacher-graph-detail-shell"}">
-      <div class="graph-dashboard-topbar">
-        <button class="mini" type="button" id="graphBackToLibrary">返回图谱列表</button>
-        <div>
-          <h3>${escapeHtml(selected.title)}</h3>
-          <strong>${escapeHtml(selected.subject || "通用")} · ${stats.visibleNodes}/${stats.totalNodes} 节点 · ${stats.visibleLinks}/${stats.totalLinks} 关系</strong>
+    <section class="panel graph-detail-shell graph-dashboard-shell graph-atlas-shell graph-focus-shell ${detailOpen ? "detail-open" : "detail-collapsed"} ${mode === "student" ? "student-graph-detail-shell" : "teacher-graph-detail-shell"} ${shellClass}" data-graph-atlas-shell="${escapeHtml(selected.id)}">
+      ${mode === "student" ? renderMachineLearningModuleMap(selected) : ""}
+      ${mode === "student" ? renderStudentGraphPathSummary(selected) : ""}
+      ${mode === "teacher" ? renderTeacherMlGraphEditor(selected) : ""}
+      ${renderGraphAtlasNav(selected)}
+      <div class="graph-atlas-main">
+        ${renderGraphAtlasFilterbar(selected, stats)}
+        <div class="graph-atlas-workbench">
+          <aside class="graph-atlas-stat-stack">
+            ${renderGraphAtlasStats(selected, mode, stats)}
+          </aside>
+          <div class="graph-atlas-stage">
+            <div class="graph-canvas">${renderGraphViewer(selected)}</div>
+          </div>
+          ${renderGraphAtlasModePanel()}
+          ${renderGraphAtlasLegend()}
         </div>
       </div>
-      ${renderGraphLearningWorkspace(graphs, selected, mode, false, false)}
+      ${renderGraphAtlasFooter(selected)}
     </section>
     ${renderGraphNodeModal()}
+  `;
+}
+
+function renderGraphAtlasNav(graph) {
+  const items = ["导学", "教材", "教学目标", "知识图谱", "目录", "FAQ", "学习资料", "测验", "作业", "项目"];
+  return `
+    <nav class="graph-atlas-nav" aria-label="知识图谱导航">
+      <div class="graph-atlas-nav-scroll">
+        ${items.map((item) => `<button type="button" class="${item === "知识图谱" ? "active" : ""}">${escapeHtml(item)}</button>`).join("")}
+      </div>
+      <div class="graph-atlas-title">
+        <span>${escapeHtml(compactText(graph.title || "知识图谱", 28))}</span>
+        <button class="mini" type="button" id="graphBackToLibrary">图谱库</button>
+      </div>
+    </nav>
+  `;
+}
+
+function renderGraphAtlasFilterbar(graph, stats) {
+  const filterSet = graphFilterSet();
+  const searchValue = escapeHtml(state.graphSearch || "");
+  const filterButtons = state.user?.role === "student"
+    ? [
+      { label: "我的路径", key: "all" },
+      { label: "当前薄弱", key: "weak" },
+      { label: "已掌握", key: "mastered" },
+      { label: "误区节点", key: "misconception" },
+      { label: "验证任务", key: "exercise" }
+    ]
+    : [
+      { label: "分类", key: "all" },
+      { label: "难易度", key: "weak" },
+      { label: "掌握度", key: "mastered" },
+      { label: "学习进度", key: "resource" },
+      { label: "达成状态", key: "core" }
+    ];
+  return `
+    <div class="graph-atlas-filterbar">
+      <form id="graphSearchForm" class="graph-atlas-search">
+        <input name="query" value="${searchValue}" placeholder="请输入关键字" />
+        <span class="graph-atlas-search-separator"></span>
+        <button type="submit" title="搜索">${iconSvg("search", "搜索")}</button>
+      </form>
+      <div class="graph-atlas-filters">
+        ${filterButtons.map((item) => `
+          <button type="button" class="${(state.graphNodeFilter || "all") === item.key ? "active" : ""}" data-graph-node-filter="${item.key}">
+            ${escapeHtml(item.label)} ${iconSvg("chevronDown", item.label)}
+          </button>
+        `).join("")}
+        <button type="button" class="more" data-graph-relation="resource" aria-pressed="${filterSet.has("resource") ? "true" : "false"}">
+          更多筛选 ${iconSvg("chevronDown", "更多筛选")}
+        </button>
+      </div>
+      <div class="graph-atlas-current-count">当前节点知识点数： <strong>${stats.visibleNodes}/${stats.totalNodes}</strong></div>
+      <button class="graph-atlas-layout-btn" type="button" data-graph-layer="${state.graphLayer === "overview" ? "relation" : "overview"}">
+        ${iconSvg("refresh", "布局切换")} 布局切换
+      </button>
+    </div>
+  `;
+}
+
+function renderGraphAtlasStats(graph, mode = "teacher", stats = graphAnalytics(graph)) {
+  const completionText = `${Math.round(stats.completion * 100)}%`;
+  const masteryText = `${Math.round(stats.averageMastery * 100)}%`;
+  const hasMastery = stats.masteryEntries > 0;
+  const cards = [
+    { icon: "book", label: "知识点总数", value: stats.totalNodes, suffix: "", meta: "" },
+    { icon: "complete", label: "学习完成率", value: completionText, suffix: "", meta: hasMastery ? `${stats.masteredCount} 个已掌握` : "--" },
+    { icon: "target", label: "学习达成率", value: masteryText, suffix: "", meta: hasMastery ? `${stats.masteryEntries} 个真实记录` : "--" }
+  ];
+  return cards.map((card) => `
+    <article class="graph-atlas-stat-card ${card.icon}">
+      <span class="graph-atlas-stat-icon"></span>
+      <div>
+        <span>${escapeHtml(card.label)}</span>
+        <strong>${escapeHtml(String(card.value))}${card.suffix ? `<small>${escapeHtml(card.suffix)}</small>` : ""}</strong>
+        <em>${escapeHtml(card.meta || "")}</em>
+      </div>
+    </article>
+  `).join("");
+}
+
+function renderGraphAtlasModePanel() {
+  const layer = state.graphLayer || "overview";
+  const modeButtons = [
+    { key: "overview", label: "重力模式" },
+    { key: "relation", label: "中心模式" }
+  ];
+  return `
+    <aside class="graph-atlas-mode-panel">
+      <div class="graph-atlas-layout-modes">
+        ${modeButtons.map((item) => `<button type="button" class="${layer === item.key ? "active" : ""}" data-graph-layer="${item.key}">${escapeHtml(item.label)}</button>`).join("")}
+      </div>
+      <div class="graph-atlas-view-modes">
+        <button type="button" class="${layer !== "diagnosis" ? "active" : ""}" data-graph-layer="relation">${iconSvg("atom", "图谱模式")} 图谱模式</button>
+        <button type="button" data-graph-layer="overview">${iconSvg("columns", "导图模式")} 导图模式</button>
+        <button type="button" data-graph-layer="diagnosis">${iconSvg("branch", "大纲模式")} 大纲模式</button>
+      </div>
+    </aside>
+  `;
+}
+
+function renderGraphAtlasLegend() {
+  const items = state.user?.role === "student"
+    ? [
+      { tone: "mastery-high", label: "已掌握" },
+      { tone: "mastery-mid", label: "待巩固" },
+      { tone: "mastery-low", label: "薄弱点" },
+      { tone: "learning", label: "正在学习" },
+      { tone: "not-started", label: "未开始" }
+    ]
+    : [
+      { tone: "root", label: "根节点" },
+      { tone: "unit-1", label: "一级知识单元" },
+      { tone: "unit-2", label: "二级知识单元" },
+      { tone: "point-1", label: "一级知识点" },
+      { tone: "point-2", label: "二级知识点" }
+    ];
+  return `
+    <aside class="graph-atlas-legend">
+      ${items.map((item) => `<div><span class="legend-dot ${item.tone}"></span>${escapeHtml(item.label)}</div>`).join("")}
+    </aside>
+  `;
+}
+
+function graphAtlasTagStats(graph) {
+  const nodes = graph?.nodes || [];
+  const includesText = (node, pattern) => [
+    node.label,
+    node.details,
+    node.misconception,
+    node.ontology?.layer,
+    node.ontology?.type,
+    node.cognitive?.objective,
+    ...(Array.isArray(node.tags) ? node.tags : []),
+    ...(Array.isArray(node.knowledgePoints) ? node.knowledgePoints : [])
+  ].join(" ");
+  const count = (fn) => nodes.reduce((sum, node, index) => sum + (fn(node, index) ? 1 : 0), 0);
+  return {
+    important: count((node, index) => graphNodeImportanceScore(node, index) >= 38 || /重点|核心|关键/.test(includesText(node))),
+    difficult: count((node) => graphNodeHasWeakness(node) || /难点|困难|复杂/.test(includesText(node))),
+    exam: count((node) => /考点|考试|测验|题型|题目/.test(includesText(node))),
+    selfStudy: count((node) => /自学|自主/.test(includesText(node))),
+    thinking: count((node) => /思政|价值|素养/.test(includesText(node))),
+    fivePoint: count((node) => /五新|新课标|新教材|新技术|新方法|新评价/.test(includesText(node))),
+    skill: count((node) => /技能|能力|实践|操作/.test(includesText(node))),
+    experiment: count((node) => graphHasExercise(node) || /实验|实训|实践/.test(includesText(node))),
+    custom: count((node) => /自定义|custom/.test(includesText(node)))
+  };
+}
+
+function renderGraphAtlasFooter(graph) {
+  const tagStats = graphAtlasTagStats(graph);
+  const relations = [
+    { key: "prerequisite", label: "前修" },
+    { key: "contains", label: "包含" },
+    { key: "sequence", label: "顺序" },
+    { key: "semantic", label: "相关" },
+    { key: "custom", label: "自定义" }
+  ];
+  const filterSet = graphFilterSet();
+  const tags = [
+    ["重点", tagStats.important],
+    ["难点", tagStats.difficult],
+    ["考点", tagStats.exam],
+    ["自学", tagStats.selfStudy],
+    ["思政点", tagStats.thinking],
+    ["五新点", tagStats.fivePoint],
+    ["技能点", tagStats.skill],
+    ["实验/实践/实训", tagStats.experiment],
+    ["自定义", tagStats.custom]
+  ];
+  return `
+    <footer class="graph-atlas-footer">
+      <div class="graph-atlas-relations">
+        <span>关系：</span>
+        ${relations.map((item) => `<button type="button" class="${filterSet.has(item.key) ? "active" : ""}" data-graph-relation="${item.key}">${escapeHtml(item.label)}</button>`).join("")}
+      </div>
+      <div class="graph-atlas-tags">
+        <span>标签：</span>
+        ${tags.map(([label, value]) => `<span>${escapeHtml(label)}： <strong>${Number(value || 0)}</strong></span>`).join("")}
+      </div>
+    </footer>
   `;
 }
 
@@ -2222,6 +4038,7 @@ function renderStudentGraphLibraryTab(graphs) {
 
 function renderStudentKnowledgeTestTab() {
   const test = state.knowledgeTest || {};
+  const phase = ["diagnostic", "remedial", "verify"].includes(test.phase) ? test.phase : "diagnostic";
   const testSubjects = knowledgeTestSubjects();
   const selectedSubject = normalizeSubjectLabel(test.subject || testSubjects[0] || preferredSubject());
   const materials = knowledgeTestMaterialsForSubject(selectedSubject);
@@ -2232,8 +4049,31 @@ function renderStudentKnowledgeTestTab() {
   const summary = test.summary || test.result?.overall || null;
   const answeredQuestionIds = new Set(attempts.map((item) => item.questionId).filter(Boolean));
   const sourceMaterials = Array.isArray(test.sourceMaterials) ? test.sourceMaterials : [];
+  const phaseMeta = {
+    diagnostic: { label: "诊断性练习", hint: "前测 / 章节前测 / 知识点微测，先定位掌握度与错因。" },
+    remedial: { label: "补救性练习", hint: "根据错因生成最多 4 道同类辨析与变式迁移题。" },
+    verify: { label: "验证性练习", hint: "完成补救后，用新题验证错因是否真正消除。" }
+  }[phase];
+  const currentQuestionNode = question?.nodeId ? (state.data?.knowledgeGraphs || []).flatMap((graph) => graph.nodes || []).find((node) => node.id === question.nodeId) : null;
+  const latestAccuracy = Number(test.result?.accuracy || test.previousAccuracy || 0);
   return `
-    <div class="knowledge-test-layout">
+    <div class="diagnostic-practice-shell">
+      <section class="practice-stage-header">
+        <div>
+          <span class="cycle-eyebrow">机器学习知识测评</span>
+          <h2>诊断练习 → 补救练习 → 验证练习</h2>
+          <p>每道题都绑定知识图谱节点，答题结果会更新学习画像，并决定下一步干预。</p>
+        </div>
+        <div class="practice-profile-snapshot">
+          <strong>${summary ? `${Number(summary.accuracy || 0)}%` : "待诊断"}</strong>
+          <span>${summary ? `${Number(summary.answered || 0)}/${Number(summary.total || (test.questions || []).length)} 题已完成` : "完成前测后生成画像"}</span>
+        </div>
+      </section>
+      <nav class="practice-stage-tabs" aria-label="练习阶段">
+        ${Object.entries(phaseMeta ? { diagnostic: phaseMeta, remedial: { label: "补救性练习", hint: "根据错因生成最多 4 道同类辨析与变式迁移题。" }, verify: { label: "验证性练习", hint: "完成补救后，用新题验证错因是否真正消除。" } } : {}).map(([key, item]) => `<button type="button" class="${phase === key ? "active" : ""}" data-practice-phase="${key}"><strong>${item.label}</strong><span>${item.hint}</span></button>`).join("")}
+      </nav>
+      <section class="practice-stage-intro"><strong>${phaseMeta.label}</strong><span>${phaseMeta.hint}</span><em>最多 3–5 题</em></section>
+      <div class="knowledge-test-layout">
       <section class="knowledge-test-setup">
         <form id="knowledgeTestSetupForm" class="knowledge-test-form">
           <label>学科
@@ -2247,7 +4087,8 @@ function renderStudentKnowledgeTestTab() {
               ${materials.map((item) => `<option value="${escapeHtml(item.id)}" ${selectedMaterialId === item.id ? "selected" : ""}>${escapeHtml(item.title)}</option>`).join("")}
             </select>
           </label>
-          <button class="primary" type="submit" ${materials.length ? "" : "disabled"}>生成题目</button>
+          <input type="hidden" name="phase" value="${phase}" />
+          <button class="primary" type="submit" ${materials.length ? "" : "disabled"}>生成${phaseMeta.label}</button>
         </form>
         ${test.sourceNotice ? `<p class="knowledge-source-notice">${escapeHtml(test.sourceNotice)}</p>` : ""}
         ${sourceMaterials.length ? `
@@ -2263,6 +4104,7 @@ function renderStudentKnowledgeTestTab() {
               <h3>${escapeHtml(question.topic || selectedSubject || "知识测试")}</h3>
               <strong>${currentIndex + 1}/${(test.questions || []).length}${answeredQuestionIds.has(question.id) ? " · 已答" : ""}</strong>
             </div>
+            <div class="practice-question-tags"><span>${escapeHtml(question.type || "开放题")}</span><span>图谱节点：${escapeHtml(currentQuestionNode?.label || question.topic || "待绑定")}</span></div>
             <p>${escapeHtml(question.prompt)}</p>
             <div class="knowledge-question-meta">
               <span>${escapeHtml(question.sourceTitle || "课程资料")}</span>
@@ -2275,21 +4117,40 @@ function renderStudentKnowledgeTestTab() {
               <button class="primary" type="submit">提交本次回答</button>
             </form>
             ${test.result ? `
-              <div class="knowledge-test-result">
+              <div class="knowledge-test-result ${test.result.errorEliminated === true ? "improved" : ""}">
                 <strong>本题 ${Number(test.result.accuracy || 0)}% · ${escapeHtml(test.result.masteryLevel || "")}</strong>
                 <p>${escapeHtml(test.result.feedback || "")}</p>
                 <div class="mastery-meter"><span style="width:${clamp(Number(test.result.accuracy || 0), 0, 100)}%"></span></div>
                 ${(test.result.matched || []).length ? `<p class="knowledge-test-detail">已覆盖：${escapeHtml((test.result.matched || []).slice(0, 8).join("、"))}</p>` : ""}
                 ${(test.result.missing || []).length ? `<p class="knowledge-test-detail">待补充：${escapeHtml((test.result.missing || []).slice(0, 8).join("、"))}</p>` : ""}
+                <p class="practice-improvement-status">${phase === "verify" ? (test.result.errorEliminated ? "错因已消除：可以进入下一知识点。" : "错因尚未消除：建议更换干预方式，先看微课或询问 AI。") : "答题结果已写入学习画像，可查看错因并生成补救题。"}</p>
+                <div class="practice-answer-actions">
+                  <button type="button" class="mini" data-test-action="analysis">查看错因分析</button>
+                  <button type="button" class="mini" data-test-action="archive">加入订正档案</button>
+                  <button type="button" class="mini primary" data-test-action="variant">生成一道变式题</button>
+                </div>
+                <div class="practice-analysis-panel" data-practice-analysis hidden><b>诊断提示</b><p>${escapeHtml((test.result.missing || []).length ? `当前主要缺口：${(test.result.missing || []).slice(0, 4).join("、")}` : "当前没有明显缺口，建议用新场景验证迁移能力。")}</p><p>下一步干预：${phase === "verify" && !test.result.errorEliminated ? "微课 + AI 引导或教师答疑" : "同类辨析题 + 变式迁移题"}</p></div>
               </div>
+              <details class="reflection-inline-card knowledge-reflection-card" open>
+                <summary>写本题反思并入档</summary>
+                ${renderStructuredReflectionForm({
+                  contextType: "knowledge_test",
+                  contextId: question.id || test.quizId || "",
+                  contextTitle: question.prompt || "知识测试",
+                  subject: selectedSubject,
+                  knowledgePoint: test.result.topic || question.topic || selectedSubject
+                })}
+              </details>
             ` : ""}
             <div class="knowledge-test-actions">
               <button class="mini" type="button" id="knowledgeTestRetry">再次回答</button>
               <button class="mini" type="button" id="knowledgeTestNext">下一题</button>
+              ${phase === "diagnostic" ? `<button class="mini primary" type="button" data-practice-next-phase="remedial">进入补救练习</button>` : ""}
+              ${phase === "remedial" ? `<button class="mini primary" type="button" data-practice-next-phase="verify">完成补救，开始验证</button>` : ""}
             </div>
           </article>
           <aside class="knowledge-attempts">
-            <h3>掌握判断</h3>
+            <h3>学习画像</h3>
             ${summary ? `
               <div class="knowledge-summary-card">
                 <strong>${Number(summary.accuracy || 0)}%</strong>
@@ -2309,10 +4170,50 @@ function renderStudentKnowledgeTestTab() {
               `).join("") || emptyBlock("提交答案后显示记录。")}
             </div>
           </aside>
-        ` : emptyBlock(materials.length ? "选择学科或课程资料后生成题目。" : `当前「${escapeHtml(selectedSubject)}」暂无可用于出题的课程资料，请老师先上传并开放给学生检索。`)}
+        ` : `
+          <div class="knowledge-test-flow-empty">
+            <div>
+              <h3>${materials.length ? "生成一次可入档的知识测试" : `当前「${escapeHtml(selectedSubject)}」暂无可出题资料`}</h3>
+              <p>${materials.length ? "本次测试会记录为学习证据：生成题目、独立作答、AI 诊断、错因修正、写反思，然后进入学习档案。" : "请老师先上传并开放课程资料，或切换到已有资料的学科。"}</p>
+            </div>
+            <ol>
+              <li><strong>生成题目</strong><span>按学科和课程资料抽取 10-15 道核心题</span></li>
+              <li><strong>自主作答</strong><span>保留学生原始理解，避免直接要答案</span></li>
+              <li><strong>AI 诊断</strong><span>给出掌握度、缺失点和引用依据</span></li>
+              <li><strong>错因修正</strong><span>把误区转入错题/错因轨迹</span></li>
+              <li><strong>写反思</strong><span>记录策略变化和下一步计划</span></li>
+              <li><strong>进入档案</strong><span>形成前测/后测对比和导出材料</span></li>
+            </ol>
+          </div>
+        `}
       </section>
+      </div>
     </div>
   `;
+}
+
+function renderTeacherMlGraphEditor(graph) {
+  if (!isMachineLearningGraph(graph)) return "";
+  const node = graphSelectedNode(graph) || graph.nodes?.[0];
+  if (!node) return "";
+  const lines = (value) => Array.isArray(value) ? value.join("\n") : String(value || "");
+  const relationLinks = (graph.links || []).filter((link) => ["prerequisite", "misconception"].includes(graphRelationKey(link)));
+  return `<section class="panel ml-graph-editor">
+    <div class="split-head"><div><span class="cycle-eyebrow">TEACHER KNOWLEDGE DESIGNER</span><h2>机器学习知识图谱编辑器</h2><p class="hint">编辑「${escapeHtml(node.label)}」的学习目标、错因诊断和干预资源，让图谱表达学生为什么会学错。</p></div><span class="graph-badge ready">${graph.nodes.length} 个节点 · ${relationLinks.length} 条关键关系</span></div>
+    <form class="ml-graph-node-form" data-ml-graph-node-form data-graph-id="${escapeHtml(graph.id)}" data-node-id="${escapeHtml(node.id)}">
+      <div class="form-grid"><label>知识点名称<input name="label" value="${escapeHtml(node.label)}" /></label><label>所属模块<input name="group" value="${escapeHtml(node.group || "分类模型")}" /></label></div>
+      <label>前置知识（每行一个）<textarea name="prerequisites" rows="2">${escapeHtml(lines(node.prerequisites || []))}</textarea></label>
+      <label>学习目标<textarea name="learningGoal" rows="2" placeholder="能解释、能推导、能应用什么？">${escapeHtml(node.learningGoal || node.details || "")}</textarea></label>
+      <label>常见错因（每行一个）<textarea name="misconceptions" rows="2" placeholder="例如：将 Precision 与 Recall 的适用场景混淆">${escapeHtml(lines(node.misconceptions || (node.misconception ? [node.misconception] : [])))}</textarea></label>
+      <div class="form-grid"><label>诊断题（每行一个）<textarea name="diagnosticQuestions" rows="3">${escapeHtml(lines(node.diagnosticQuestions || ["概念辨析题", "公式推导题", "代码阅读题"]))}</textarea></label><label>补救资源（每行一个）<textarea name="remediationResources" rows="3">${escapeHtml(lines(node.remediationResources || ["概念对比微课", "教材重点页", "代码实验"]))}</textarea></label></div>
+      <div class="form-grid"><label>验证题（每行一个）<textarea name="verificationQuestions" rows="3">${escapeHtml(lines(node.verificationQuestions || ["变式题", "真实场景题"]))}</textarea></label><label>掌握标准<textarea name="masteryStandard" rows="3">${escapeHtml(node.masteryStandard || "连续两次变式题正确且能解释原因")}</textarea></label></div>
+      <button class="primary" type="submit">保存节点教学配置</button>
+    </form>
+    <div class="ml-relation-editor"><div class="split-head"><div><h3>语义关系</h3><span class="hint">前置依赖用于路径规划，易混淆关系用于错因诊断。</span></div></div>
+      <div class="ml-relation-list">${relationLinks.map((link) => `<span class="relation-chip ${graphRelationKey(link)}">${escapeHtml((graph.nodes.find((item) => item.id === link.source)?.label || link.source))} ${graphRelationKey(link) === "prerequisite" ? "→" : "↔"} ${escapeHtml(graph.nodes.find((item) => item.id === link.target)?.label || link.target)} · ${escapeHtml(link.label || "")}</span>`).join("") || `<span class="hint">暂无前置依赖或易混淆关系。</span>`}</div>
+      <form class="ml-relation-form" data-ml-relation-form data-graph-id="${escapeHtml(graph.id)}"><select name="source">${graph.nodes.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join("")}</select><select name="type"><option value="prerequisite">前置依赖</option><option value="misconception">易混淆关系</option></select><select name="target">${graph.nodes.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === node.id ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}</select><button class="mini" type="submit">添加关系</button></form>
+    </div>
+  </section>`;
 }
 
 function renderGraphLearningWorkspace(graphs, selected, mode = "teacher", includeList = true, showControlPanel = includeList) {
@@ -2336,8 +4237,8 @@ function renderGraphControlPanel(graphs, graph, mode = "teacher", includeList = 
     <aside class="graph-control-panel">
       ${mode === "student" ? `
         <section class="graph-control-block compact-subject">
-          <strong>学科</strong>
-          <select id="studentGraphSubject">${subjectSelectOptions(state.graphSubject, studentGraphSubjects(), true, "全部图谱")}</select>
+          <strong>课程</strong>
+          <span class="ml-graph-course-lock">机器学习 · 六模块</span>
         </section>
       ` : ""}
       <section class="graph-control-block">
@@ -2434,6 +4335,43 @@ function renderGraphChapterTree(graph) {
   `;
 }
 
+function renderStudentNodeAnnotationForm(graph, node) {
+  const annotation = studentNodeAnnotationFor(graph.id, node.id, node.label) || {};
+  const status = annotation.status || "learning";
+  const selected = (value) => status === value ? "selected" : "";
+  return `
+    <form class="node-annotation-form" data-node-annotation-form>
+      <input type="hidden" name="graphId" value="${escapeHtml(graph.id)}" />
+      <input type="hidden" name="nodeId" value="${escapeHtml(node.id)}" />
+      <input type="hidden" name="graphTitle" value="${escapeHtml(graph.title)}" />
+      <input type="hidden" name="subject" value="${escapeHtml(graph.subject || preferredSubject())}" />
+      <input type="hidden" name="nodeLabel" value="${escapeHtml(node.label)}" />
+      <label class="check-line"><input type="checkbox" name="favorite" value="1" ${annotation.favorite ? "checked" : ""} />收藏该节点</label>
+      <label>我的状态
+        <select name="status">
+          <option value="learning" ${selected("learning")}>正在学习</option>
+          <option value="mastered" ${selected("mastered")}>已掌握</option>
+          <option value="uncertain" ${selected("uncertain")}>不确定</option>
+          <option value="weak" ${selected("weak")}>易错/薄弱</option>
+          <option value="not_started" ${selected("not_started")}>未开始</option>
+        </select>
+      </label>
+      <label>我的理解<textarea name="explanation" rows="3" placeholder="用自己的话解释该节点，或记录仍不确定的问题">${escapeHtml(annotation.explanation || "")}</textarea></label>
+      <div class="form-grid two">
+        <label>证据类型
+          <select name="evidenceType">
+            ${["note", "code", "homework", "screenshot", "concept-map", "project"].map((item) => `<option value="${item}" ${annotation.evidenceType === item ? "selected" : ""}>${escapeHtml({ note: "笔记", code: "代码实验", homework: "作业", screenshot: "截图", "concept-map": "概念图", project: "项目报告" }[item])}</option>`).join("")}
+          </select>
+        </label>
+        <label>证据标题<input name="evidenceTitle" value="${escapeHtml(annotation.evidenceTitle || "")}" placeholder="例如：KNN 距离度量实验笔记" /></label>
+      </div>
+      <label>证据链接/说明<input name="evidenceUrl" value="${escapeHtml(annotation.evidenceUrl || "")}" placeholder="可填本地文件名、报告标题或外部链接" /></label>
+      <label class="check-line"><input type="checkbox" name="fromAiAnswer" value="1" ${annotation.fromAiAnswer ? "checked" : ""} />把本节点解释作为 AI 回答学习卡片入档</label>
+      <button class="primary" type="submit">保存节点证据</button>
+    </form>
+  `;
+}
+
 function renderGraphDetailPanel(graph, mode = "teacher") {
   if (!graph) {
     return `<aside class="graph-detail-panel">${emptyBlock("选择图谱后显示节点详情。")}</aside>`;
@@ -2467,6 +4405,52 @@ function renderGraphDetailPanel(graph, mode = "teacher") {
   if (points.length) {
     pushDetailCard("知识点解释", points.map((point) => `<p>${escapeHtml(point)}</p>`).join(""));
   }
+  if (mode === "student") {
+    const portfolio = currentStudentPortfolio();
+    const label = String(node.label || "");
+    const comparison = (portfolio.masteryComparison || []).find((item) => item.topic === label || item.topic.includes(label) || label.includes(item.topic));
+    const relatedTimeline = (portfolio.timeline || []).filter((item) => `${item.title} ${item.summary}`.includes(label)).slice(0, 4);
+    const relatedReflections = (portfolio.reflections || []).filter((item) => `${item.knowledgePoint} ${item.contextTitle} ${item.originalUnderstanding} ${item.aiDiscovery} ${item.strategyChange}`.includes(label)).slice(0, 3);
+    const misconception = (node.misconceptions || []).slice(0, 4);
+    const recentMisconceptions = (portfolio.misconceptionTrajectory || [])
+      .filter((item) => `${item.topic || ""} ${item.before || ""} ${item.issue || ""} ${item.after || ""}`.includes(label))
+      .slice(0, 3);
+    const prerequisiteNodes = (context.incoming || [])
+      .filter((link) => graphRelationKey(link) === "prerequisite" || graphRelationKey(link) === "dependency")
+      .map((link) => (graph.nodes || []).find((item) => item.id === link.source))
+      .filter(Boolean)
+      .slice(0, 5);
+    const blockedPrerequisites = prerequisiteNodes.filter((item) => {
+      const value = graphMasteryValue(item);
+      return graphNodeHasWeakness(item) || !Number.isFinite(value) || value < 0.58;
+    });
+    const resources = Array.isArray(node.resources) ? node.resources.slice(0, 3) : [];
+    const objective = node.cognitive?.objective || node.objective || `能够解释「${label}」的核心概念、适用条件，并完成一个迁移任务。`;
+    pushDetailCard("学习目标", `<p>${escapeHtml(objective)}</p>`);
+    pushDetailCard("前置知识与阻塞", prerequisiteNodes.length
+      ? `<p>${escapeHtml(prerequisiteNodes.map((item) => item.label).join("、"))}</p>${blockedPrerequisites.length ? `<p class="graph-blocked-warning">先补：${escapeHtml(blockedPrerequisites.map((item) => `${item.label}（${percentText(graphMasteryValue(item))}）`).join("、"))}</p>` : `<p class="graph-prereq-ready">前置节点已有可用掌握记录。</p>`}`
+      : `<p>暂无显式前置依赖，建议先完成一次概念辨析。</p>`);
+    pushDetailCard("常见错因", misconception.length ? misconception.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>把逻辑回归误认为回归问题；认为准确率高就一定模型好；把标准化和归一化混为一谈。</p>`);
+    pushDetailCard("我的最近错因", recentMisconceptions.length ? recentMisconceptions.map((item) => `<p><b>${escapeHtml(item.issue || "待修正")}</b>：${escapeHtml(item.before || item.after || "已记录一条错因轨迹")}</p>`).join("") : `<p>暂无该节点的个人错因记录。完成 AI 诊断或节点测试后会自动归档。</p>`);
+    pushDetailCard("推荐资料", resources.length ? resources.map((item) => `<p>${escapeHtml(item.title || item.name || item.label || "课程资料")}</p>`).join("") : `<p>进入课程资料或关联图谱节点查看可用微课与例题。</p>`);
+    pushDetailCard("学习操作", `
+      <div class="graph-student-actions">
+        <button type="button" class="mini primary" data-graph-node-action="explain">进入 AI 助教</button>
+        <button type="button" class="mini" data-graph-node-action="exercise">生成练习</button>
+        <button type="button" class="mini" data-graph-node-action="experiment">开始实验</button>
+        <button type="button" class="mini" data-graph-node-action="path">查看错因轨迹</button>
+      </div>
+    `);
+    pushDetailCard("我的学习状态", `
+      <p>${comparison ? `我学过该节点：前测 ${escapeHtml(comparison.startText)}，当前 ${escapeHtml(comparison.currentText)}，变化 ${escapeHtml(comparison.changeText)}。` : "我还没有形成该节点的真实测试或诊断记录。"}</p>
+      ${relatedTimeline[0] ? `<p>最近证据：${escapeHtml(relatedTimeline[0].type)} · ${escapeHtml(fmtTime(relatedTimeline[0].time))} · ${escapeHtml(relatedTimeline[0].summary || relatedTimeline[0].title)}</p>` : ""}
+    `);
+    pushDetailCard("学习路径解释", renderGraphLearningPathExplanation(graph, node, context));
+    pushDetailCard("我的笔记/反思", relatedReflections.length
+      ? relatedReflections.map((item) => `<p>${escapeHtml(item.strategyChange || item.aiDiscovery || item.nextPlan || item.originalUnderstanding)}</p>`).join("")
+      : `<p>暂无该节点反思。可在学习档案中新增结构化反思。</p>`);
+    pushDetailCard("我的节点证据", renderStudentNodeAnnotationForm(graph, node));
+  }
   return `
     <aside class="graph-detail-panel">
       <div class="detail-head">
@@ -2487,10 +4471,18 @@ function renderGraphLegend() {
   return `
     <section class="graph-legend">
       <strong>图例</strong>
-      <div><span class="legend-dot concept"></span>概念</div>
-      <div><span class="legend-dot method"></span>方法/算法</div>
-      <div><span class="legend-dot formula"></span>公式</div>
-      <div><span class="legend-dot misconception"></span>易错点</div>
+      ${state.user?.role === "student" ? `
+        <div><span class="legend-dot mastery-high"></span>已掌握</div>
+        <div><span class="legend-dot mastery-mid"></span>待巩固</div>
+        <div><span class="legend-dot mastery-low"></span>高风险</div>
+        <div><span class="legend-dot learning"></span>正在学习</div>
+        <div><span class="legend-dot not-started"></span>未开始</div>
+      ` : `
+        <div><span class="legend-dot concept"></span>概念</div>
+        <div><span class="legend-dot method"></span>方法/算法</div>
+        <div><span class="legend-dot formula"></span>公式</div>
+        <div><span class="legend-dot misconception"></span>易错点</div>
+      `}
       <div><span class="legend-line prerequisite"></span>前置依赖</div>
       <div><span class="legend-line misconception"></span>易混淆</div>
     </section>
@@ -2607,8 +4599,34 @@ function isRealLearnerState(learner) {
   return !/模拟|可接入|后续|节点层级|待真实诊断|暂无基于/.test(evidenceText);
 }
 
+function studentNodeAnnotationFor(graphId = "", nodeId = "", nodeLabel = "") {
+  return (state.data?.studentNodeAnnotations || []).find((item) => (
+    (!graphId || item.graphId === graphId)
+    && (item.nodeId === nodeId || (nodeLabel && item.nodeLabel === nodeLabel))
+  )) || null;
+}
+
+function annotationLearnerState(annotation) {
+  if (!annotation) return {};
+  const score = {
+    mastered: 0.86,
+    uncertain: 0.55,
+    weak: 0.32,
+    learning: 0.62,
+    not_started: 0.18
+  }[annotation.status];
+  return {
+    mastery: Number.isFinite(score) ? score : undefined,
+    status: annotation.statusLabel || "",
+    evidence: annotation.explanation || annotation.evidenceTitle || "学生主动图谱标注"
+  };
+}
+
 function realLearnerState(node) {
-  return isRealLearnerState(node?.learnerState) ? node.learnerState : {};
+  const base = isRealLearnerState(node?.learnerState) ? node.learnerState : {};
+  if (state.user?.role !== "student") return base;
+  const annotation = studentNodeAnnotationFor("", node?.id || "", node?.label || "");
+  return annotation ? { ...base, ...annotationLearnerState(annotation) } : base;
 }
 
 function graphNodeHasWeakness(node) {
@@ -2645,6 +4663,7 @@ function graphNodeMatchesDashboardFilter(node, index = 0, filter = state.graphNo
   const mastery = graphMasteryValue(node);
   if (key === "weak") return graphNodeHasWeakness(node) || (Number.isFinite(mastery) && mastery < 0.58);
   if (key === "mastered") return Number.isFinite(mastery) && mastery >= 0.78;
+  if (key === "misconception") return graphNodeVisualClass(node, index) === "misconception" || /易错|混淆|误区|错因/.test(String(node?.label || node?.details || node?.misconception || ""));
   if (key === "core") return graphNodeLevel(node, index) <= 1 || graphNodeImportanceScore(node, index) >= 58;
   if (key === "resource") return graphHasResource(node);
   if (key === "exercise") return graphHasExercise(node);
@@ -2894,8 +4913,12 @@ function graphMasteryClass(node) {
   const learner = realLearnerState(node);
   const stateText = String(learner.status || "");
   const mastery = Number(learner.mastery);
-  if (!stateText && !Number.isFinite(mastery)) return "";
-  if (stateText.includes("未") || (Number.isFinite(mastery) && mastery < 0.35)) return "mastery-low";
+  if (!stateText && !Number.isFinite(mastery)) {
+    if (state.user?.role === "student" && (state.graphFocusNodeId === node?.id || state.graphSelectedNodeId === node?.id)) return "learning";
+    return state.user?.role === "student" ? "not-started" : "";
+  }
+  if (/未学习|未开始|未诊断/.test(stateText)) return "not-started";
+  if (stateText.includes("未") || stateText.includes("高风险") || stateText.includes("薄弱") || (Number.isFinite(mastery) && mastery < 0.35)) return "mastery-low";
   if (stateText.includes("模糊") || (Number.isFinite(mastery) && mastery < 0.58)) return "mastery-mid";
   if (stateText.includes("精通") || (Number.isFinite(mastery) && mastery >= 0.82)) return "mastery-expert";
   return "mastery-high";
@@ -3359,12 +5382,19 @@ function getGraphView(graph) {
 function renderGraphViewer(graph) {
   const displayGraph = graphDisplayGraph(graph);
   const stats = displayGraph.meta?.visibleStats || {};
+  const size = graphCanvasSize(displayGraph);
+  const view = getGraphView(displayGraph);
+  const zoomText = `${Math.round(Number(view?.scale || defaultGraphScale(size)) * 100)}%`;
   return `
     <div class="graph-viewer" data-graph-viewer="${graph.id}">
-      <div class="graph-toolbar">
-        <button class="mini" data-graph-zoom="out">缩小</button>
-        <button class="mini" data-graph-zoom="reset">重置</button>
-        <button class="mini" data-graph-zoom="in">放大</button>
+      <div class="graph-toolbar graph-zoom-dock" aria-label="图谱工具">
+        <button type="button" class="graph-icon-button" data-graph-action="maximize" title="${state.graphMaximized ? "还原" : "最大化"}">${iconSvg(state.graphMaximized ? "minimize" : "maximize", state.graphMaximized ? "还原" : "最大化")}</button>
+        <button type="button" class="graph-icon-button" data-graph-zoom="in" title="放大">${iconSvg("zoomIn", "放大")}</button>
+        <span class="graph-zoom-value">${escapeHtml(zoomText)}</span>
+        <button type="button" class="graph-icon-button" data-graph-zoom="out" title="缩小">${iconSvg("zoomOut", "缩小")}</button>
+        <button type="button" class="graph-icon-button" data-graph-zoom="reset" title="重置视图">${iconSvg("target", "重置视图")}</button>
+        <button type="button" class="graph-icon-button" data-graph-zoom="reset" title="恢复布局">${iconSvg("refresh", "恢复布局")}</button>
+        <button type="button" class="graph-icon-button" title="图谱快照">${iconSvg("image", "图谱快照")}</button>
         <strong>${stats.nodes || 0}/${stats.totalNodes || 0} 节点 · ${stats.links || 0}/${stats.totalLinks || 0} 关系</strong>
       </div>
       ${renderGraphSvg(graph)}
@@ -3493,6 +5523,10 @@ function renderGraphNodeModal() {
           <article>
             <strong>知识点解释</strong>
             ${explanation.map((point) => `<p>${escapeHtml(point)}</p>`).join("") || `<p>${escapeHtml(node.label)}：当前节点暂无补充解释。</p>`}
+          </article>
+          <article class="path-explanation-card">
+            <strong>学习路径解释</strong>
+            ${renderGraphLearningPathExplanation(graph, node, context)}
           </article>
         </div>
       </section>
@@ -3776,6 +5810,25 @@ function graphLocalSubgraphSummary(graph, node, context) {
   };
 }
 
+function renderGraphLearningPathExplanation(graph, node, context) {
+  const path = graphShortestLearningPath(graph, node, context);
+  const weakSources = graphWeaknessAttribution(graph, node);
+  const learner = realLearnerState(node);
+  const mastery = Number(learner.mastery);
+  const lowMastery = !Number.isFinite(mastery) || mastery < 0.58;
+  const misconceptionText = node.misconception || (node.misconceptions || []).slice(0, 3).join("、") || "暂无显式误区，需要用前测或 AI 诊断确认。";
+  const fallback = weakSources[0]?.label && weakSources[0].label !== node.label ? weakSources[0].label : (context.parent?.label || path[path.length - 2] || "前置节点");
+  return `
+    <div class="graph-path-explanation">
+      <p><b>为什么先学这个：</b>${escapeHtml(lowMastery ? "该节点与当前薄弱点或未诊断状态相关，先补它可以支撑后续任务。" : "该节点已有掌握证据，适合作为后测和迁移验证点。")}</p>
+      <p><b>与错因的关系：</b>${escapeHtml(misconceptionText)}</p>
+      <p><b>前置知识：</b>${escapeHtml(path.slice(0, -1).slice(-4).join(" → ") || "本章基础概念")}</p>
+      <p><b>学完怎么验证：</b>${escapeHtml(graphHasExercise(node) ? "完成节点关联练习或知识测试，并把结果写入学习档案。" : "用自己的话解释该节点，再完成一道同知识点变式题。")}</p>
+      <p><b>仍未掌握下一步：</b>${escapeHtml(`回到「${fallback}」补学，并让 AI 只给提示和引用，不直接代答。`)}</p>
+    </div>
+  `;
+}
+
 function enrichedNodePoints(graph, node, context) {
   const label = String(node.label || "该节点");
   const parentLabel = context.parent?.label || graph.subject || "当前图谱";
@@ -3849,6 +5902,10 @@ function bindInteractiveGraph() {
     nodeEl.addEventListener("dblclick", (event) => {
       event.stopPropagation();
       if (nodeClickTimer) clearTimeout(nodeClickTimer);
+      if (nodeEl.closest(".graph-atlas-shell")) {
+        setGraphMaximized(!state.graphMaximized, true);
+        return;
+      }
       state.graphSelectedNodeId = nodeEl.dataset.nodeId;
       state.graphFocusNodeId = nodeEl.dataset.nodeId;
       state.graphLayer = "relation";
@@ -3946,6 +6003,57 @@ function bindInteractiveGraph() {
   });
 }
 
+function syncGraphMaximizedClass() {
+  const active = state.page === "graph" && state.graphMaximized;
+  document.body?.classList.toggle("graph-page-maximized", active);
+  document.querySelectorAll(".graph-atlas-shell").forEach((shell) => {
+    shell.classList.toggle("graph-maximized", active);
+  });
+}
+
+function setGraphMaximized(maximized, requestFullscreen = false) {
+  state.graphMaximized = Boolean(maximized);
+  syncGraphMaximizedClass();
+  const shell = document.querySelector(".graph-atlas-shell");
+  if (!shell) return;
+  if (state.graphMaximized && requestFullscreen && shell.requestFullscreen && !document.fullscreenElement) {
+    shell.requestFullscreen().catch(() => {});
+  } else if (!state.graphMaximized && document.fullscreenElement === shell && document.exitFullscreen) {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+
+function bindGraphMaximizeControls() {
+  const shell = document.querySelector(".graph-atlas-shell");
+  if (!shell) {
+    syncGraphMaximizedClass();
+    return;
+  }
+  syncGraphMaximizedClass();
+  shell.addEventListener("dblclick", (event) => {
+    if (event.target.closest(".graph-node, button, a, input, select, textarea, .graph-toolbar, .graph-atlas-filterbar, .graph-atlas-nav, .graph-atlas-mode-panel, .graph-atlas-footer")) return;
+    setGraphMaximized(!state.graphMaximized, true);
+  });
+  document.querySelectorAll('[data-graph-action="maximize"]').forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setGraphMaximized(!state.graphMaximized, true);
+      button.title = state.graphMaximized ? "还原" : "最大化";
+      button.innerHTML = iconSvg(state.graphMaximized ? "minimize" : "maximize", button.title);
+    });
+  });
+  if (!window.__graphFullscreenListenerBound) {
+    document.addEventListener("fullscreenchange", () => {
+      if (state.graphMaximized && !document.fullscreenElement) {
+        state.graphMaximized = false;
+        syncGraphMaximizedClass();
+        renderContent();
+      }
+    });
+    window.__graphFullscreenListenerBound = true;
+  }
+}
+
 function stopGraphJobPolling() {
   if (state.graphJobTimer) clearTimeout(state.graphJobTimer);
   state.graphJobTimer = null;
@@ -4030,6 +6138,7 @@ function bindGraphTaskControls() {
   });
   document.querySelectorAll("[data-open-job-graph]").forEach((button) => {
     button.addEventListener("click", () => {
+      state.graphMaximized = false;
       state.selectedGraphId = button.dataset.openJobGraph;
       state.graphTab = "library";
       renderContent();
@@ -4224,7 +6333,47 @@ async function generateGraphFromUploadedFile({ file, files = null, subject, titl
 }
 
 function bindGraphPage() {
+  document.querySelector("[data-ml-graph-node-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const body = { userId: state.user.id, nodeId: form.dataset.nodeId };
+    ["label", "group", "learningGoal", "masteryStandard"].forEach((key) => { body[key] = String(data.get(key) || ""); });
+    ["prerequisites", "misconceptions", "diagnosticQuestions", "remediationResources", "verificationQuestions"].forEach((key) => { body[key] = String(data.get(key) || "").split(/\n|；|;/).map((item) => item.trim()).filter(Boolean); });
+    try {
+      const payload = await api(`/api/graphs/${form.dataset.graphId}`, { method: "PUT", body });
+      const index = state.data.knowledgeGraphs.findIndex((item) => item.id === payload.graph.id);
+      if (index >= 0) state.data.knowledgeGraphs[index] = payload.graph;
+      showToast("节点教学配置已保存");
+      renderContent();
+    } catch (error) { showToast(error.message, "error"); }
+  });
+  document.querySelector("[data-ml-relation-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const graph = state.data.knowledgeGraphs.find((item) => item.id === form.dataset.graphId);
+    if (!graph) return;
+    const source = String(data.get("source") || "");
+    const target = String(data.get("target") || "");
+    const type = String(data.get("type") || "prerequisite");
+    if (!source || !target || source === target) return showToast("请选择两个不同的知识点", "error");
+    const exists = (graph.links || []).some((link) => link.source === source && link.target === target && graphRelationKey(link) === type);
+    if (exists) return showToast("这条语义关系已经存在", "error");
+    const links = [...(graph.links || []), { source, target, type, label: type === "prerequisite" ? "前置依赖" : "易混淆关系", pedagogy: type === "prerequisite" ? "用于路径规划和薄弱点归因" : "用于错因诊断和对比干预" }];
+    try {
+      const payload = await api(`/api/graphs/${form.dataset.graphId}`, { method: "PUT", body: { userId: state.user.id, links } });
+      const index = state.data.knowledgeGraphs.findIndex((item) => item.id === payload.graph.id);
+      if (index >= 0) state.data.knowledgeGraphs[index] = payload.graph;
+      showToast("语义关系已保存");
+      renderContent();
+    } catch (error) { showToast(error.message, "error"); }
+  });
+  bindDashboardPageLinks();
+  bindReflectionForms();
+  bindNodeAnnotationForms();
   bindInteractiveGraph();
+  bindGraphMaximizeControls();
   bindGraphProgressControls();
   bindGraphTaskControls();
   loadGraphJobsSnapshot();
@@ -4282,7 +6431,9 @@ function bindGraphPage() {
         body: {
           subject: form.get("subject"),
           materialId: form.get("materialId"),
-          count: 4
+          count: 4,
+          phase: form.get("phase") || state.knowledgeTest?.phase || "diagnostic",
+          nodeId: state.graphFocusNodeId || state.graphSelectedNodeId || ""
         }
       });
       state.knowledgeTest = {
@@ -4297,7 +6448,9 @@ function bindGraphPage() {
         attempts: [],
         summary: null,
         sourceNotice: payload.quiz.sourceNotice || "",
-        sourceMaterials: payload.quiz.sourceMaterials || []
+        sourceMaterials: payload.quiz.sourceMaterials || [],
+        phase: payload.quiz.phase || form.get("phase") || "diagnostic",
+        previousAccuracy: state.knowledgeTest?.phase === "diagnostic" ? Number(state.knowledgeTest?.summary?.accuracy || 0) : Number(state.knowledgeTest?.previousAccuracy || 0)
       };
       renderContent();
       showToast("知识测试题目已生成");
@@ -4322,7 +6475,9 @@ function bindGraphPage() {
           question,
           answer,
           attempts: test.attempts || [],
-          questionCount: (test.questions || []).length
+          questionCount: (test.questions || []).length,
+          phase: test.phase || question.phase || "diagnostic",
+          previousAccuracy: test.previousAccuracy || 0
         }
       });
       const attempt = {
@@ -4345,9 +6500,33 @@ function bindGraphPage() {
         answer,
         result: payload.result,
         attempts,
-        summary: payload.result.overall || null
+        summary: payload.result.overall || null,
+        phase: test.phase || question.phase || "diagnostic"
       };
       await loadState();
+      if ((test.phase || question.phase) === "remedial" && attempts.length >= (test.questions || []).length) {
+        const verifyPayload = await api("/api/knowledge-tests/generate", {
+          method: "POST",
+          body: { subject: test.subject, materialId: test.materialId, count: 4, phase: "verify", nodeId: question.nodeId || state.graphFocusNodeId || state.graphSelectedNodeId || "" }
+        });
+        state.knowledgeTest = {
+          ...test,
+          phase: "verify",
+          quizId: verifyPayload.quiz.id,
+          questions: verifyPayload.quiz.questions || [],
+          currentIndex: 0,
+          answer: "",
+          result: null,
+          attempts: [],
+          summary: null,
+          sourceNotice: verifyPayload.quiz.sourceNotice || "",
+          sourceMaterials: verifyPayload.quiz.sourceMaterials || [],
+          previousAccuracy: Number(test.previousAccuracy || test.summary?.accuracy || 0)
+        };
+        renderContent();
+        showToast("补救完成，已自动生成验证性小测");
+        return;
+      }
       renderShell();
       showToast(`本题 ${payload.result.accuracy}%；累计 ${payload.result.overall?.accuracy ?? payload.result.accuracy}%`);
     } catch (error) {
@@ -4369,6 +6548,59 @@ function bindGraphPage() {
       result: null
     };
     renderContent();
+  });
+  document.querySelectorAll("[data-practice-phase], [data-practice-next-phase]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextPhase = button.dataset.practicePhase || button.dataset.practiceNextPhase;
+      state.knowledgeTest = {
+        ...(state.knowledgeTest || {}),
+        phase: nextPhase,
+        questions: [],
+        currentIndex: 0,
+        answer: "",
+        result: null,
+        attempts: [],
+        summary: null,
+        previousAccuracy: Number(state.knowledgeTest?.summary?.accuracy || state.knowledgeTest?.previousAccuracy || 0)
+      };
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-test-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.testAction;
+      const test = state.knowledgeTest || {};
+      const question = (test.questions || [])[Number(test.currentIndex || 0)] || {};
+      const result = test.result || {};
+      if (action === "analysis") {
+        const panel = document.querySelector("[data-practice-analysis]");
+        if (panel) panel.hidden = !panel.hidden;
+        return;
+      }
+      if (action === "archive") {
+        try {
+          await api("/api/wrong-notes", {
+            method: "POST",
+            body: {
+              userId: state.user.id,
+              topic: question.topic || test.subject || "机器学习知识点",
+              question: question.prompt || "知识测评",
+              answer: test.answer || "",
+              source: "知识测评订正",
+              analysis: (result.missing || []).length ? `待补齐：${(result.missing || []).join("、")}` : "学生主动加入订正档案",
+              recommendation: "完成同类辨析题与一道变式迁移题后再复测。"
+            }
+          });
+          await loadState();
+          showToast("已加入订正档案");
+        } catch (error) { showToast(error.message, "error"); }
+        return;
+      }
+      if (action === "variant") {
+        state.knowledgeTest = { ...test, phase: "remedial", questions: [], currentIndex: 0, answer: "", result: null, attempts: [], summary: null, previousAccuracy: Number(result.accuracy || test.previousAccuracy || 0) };
+        renderContent();
+      }
+    });
   });
   document.getElementById("refreshGraphJobs")?.addEventListener("click", loadGraphJobsSnapshot);
   document.getElementById("graphLibrarySearchForm")?.addEventListener("submit", (event) => {
@@ -4430,12 +6662,25 @@ function bindGraphPage() {
     renderContent();
   });
 
-  document.querySelectorAll("[data-graph-relation]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
-      state.graphRelationFilters = Array.from(document.querySelectorAll("[data-graph-relation]:checked"))
-        .map((item) => item.dataset.graphRelation);
+  document.querySelectorAll("[data-graph-relation]").forEach((control) => {
+    const isCheckbox = control.matches('input[type="checkbox"]');
+    const updateRelationFilters = () => {
+      if (isCheckbox) {
+        state.graphRelationFilters = Array.from(document.querySelectorAll('input[type="checkbox"][data-graph-relation]:checked'))
+          .map((item) => item.dataset.graphRelation);
+      } else {
+        const next = graphFilterSet();
+        const key = control.dataset.graphRelation;
+        if (next.has(key)) {
+          next.delete(key);
+        } else {
+          next.add(key);
+        }
+        state.graphRelationFilters = Array.from(next);
+      }
       renderContent();
-    });
+    };
+    control.addEventListener(isCheckbox ? "change" : "click", updateRelationFilters);
   });
 
   document.querySelectorAll("[data-graph-focus-node]").forEach((button) => {
@@ -4447,12 +6692,49 @@ function bindGraphPage() {
     });
   });
 
+  document.querySelectorAll("[data-ml-module]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const graph = graphListForCurrentRole().find((item) => item.id === state.selectedGraphId) || machineLearningGraph();
+      const module = ML_GRAPH_MODULES.find((item) => item.key === button.dataset.mlModule);
+      if (!graph || !module) return;
+      const match = (graph.nodes || [])
+        .map((node, index) => ({ node, score: (machineLearningModuleMatches(node, module) ? 100 : 0) + graphNodeImportanceScore(node, index) }))
+        .filter((entry) => entry.score >= 100)
+        .sort((a, b) => b.score - a.score)[0]?.node;
+      if (!match) return showToast("该模块暂未定位到对应知识点", "error");
+      state.selectedGraphId = graph.id;
+      state.graphFocusNodeId = match.id;
+      state.graphSelectedNodeId = match.id;
+      state.graphLayer = "relation";
+      state.graphNodeFilter = "all";
+      renderContent();
+    });
+  });
+
+  document.querySelectorAll("[data-ml-focus-node]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const graph = graphListForCurrentRole().find((item) => item.id === state.selectedGraphId) || machineLearningGraph();
+      if (!graph) return;
+      state.selectedGraphId = graph.id;
+      state.graphFocusNodeId = button.dataset.mlFocusNode;
+      state.graphSelectedNodeId = button.dataset.mlFocusNode;
+      state.graphLayer = "relation";
+      renderContent();
+    });
+  });
+
   document.querySelectorAll("[data-graph-node-action]").forEach((button) => {
     button.addEventListener("click", async () => {
       const action = button.dataset.graphNodeAction;
       const graph = graphListForCurrentRole().find((item) => item.id === state.selectedGraphId) || graphListForCurrentRole()[0];
       const node = graph ? graphSelectedNode(graph) : null;
       if (!graph || !node) return showToast("请先选择一个知识图谱节点", "error");
+      if (action === "experiment") {
+        state.modelSubject = "机器学习";
+        state.page = "models";
+        renderShell();
+        return;
+      }
       const context = graphNodeContext(graph, node);
       const linkNeighbor = (context.incoming || []).concat(context.outgoing || [])
         .map((link) => {
@@ -4530,6 +6812,7 @@ function bindGraphPage() {
   document.querySelectorAll("[data-select-graph]").forEach((card) => {
     card.addEventListener("dblclick", (event) => {
       if (event.target.closest("button, a, input, select, textarea")) return;
+      state.graphMaximized = false;
       state.selectedGraphId = card.dataset.selectGraph;
       state.graphFocusNodeId = null;
       state.graphSelectedNodeId = null;
@@ -4541,6 +6824,7 @@ function bindGraphPage() {
   });
 
   document.getElementById("graphBackToLibrary")?.addEventListener("click", () => {
+    setGraphMaximized(false);
     state.selectedGraphId = null;
     state.graphFocusNodeId = null;
     state.graphSelectedNodeId = null;
@@ -4563,6 +6847,7 @@ function bindGraphPage() {
       if (!confirm("确认删除该图谱？")) return;
       try {
         await api(`/api/graphs/${button.dataset.deleteGraph}?userId=${state.user.id}`, { method: "DELETE" });
+        setGraphMaximized(false);
         state.selectedGraphId = null;
         state.graphFocusNodeId = null;
         state.graphSelectedNodeId = null;
@@ -4591,6 +6876,7 @@ function bindGraphPage() {
   });
 
   document.getElementById("studentGraphSubject")?.addEventListener("change", (event) => {
+    setGraphMaximized(false);
     state.graphSubject = event.target.value;
     state.selectedGraphId = null;
     state.graphFocusNodeId = null;
@@ -4879,18 +7165,14 @@ function aiTaskOptions(isTeacher = isTeacherLike()) {
       { key: "grading", label: "批改", hint: "评分建议和错因分析", mode: "grade" },
       { key: "class_analysis", label: "学情", hint: "薄弱点和分层补救", mode: "plan" }
     ]
-    : [
-      { key: "explain", label: "讲解", hint: "把概念讲清楚", mode: "explain" },
-      { key: "guided", label: "提示", hint: "只给下一步线索", mode: "guided" },
-      { key: "practice", label: "出题", hint: "生成练习并解析", mode: "practice" },
-      { key: "plan", label: "复习计划", hint: "安排复习路径", mode: "plan" }
-    ];
+    : STUDENT_AI_TASK_MODES;
 }
 
 function renderAiTaskButtons(isTeacher) {
   const current = normalizeAiModeClient(state.aiMode);
   const options = aiTaskOptions(isTeacher);
-  const currentTask = isTeacher ? (state.aiTeacherTask || state.aiTaskKey || "lesson_plan") : (state.aiTaskKey || current);
+  const requestedTask = isTeacher ? (state.aiTeacherTask || state.aiTaskKey || "lesson_plan") : (state.aiTaskKey || current);
+  const currentTask = options.some((item) => item.key === requestedTask) ? requestedTask : options[0]?.key;
   return `
     <div class="ai-task-strip" aria-label="${isTeacher ? "教师任务" : "学习任务"}">
       ${options.map((item) => `
@@ -5047,7 +7329,13 @@ function renderAiMessageMeta(message) {
 }
 
 function renderAiMessageActions(message) {
-  return "";
+  if (message.role !== "assistant") return "";
+  return `
+    <div class="ai-message-actions">
+      <button class="mini" type="button" data-ai-card-message="${escapeHtml(message.id)}">转学习卡片</button>
+      <button class="mini" type="button" data-dashboard-page="portfolio">写反思</button>
+    </div>
+  `;
 }
 
 function renderPanelChipList(items = [], emptyText = "暂无数据") {
@@ -5124,12 +7412,36 @@ function aiMessageDisplayContent(message) {
   return String(message.workflowResult?.final_answer || message.content || "");
 }
 
+function aiAnswerSummary(message, content) {
+  const workflowResult = message.workflowResult || {};
+  const topic = workflowResult.topic_localization?.selectedTopic || workflowResult.topic_label || (message.knowledgePoints || [])[0] || "";
+  const feedback = workflowResult.diagnosis_feedback || workflowResult.mastery_level || "";
+  const next = Array.isArray(workflowResult.next_questions) ? workflowResult.next_questions[0] : "";
+  const plain = String(content || "").replace(/#+\s*/g, "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  return {
+    title: topic ? `本轮重点：${topic}` : "本轮摘要",
+    summary: feedback ? compactText(feedback, 130) : compactText(plain[0] || "", 130),
+    action: next ? `下一步：${compactText(next, 90)}` : "下一步：完成一次测试或写一条反思，把证据归入学习档案。"
+  };
+}
+
 function renderAiMessage(message) {
   const citations = Array.isArray(message.citations) ? message.citations : [];
   const confidence = message.confidence ? `<small class="answer-source">可靠性：${escapeHtml(message.confidence)}${citations.length ? ` · 引用 ${citations.length} 条` : ""}</small>` : "";
   const content = aiMessageDisplayContent(message);
+  const summary = message.role === "assistant" ? aiAnswerSummary(message, content) : null;
   const body = message.role === "assistant"
-    ? `<pre class="ai-answer-text">${escapeHtml(content)}</pre>`
+    ? `
+      <div class="ai-answer-summary-card">
+        <strong>${escapeHtml(summary.title)}</strong>
+        <p>${escapeHtml(summary.summary || "工作流已返回回答。")}</p>
+        <span>${escapeHtml(summary.action)}</span>
+      </div>
+      <details class="ai-answer-detail" ${String(content || "").length < 520 ? "open" : ""}>
+        <summary>查看详细解释</summary>
+        <pre class="ai-answer-text">${escapeHtml(content)}</pre>
+      </details>
+    `
     : `<p>${escapeMultiline(content)}</p>`;
   return `
     <div class="bubble ${message.role}">
@@ -5646,7 +7958,7 @@ function renderAgentTracePanel(active) {
 function aiPromptPlaceholder(isTeacher) {
   return isTeacher
     ? "直接输入教学需求，例如：给高一3班讲KNN，先看这个知识点的学情，再生成课堂练习"
-    : "直接输入问题、学科、需要的深度或你的答案，例如：机器学习 KNN 这题我的答案是...";
+    : "先写你的原始理解，再让 AI 诊断、给引用并接受你的审辩，例如：我认为 KNN 是...";
 }
 
 function inferAiModeFromPrompt(prompt, isTeacher) {
@@ -5660,8 +7972,238 @@ function inferAiModeFromPrompt(prompt, isTeacher) {
   return "qa";
 }
 
+function renderTopicLocalizationCard(assistant, panel = {}) {
+  const workflowResult = assistant?.workflowResult || {};
+  const localization = workflowResult.topic_localization || panel.topicLocalization || {};
+  const candidates = Array.isArray(localization.candidates) ? localization.candidates : [];
+  const selected = localization.selectedTopic || workflowResult.topic_label || (assistant?.knowledgePoints || [])[0] || "待定位";
+  const confidence = Number(localization.confidence);
+  const confidenceText = Number.isFinite(confidence) ? percentText(confidence) : (localization.confidenceLabel || "待确认");
+  return `
+    <section class="ai-side-card diagnosis-card">
+      <h3>诊断卡</h3>
+      <div class="ai-side-card-body">
+        <div class="diagnosis-main">
+          <strong>${escapeHtml(selected)}</strong>
+          <span>置信度 ${escapeHtml(confidenceText)} · ${localization.needsConfirmation ? "待确认，不更新画像" : "已写入学习画像"}</span>
+        </div>
+        <div class="mastery-meter small"><span style="width:${Number.isFinite(confidence) ? clamp(confidence, 0, 1) * 100 : 0}%"></span></div>
+        <p class="hint">${escapeHtml(localization.basis || localization.policy || "提交问题后会显示定位依据。")}</p>
+        ${candidates.length ? `
+          <div class="topic-candidate-list">
+            ${candidates.map((item) => `<span>${escapeHtml(item.topic)} <small>${percentText(item.probability)}</small></span>`).join("")}
+          </div>
+        ` : `<p class="hint">暂无候选列表。</p>`}
+        ${assistant ? `<form class="topic-correction-form" data-topic-correction-form>
+          <input type="hidden" name="messageId" value="${escapeHtml(assistant?.id || "")}" />
+          <input type="hidden" name="fromTopic" value="${escapeHtml(selected)}" />
+          <input type="hidden" name="confidence" value="${escapeHtml(localization.confidence || "")}" />
+          <label>手动纠正知识点<input name="correctedTopic" list="topicCorrectionCandidates" placeholder="例如：K 近邻" required /></label>
+          <datalist id="topicCorrectionCandidates">
+            ${candidates.map((item) => `<option value="${escapeHtml(item.topic)}"></option>`).join("")}
+          </datalist>
+          <label>纠正依据<input name="reason" placeholder="例如：我的问题问的是 KNN 核心思想，不是支持向量机" /></label>
+          <button class="mini" type="submit">重新归档</button>
+        </form>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderStudentAiEvidenceCard(assistant, panel = {}) {
+  const citations = panel.citations || assistant?.citations || [];
+  const workflowResult = assistant?.workflowResult || {};
+  const missing = workflowResult.missing_points || [];
+  const errors = workflowResult.error_tags || [];
+  return `
+    <section class="ai-side-card evidence-card">
+      <h3>证据卡</h3>
+      <div class="ai-side-card-body">
+        ${renderCitationList(citations)}
+        ${(panel.relatedKnowledgePoints || []).length ? `<p class="hint">图谱节点：${escapeHtml((panel.relatedKnowledgePoints || []).slice(0, 4).map((item) => item.label || item.topic || item).join("、"))}</p>` : ""}
+        ${missing.length || errors.length ? `<p class="hint">错因命中：${escapeHtml([...errors, ...missing].slice(0, 5).join("、"))}</p>` : `<p class="hint">暂无错因命中。提供自己的答案后可形成诊断反馈。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderProfileDrivenPathCard(panel = {}) {
+  const path = panel.profileDrivenPath || {};
+  const steps = Array.isArray(path.nextPath) ? path.nextPath : [];
+  return `
+    <section class="ai-side-card profile-path-card">
+      <h3>GraphRAG + 画像路径</h3>
+      <div class="ai-side-card-body">
+        <p class="hint">${escapeHtml(path.rationale || "AI 回答会绑定课程资料和图谱节点，学习行为回写画像后影响推荐路径。")}</p>
+        ${path.graphNode?.label ? `<p><strong>${escapeHtml(path.graphNode.label)}</strong><br /><span class="hint">${escapeHtml((path.graphNode.path || []).join(" → ") || path.graphNode.graphTitle || "知识图谱节点")}</span></p>` : ""}
+        <ol class="learning-panel-list">
+          ${steps.slice(0, 5).map((step) => `<li>${escapeHtml(step)}</li>`).join("") || `<li>完成一次诊断后生成画像驱动路径。</li>`}
+        </ol>
+      </div>
+    </section>
+  `;
+}
+
+function renderMetacognitionCard(panel = {}) {
+  const prompts = Array.isArray(panel.metacognitivePrompts) ? panel.metacognitivePrompts : [];
+  return `
+    <section class="ai-side-card metacognition-card">
+      <h3>元认知追问</h3>
+      <div class="ai-side-card-body">
+        <ol class="learning-panel-list">
+          ${prompts.slice(0, 5).map((prompt) => `<li>${escapeHtml(prompt)}</li>`).join("") || `<li>你为什么这样理解？你最不确定的是什么？下一步如何验证？</li>`}
+        </ol>
+      </div>
+    </section>
+  `;
+}
+
+function renderAiTrustReviewCard(assistant, active) {
+  if (!assistant) return "";
+  const workflowResult = assistant.workflowResult || {};
+  const topic = workflowResult.topic_localization?.selectedTopic || workflowResult.topic_label || (assistant.knowledgePoints || [])[0] || "";
+  const reviewOptions = [
+    ["accepted", "我采纳"],
+    ["partial_accept", "我部分采纳"],
+    ["challenge", "我质疑"],
+    ["ai_error", "我发现 AI 错误"],
+    ["citation_needed", "我需要资料引用验证"]
+  ];
+  return `
+    <section class="ai-side-card ai-trust-card">
+      <h3>AI 审辩</h3>
+      <div class="ai-side-card-body">
+        <form class="ai-review-form" data-ai-review-form>
+          <input type="hidden" name="conversationId" value="${escapeHtml(active?.id || state.activeConversationId || "")}" />
+          <input type="hidden" name="messageId" value="${escapeHtml(assistant.id || "")}" />
+          <input type="hidden" name="topic" value="${escapeHtml(topic)}" />
+          <label>我的判断
+            <select name="reviewType">
+              ${reviewOptions.map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join("")}
+            </select>
+          </label>
+          <label>可信度
+            <select name="trustScore">
+              <option value="0.8">高</option>
+              <option value="0.55">中</option>
+              <option value="0.25">低</option>
+            </select>
+          </label>
+          <label>审辩说明<textarea name="comment" rows="2" placeholder="例如：引用材料对应 KNN，但回答混入了 SVM。"></textarea></label>
+          <label>我的最终判断<textarea name="finalJudgment" rows="2" required placeholder="写一句最终判断：我采纳/保留/反驳 AI 的哪些内容，理由是什么。"></textarea></label>
+          <label>下一步验证<input name="studentAction" placeholder="例如：手动纠正知识点，并做一道变式题验证" /></label>
+          <label>引用核验<input name="verificationNeed" placeholder="例如：需要回看第 5 章 KNN 距离度量材料" /></label>
+          <button class="mini" type="submit">保存审辩记录</button>
+        </form>
+      </div>
+    </section>
+  `;
+}
+
+function renderStudentAiNextStepCard(assistant, panel = {}) {
+  const workflowResult = assistant?.workflowResult || {};
+  const nextQuestions = Array.isArray(workflowResult.next_questions) ? workflowResult.next_questions : [];
+  const topic = workflowResult.topic_localization?.selectedTopic || workflowResult.topic_label || (assistant?.knowledgePoints || [])[0] || "";
+  return `
+    <section class="ai-side-card next-step-card">
+      <h3>下一步卡</h3>
+      <div class="ai-side-card-body">
+        <div class="quick-next-actions">
+          <button class="mini primary" type="button" data-dashboard-page="graph">去做知识测试</button>
+          <button class="mini" type="button" data-dashboard-page="graph">复习图谱节点</button>
+          <button class="mini" type="button" data-dashboard-page="portfolio">查看档案</button>
+        </div>
+        ${nextQuestions.length ? `<ol class="learning-panel-list">${nextQuestions.slice(0, 4).map((question) => `<li>${escapeHtml(question)}</li>`).join("")}</ol>` : `<p class="hint">完成提问后会出现推荐测试、复习节点和追问题。</p>`}
+        <details class="reflection-inline-card">
+          <summary>写本轮反思</summary>
+          ${renderStructuredReflectionForm({ contextType: "ai_diagnosis", contextId: assistant?.id || "", contextTitle: "AI 诊断", knowledgePoint: topic, subject: state.aiSubject || preferredSubject() })}
+        </details>
+      </div>
+    </section>
+  `;
+}
+
+function diagnosisTypeLabels(tags = []) {
+  const raw = Array.isArray(tags) ? tags.join("、") : String(tags || "");
+  const labels = [];
+  if (/概念|任务类型/.test(raw)) labels.push("概念混淆");
+  if (/前置|关键词/.test(raw)) labels.push("前置知识缺失");
+  if (/公式|目标/.test(raw)) labels.push("公式理解偏差");
+  if (/流程|步骤/.test(raw)) labels.push("步骤遗漏");
+  if (/代码|数据泄漏/.test(raw)) labels.push("代码实现错误");
+  if (/指标|场景|适用/.test(raw)) labels.push("迁移应用不足");
+  return labels.length ? labels : (raw ? [raw] : ["暂未发现显著错因"]);
+}
+
+function renderStructuredDiagnosisResult(active) {
+  const assistant = latestAssistantMessage(active);
+  const result = assistant?.workflowResult || {};
+  const panel = assistant?.learningPanel || {};
+  const hasDiagnosis = Boolean(assistant && (result.mastery_score !== undefined || result.masteryScore !== undefined || result.error_tags?.length || result.missing_points?.length));
+  const topic = result.topic_localization?.selectedTopic || result.topic_label || (assistant?.knowledgePoints || [])[0] || state.aiKnowledgePoint || "待学生提交作答";
+  const errorTags = Array.isArray(result.error_tags) ? result.error_tags : [];
+  const structuredTags = Array.isArray(result.misconception_tags) ? result.misconception_tags : errorTags;
+  const missing = Array.isArray(result.missing_points) ? result.missing_points : [];
+  const score = Number(result.mastery_score ?? result.masteryScore);
+  const userMessage = [...(active?.messages || [])].reverse().find((item) => item.role === "user");
+  const evidence = String(result.error_evidence || result.evidence_sentence || userMessage?.content || "等待学生作答后，系统将引用答案中的具体句子或代码行。").split("\n").find(Boolean) || "等待学生作答后生成。";
+  const graphFocus = panel.graphFocus;
+  if (!hasDiagnosis) {
+    return `
+      <section class="ai-side-card structured-diagnosis-card pending">
+        <h3>结构化诊断结果</h3>
+        <div class="ai-side-card-body"><p>请先在“错因诊断”模式提交你的答案与思路。AI 会判断正确性，但重点呈现错因、证据、掌握度和下一步补救任务。</p></div>
+      </section>
+    `;
+  }
+  return `
+    <section class="ai-side-card structured-diagnosis-card">
+      <h3>结构化诊断结果</h3>
+      <div class="ai-side-card-body">
+        <dl class="structured-diagnosis-list">
+          <div><dt>对应知识点</dt><dd>${escapeHtml(topic)}</dd></div>
+          <div><dt>错因类型</dt><dd>${escapeHtml(diagnosisTypeLabels(structuredTags).join("、") || "待分类")}${result.misconception_level ? ` · ${escapeHtml(result.misconception_level)}` : ""}</dd></div>
+          <div><dt>错误证据</dt><dd>“${escapeHtml(compactText(result.evidence || evidence, 110))}”</dd></div>
+          <div><dt>判断结果</dt><dd>${result.is_correct === true ? "正确" : result.is_correct === false ? "需要修正" : "待确认"}</dd></div>
+          <div><dt>掌握度估计</dt><dd><b>${Number.isFinite(score) ? `${Math.round(score)} / 100` : "待诊断"}</b>${result.mastery_level ? ` · ${escapeHtml(result.mastery_level)}` : ""}</dd></div>
+          <div><dt>关联节点</dt><dd>${escapeHtml(graphFocus?.label || (panel.relatedKnowledgePoints || []).map((item) => item.label || item).slice(0, 2).join("、") || "诊断后自动定位")}</dd></div>
+          <div><dt>下一步</dt><dd>${(result.recommended_actions || []).length ? escapeHtml(result.recommended_actions.slice(0, 3).join("；")) : `1 个微课、2 道变式题、1 个实验操作${score < 60 ? "，必要时向教师求助" : ""}`}</dd></div>
+          <div><dt>是否需要复测</dt><dd>${result.need_reassessment !== undefined ? (result.need_reassessment ? "是" : "否") : (!Number.isFinite(score) || score < 85 ? "是" : "否")}</dd></div>
+        </dl>
+        <div class="diagnosis-confirm-actions">
+          <form data-ai-review-form><input type="hidden" name="conversationId" value="${escapeHtml(active?.id || "")}" /><input type="hidden" name="messageId" value="${escapeHtml(assistant?.id || "")}" /><input type="hidden" name="topic" value="${escapeHtml(topic)}" /><input type="hidden" name="reviewType" value="accepted" /><input type="hidden" name="trustScore" value="0.8" /><input type="hidden" name="finalJudgment" value="我理解了本轮诊断，并将按补救任务完成验证。" /><button class="mini primary" type="submit">我理解了</button></form>
+          <form data-ai-review-form><input type="hidden" name="conversationId" value="${escapeHtml(active?.id || "")}" /><input type="hidden" name="messageId" value="${escapeHtml(assistant?.id || "")}" /><input type="hidden" name="topic" value="${escapeHtml(topic)}" /><input type="hidden" name="reviewType" value="challenge" /><input type="hidden" name="trustScore" value="0.55" /><input type="hidden" name="finalJudgment" value="我仍然困惑，需要通过变式题或向教师求助继续验证。" /><button class="mini" type="submit">仍然困惑</button></form>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderStudentAiInsightPanel(active) {
+  const assistant = latestAssistantMessage(active);
+  const panel = assistant?.learningPanel || {};
+  return `
+    <section class="ai-side ai-insight-panel student-diagnosis-rail ai-student-insight-stack">
+      <div class="ai-rail-head">
+        <div>
+          <h3>诊断与证据</h3>
+          <span>知识点定位可校验，低置信度不更新画像</span>
+        </div>
+      </div>
+      ${renderTopicLocalizationCard(assistant, panel)}
+      ${renderStructuredDiagnosisResult(active)}
+      ${renderStudentAiEvidenceCard(assistant, panel)}
+      ${renderProfileDrivenPathCard(panel)}
+      ${renderMetacognitionCard(panel)}
+      ${renderStudentAiNextStepCard(assistant, panel)}
+      ${renderAiTrustReviewCard(assistant, active)}
+    </section>
+  `;
+}
+
 function renderDifyWorkflowSummary(active) {
   const assistant = latestAssistantMessage(active);
+  if (!isTeacherLike()) return renderStudentAiInsightPanel(active);
   const panel = assistant?.learningPanel || {};
   const workflowResult = assistant?.workflowResult || {};
   const citations = panel.citations || assistant?.citations || [];
@@ -5727,6 +8269,56 @@ function renderDifyWorkflowSummary(active) {
   `;
 }
 
+function activeStudentAiTask() {
+  const currentMode = normalizeAiModeClient(state.aiMode);
+  return STUDENT_AI_TASK_MODES.find((item) => item.key === state.aiTaskKey)
+    || STUDENT_AI_TASK_MODES.find((item) => item.mode === currentMode)
+    || STUDENT_AI_TASK_MODES[0];
+}
+
+function renderStudentAiPathRail(active) {
+  const portfolio = currentStudentPortfolio();
+  const cycle = portfolio.learningCycle || {};
+  const path = portfolio.graphRagProfileCoupling?.recommendedPath || [];
+  const nextTask = cycle.nextTask || (cycle.tasks || []).find((task) => !task.done) || {};
+  const assistant = latestAssistantMessage(active);
+  const focus = assistant?.learningPanel?.graphFocus;
+  return `
+    <aside class="ai-path-rail">
+      <section class="ai-side-card">
+        <h3>当前学习周期</h3>
+        <div class="ai-side-card-body">
+          <strong>${escapeHtml(cycle.title || "本轮学习周期")}</strong>
+          <div class="cycle-stage-strip compact-stage-strip">${(cycle.currentStage?.stages || []).map((item) => `<span class="${item.done ? "done" : item.key === cycle.currentStage?.activeKey ? "active" : ""}"><b></b>${escapeHtml(item.label)}</span>`).join("")}</div>
+          <p>${escapeHtml(nextTask.nextAction || nextTask.label || "完成当前阶段任务")}</p>
+          <button class="mini primary" type="button" data-dashboard-page="${escapeHtml(nextTask.page || "portfolio")}">下一步</button>
+        </div>
+      </section>
+      <section class="ai-side-card">
+        <h3>我的学习路径</h3>
+        <div class="ai-side-card-body ai-path-list">
+          ${path.slice(0, 5).map((step, index) => `
+            <button type="button" data-dashboard-page="graph">
+              <b>${index + 1}</b>
+              <span><strong>${escapeHtml(step.topic)}</strong><small>${escapeHtml(step.action || "")}</small></span>
+            </button>
+          `).join("") || `<p>完成诊断后生成画像驱动路径。</p>`}
+        </div>
+      </section>
+      <section class="ai-side-card">
+        <h3>图谱焦点</h3>
+        <div class="ai-side-card-body">
+          ${focus?.label ? `
+            <strong>${escapeHtml(focus.label)}</strong>
+            <p>${escapeHtml((focus.path || []).join(" → ") || focus.graphTitle || "知识图谱节点")}</p>
+            <button type="button" class="mini" data-ai-open-graph="${escapeHtml(focus.graphId || "")}" data-ai-open-node="${escapeHtml(focus.nodeId || "")}">打开节点</button>
+          ` : `<p>AI 定位知识点后会显示对应图谱节点。</p>`}
+        </div>
+      </section>
+    </aside>
+  `;
+}
+
 function renderAiPage() {
   const isTeacher = isTeacherLike();
   const conversations = state.data.conversations || [];
@@ -5740,12 +8332,20 @@ function renderAiPage() {
   const intro = isTeacher
     ? "输入教学目标、课堂问题、出题要求或批改需求，系统会通过 Dify 工作流结合项目资料回答。"
     : "输入概念问题、练习要求、学习计划或你的解题答案，系统会通过 Dify 工作流结合课程资料回答。";
+  const studentTask = isTeacher ? null : activeStudentAiTask();
   return `
-    <div class="chat-layout ai-workbench ai-assistant-workbench dify-only-workbench ${isTeacher ? "teacher-ai-workbench" : "student-ai-workbench"}">
-      <section class="panel chat-panel ai-chat-panel">
+    <div class="chat-layout ai-workbench ai-assistant-workbench ${isTeacher ? "teacher-ai-workbench" : "student-ai-workbench"}">
+      ${isTeacher ? "" : `
+        <details class="ai-context-disclosure">
+          <summary>学习上下文与路径</summary>
+          ${renderStudentAiPathRail(active)}
+        </details>
+      `}
+      <section class="panel chat-panel ai-chat-panel ${isTeacher ? "teacher-ai-main" : "student-ai-main"}">
         <div class="dify-ai-head">
           <div>
-            <h2>${isTeacher ? "教学 AI 助教" : "学习 AI 助教"}</h2>
+            <h2>${isTeacher ? "教学 AI 助教" : "机器学习任务型 AI 学习伙伴"}</h2>
+            ${isTeacher ? "" : `<p>先作答，后诊断。AI 用于定位错因、补齐知识与安排下一步，不替学生完成学习。</p>`}
           </div>
           <button id="newConversationBtn" class="primary" type="button">新建对话</button>
         </div>
@@ -5753,16 +8353,27 @@ function renderAiPage() {
           ${(active?.messages || []).map(renderAiMessage).join("") || `<div class="bubble assistant"><span>AI</span><p>${escapeHtml(intro)}</p></div>`}
         </div>
         <form id="aiForm" class="composer rich-composer ai-composer dify-composer">
-          <textarea name="prompt" rows="${isTeacher ? "3" : "2"}" placeholder="${escapeHtml(aiPromptPlaceholder(isTeacher))}"></textarea>
-          <button class="primary ai-send-button" type="submit">发送</button>
+          ${isTeacher ? "" : `<label class="student-answer-field"><span>${escapeHtml(studentTask.answerLabel)}</span><textarea name="studentAnswer" rows="3" placeholder="${escapeHtml(studentTask.answerPlaceholder)}">${escapeHtml(state.aiStudentAnswer || "")}</textarea></label>`}
+          <textarea name="prompt" rows="${isTeacher ? "3" : "2"}" placeholder="${escapeHtml(isTeacher ? aiPromptPlaceholder(true) : studentTask.promptPlaceholder)}"></textarea>
+          <button class="primary ai-send-button" type="submit">${isTeacher ? "发送" : studentTask.key === "diagnosis" ? "提交作答并诊断" : "开始任务"}</button>
         </form>
+        ${isTeacher ? "" : `
+          <details class="ai-result-disclosure">
+            <summary>查看引用、诊断依据与工作流记录</summary>
+            ${renderDifyWorkflowSummary(active)}
+          </details>
+        `}
       </section>
-      ${renderDifyWorkflowSummary(active)}
+      ${isTeacher ? renderDifyWorkflowSummary(active) : ""}
     </div>
   `;
 }
 
 function bindAiPage() {
+  bindDashboardPageLinks();
+  bindReflectionForms();
+  bindKnowledgeCorrectionForms();
+  bindAiReviewForms();
   document.getElementById("toggleAiContext")?.addEventListener("click", () => {
     state.aiContextEditorOpen = !state.aiContextEditorOpen;
     renderContent();
@@ -5791,6 +8402,36 @@ function bindAiPage() {
   };
   const active = activeAiConversation();
   const findMessage = (id) => (active?.messages || []).find((message) => message.id === id);
+  document.querySelectorAll("[data-ai-card-message]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const message = findMessage(button.dataset.aiCardMessage);
+      if (!message) return;
+      setButtonBusy(button, true, "保存中...");
+      try {
+        const previousUser = [...(active?.messages || [])].reverse().find((item) => item.role === "user" && new Date(item.createdAt || 0) <= new Date(message.createdAt || 0));
+        const topic = message.workflowResult?.topic_localization?.selectedTopic || message.workflowResult?.topic_label || (message.knowledgePoints || [])[0] || "AI 学习卡片";
+        await api("/api/wrong-notes", {
+          method: "POST",
+          body: {
+            userId: state.user.id,
+            source: "AI 回答学习卡片",
+            topic,
+            question: previousUser?.content || active?.title || "",
+            answer: aiMessageDisplayContent(message),
+            analysis: "学生将 AI 回答转成学习卡片，后续可在反思中记录采纳情况。",
+            recommendation: "用自己的话重写核心概念，并完成一道同知识点测试。"
+          }
+        });
+        await loadState();
+        renderShell();
+        showToast("已转成学习卡片并入档");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  });
   const submitPrompt = async (prompt, explicitMode = "") => {
     const cleanPrompt = String(prompt || "").trim();
     if (!cleanPrompt) return;
@@ -5853,7 +8494,9 @@ function bindAiPage() {
         chapter: state.aiChapter,
         knowledgePoint: state.aiKnowledgePoint,
         answerDepth: state.aiAnswerDepth,
+        workflowType: (isTeacher ? taskOption?.workflowType : STUDENT_AI_TASK_MODES.find((item) => item.key === state.aiTaskKey)?.workflowType) || (mode === "grade" ? "misconception_classification" : mode === "plan" ? "personalized_path" : "knowledge_qa"),
         prompt: cleanPrompt,
+        studentAnswer: state.aiStudentAnswer,
         ...graphFocus,
         ...teacherContext
       }
@@ -5948,6 +8591,10 @@ function bindAiPage() {
     const form = new FormData(event.currentTarget);
     const prompt = String(form.get("prompt") || "").trim();
     if (!prompt) return;
+    if (!isTeacherLike() && activeStudentAiTask().key === "diagnosis" && !String(form.get("studentAnswer") || "").trim()) {
+      showToast("请先提交你的答案或思路，再开始错因诊断。", "error");
+      return;
+    }
     try {
       await submitPrompt(prompt);
     } catch (error) {
@@ -5968,12 +8615,11 @@ function bindAiPage() {
         classroom_generation: { mode: "plan", depth: "full", prompt: `请把「${topic}」生成一节互动课堂，包含课堂脚本、AI 教师/助教发言、提问链、随堂测验和板书动作。` }
       };
       const studentMap = {
-        explain: { mode: "explain", depth: "layered", prompt: `请分层讲解「${topic}」，包含定义、例子和易错点。` },
-        guided: { mode: "guided", depth: "brief", prompt: `请用提示模式引导我理解「${topic}」，不要直接给完整答案。` },
-        full: { mode: "explain", depth: "full", prompt: `请给出「${topic}」的完整解析，包含资料依据、步骤、例子和练习。` },
-        practice: { mode: "practice", depth: "layered", prompt: `请根据「${topic}」生成 3 道练习题，并附答案解析。` },
-        grade: { mode: "grade", depth: "layered", prompt: `请按批改模式检查我关于「${topic}」的答案，并指出错因和修改建议。` },
-        plan: { mode: "plan", depth: "layered", prompt: `请围绕「${topic}」生成复习路径和每日练习安排。` }
+        concept: { mode: "explain", depth: "layered", prompt: `请分层讲解「${topic}」，包含生活类比、反例、关联知识点和易错点。` },
+        derivation: { mode: "explain", depth: "full", prompt: `请协助我检查「${topic}」的公式推导，按步骤说明符号含义并指出易错点，不要跳过中间过程。` },
+        code: { mode: "guided", depth: "layered", prompt: `请解读或纠正我关于「${topic}」的 Python / sklearn 代码，定位报错、解释参数并提示修改方向，不要直接代做。` },
+        diagnosis: { mode: "grade", depth: "layered", prompt: `请基于我的答案与思路诊断「${topic}」，输出对应知识点、错因类型、错误证据、掌握度、补救任务和是否需要复测。` },
+        review: { mode: "plan", depth: "layered", prompt: `请根据我的个人薄弱点围绕「${topic}」生成考前巩固任务，包含优先级、预计时间、题目和资源组合。` }
       };
       const isTeacher = isTeacherLike();
       const draft = (isTeacher ? teacherMap : studentMap)[button.dataset.aiDraft];
@@ -6145,6 +8791,14 @@ function modelDraftComponents() {
   }];
 }
 
+function currentModelExperimentRecord() {
+  if (state.modelSubject !== "机器学习") return null;
+  const component = state.modelComponents.find((item) => item.id === state.modelCodeComponentId) || state.modelComponents.find((item) => componentSupportsCode(item));
+  const base = state.modelExperimentRecord || component?.props?.experiment || null;
+  const workshop = activeMlWorkshopExperiment();
+  return { ...(base || {}), agentName: base?.agentName || "ML Lab Code Agent", userId: state.user?.id || base?.userId || "", subject: state.modelSubject, prompt: state.modelAlgorithmPrompt || component?.props?.prompt || base?.prompt || "", codeMode: state.modelCodeMode || base?.codeMode || "teaching", difficulty: state.modelDifficulty || base?.difficulty || "standard", sourceType: component?.props?.generationSource || base?.sourceType || "", title: component?.label || base?.title || workshop.title, chapter: component?.props?.chapter || base?.chapter || "", citations: component?.props?.citations || base?.citations || [], explanation: component?.props?.explanation || base?.explanation || null, verifiedRun: component?.props?.verifiedRun || base?.verifiedRun || null, repairAttempts: component?.props?.repairAttempts || base?.repairAttempts || 0, repairHistory: component?.props?.repairHistory || base?.repairHistory || [], workflow: component?.props?.workflow || base?.workflow || [], workshop: { experimentKey: workshop.key, title: workshop.title, ability: workshop.ability, dataset: workshop.dataset, nodes: workshop.nodes, steps: workshop.steps, findings: state.mlWorkshop.findings, mismatch: state.mlWorkshop.mismatch, improvement: state.mlWorkshop.improvement, evidenceFiles: state.mlWorkshop.evidenceFiles.map(({ name, type, size }) => ({ name, type, size })), conclusionCheck: state.mlWorkshop.conclusionCheck, runResult: state.modelRunResult }, updatedAt: new Date().toISOString() };
+}
+
 function componentSupportsCode(component) {
   return Boolean(component && (mlAlgorithmForType(component.type) || component.kind === "customAlgorithm" || component.props?.code !== undefined));
 }
@@ -6205,6 +8859,57 @@ function renderModelTemplates(subject) {
       `).join("")}
     </div>
   `;
+}
+
+function activeMlWorkshopExperiment() {
+  return ML_WORKSHOP_EXPERIMENTS.find((item) => item.key === state.mlWorkshop.experimentKey) || ML_WORKSHOP_EXPERIMENTS[0];
+}
+
+function renderMlWorkshop() {
+  const active = activeMlWorkshopExperiment();
+  const check = state.mlWorkshop.conclusionCheck;
+  return `
+    <section class="panel ml-workshop-brief">
+      <div class="lab-head">
+        <div><p class="eyebrow">LEARNING EVIDENCE WORKSHOP</p><h2>机器学习实验工坊</h2><p class="hint">把代码运行结果、实验判断和反思一起形成可提交的学习证据。</p></div>
+        <span class="status-pill">${state.modelCodeRan ? "已有运行证据" : "等待实验运行"}</span>
+      </div>
+      <div class="ml-experiment-grid">
+        ${ML_WORKSHOP_EXPERIMENTS.map((item) => `
+          <article class="ml-experiment-card ${item.key === active.key ? "active" : ""}">
+            <div class="ml-experiment-card-head"><span class="experiment-index">0${ML_WORKSHOP_EXPERIMENTS.indexOf(item) + 1}</span><div><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.ability)}</p></div></div>
+            <dl class="ml-experiment-meta"><div><dt>数据集</dt><dd>${escapeHtml(item.dataset)}</dd></div><div><dt>学习证据</dt><dd>${escapeHtml(item.nodes.join(" · "))}</dd></div></dl>
+            <ol>${item.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>
+            <div class="row-actions"><button class="mini ${item.key === active.key ? "primary" : ""}" type="button" data-ml-experiment="${item.key}">载入实验</button><button class="mini" type="button" data-ml-run="${item.key}">运行示例</button></div>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+    <section class="panel ml-evidence-form">
+      <div class="split-head"><div><h3>实验证据与反思</h3><span>当前实验：${escapeHtml(active.title)} · ${escapeHtml(active.ability)}</span></div><span class="hint">${state.mlWorkshop.evidenceFiles.length} 个附件</span></div>
+      <div class="ml-evidence-grid">
+        <label>上传代码或结果截图<input type="file" accept="image/*,.py,.ipynb,.txt,.csv" multiple data-ml-evidence-file /></label>
+        <div class="ml-upload-list">${state.mlWorkshop.evidenceFiles.map((file) => `<span class="file-chip">${escapeHtml(file.name)} <small>${Math.ceil(Number(file.size || 0) / 1024)} KB</small></span>`).join("") || `<span class="hint">可上传代码截图、指标图或运行结果截图。</span>`}</div>
+        <label>我发现了什么<textarea rows="3" data-ml-evidence="findings" placeholder="例如：K=3 时测试准确率最高，说明适度的邻居数量更稳定。">${escapeHtml(state.mlWorkshop.findings)}</textarea></label>
+        <label>哪里与预期不一致<textarea rows="3" data-ml-evidence="mismatch" placeholder="例如：训练集准确率很高，但测试集下降，可能存在过拟合。">${escapeHtml(state.mlWorkshop.mismatch)}</textarea></label>
+        <label>下一次如何改进<textarea rows="3" data-ml-evidence="improvement" placeholder="例如：增加交叉验证，并比较不同参数下的误差。">${escapeHtml(state.mlWorkshop.improvement)}</textarea></label>
+      </div>
+      <div class="ml-evidence-actions"><button class="ghost" type="button" data-ml-check>检查结论与结果</button><button class="primary" type="button" data-ml-save-evidence>保存为学习证据</button></div>
+      ${check ? `<div class="ml-conclusion-check ${check.ok ? "ok" : "warn"}"><strong>${escapeHtml(check.title)}</strong><p>${escapeHtml(check.detail)}</p><small>检查依据：${escapeHtml(check.evidence)}</small></div>` : ""}
+    </section>
+  `;
+}
+
+function checkMlConclusion() {
+  const experiment = activeMlWorkshopExperiment();
+  const text = `${state.mlWorkshop.findings} ${state.mlWorkshop.mismatch} ${state.mlWorkshop.improvement}`;
+  if (!state.modelCodeRan || !state.modelRunResult) {
+    state.mlWorkshop.conclusionCheck = { ok: false, title: "请先运行实验", detail: "系统需要先读取真实运行结果，再判断你的结论是否有数据证据。", evidence: "暂无运行输出" };
+    return;
+  }
+  const matched = experiment.signals.filter((signal) => text.includes(signal));
+  const ok = matched.length >= 2;
+  state.mlWorkshop.conclusionCheck = { ok, title: ok ? "结论与实验结果基本一致" : "结论证据不足，建议补充实验观察", detail: ok ? "你已经引用了与本实验相关的指标或现象，可以继续整理反思。" : `建议在反思中补充：${experiment.signals.slice(0, 3).join("、")}，并说明它们如何由运行结果支持。`, evidence: matched.length ? `已识别：${matched.join("、")}` : "尚未识别到关键结果词" };
 }
 
 function findModelTemplate(key) {
@@ -6299,6 +9004,22 @@ function renderAiAlgorithmGenerator() {
       <label>想要的算法
         <textarea name="prompt" rows="5" placeholder="例如：生成一个 KNN 分类算法，用小型数据集训练并输出准确率和预测结果">${escapeHtml(state.modelAlgorithmPrompt || "")}</textarea>
       </label>
+      <div class="algorithm-option-grid">
+        <label>Code type
+          <select name="codeMode">
+            <option value="teaching" ${state.modelCodeMode === "teaching" ? "selected" : ""}>Teaching</option>
+            <option value="from_scratch" ${state.modelCodeMode === "from_scratch" ? "selected" : ""}>From scratch</option>
+            <option value="standard_library" ${state.modelCodeMode === "standard_library" ? "selected" : ""}>Stdlib</option>
+          </select>
+        </label>
+        <label>Difficulty
+          <select name="difficulty">
+            <option value="beginner" ${state.modelDifficulty === "beginner" ? "selected" : ""}>Beginner</option>
+            <option value="standard" ${state.modelDifficulty === "standard" ? "selected" : ""}>Standard</option>
+            <option value="advanced" ${state.modelDifficulty === "advanced" ? "selected" : ""}>Advanced</option>
+          </select>
+        </label>
+      </div>
       <div class="model-action-row">
         <button class="primary" type="submit" ${state.modelAlgorithmGenerating ? "disabled" : ""}>${state.modelAlgorithmGenerating ? "生成并运行中..." : "AI 生成并运行"}</button>
         <button class="ghost" type="button" id="openBlankAlgorithmCanvas">空白画布</button>
@@ -6309,6 +9030,23 @@ function renderAiAlgorithmGenerator() {
       <div class="algorithm-generation-info">
         <strong>${escapeHtml(info.sourceLabel || "生成来源")}</strong>
         <p>${escapeHtml(info.summary || "")}</p>
+        ${Array.isArray(info.workflow) && info.workflow.length ? `
+          <div class="agent-workflow-list">
+            ${info.workflow.map((step) => `
+              <article class="${escapeHtml(step.status || "")}">
+                <strong>${escapeHtml(step.label || step.key || "")}</strong>
+                <span>${escapeHtml(step.detail || "")}</span>
+              </article>
+            `).join("")}
+          </div>
+        ` : ""}
+        ${info.explanation?.goal ? `
+          <div class="algorithm-explanation">
+            <strong>Code explanation</strong>
+            <p>${escapeHtml(info.explanation.goal)}</p>
+            ${Array.isArray(info.explanation.steps) ? `<ol>${info.explanation.steps.slice(0, 4).map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : ""}
+          </div>
+        ` : ""}
         ${citations.length ? `
           <div class="algorithm-citation-list">
             ${citations.slice(0, 3).map((item) => `
@@ -6635,6 +9373,7 @@ function renderModelPage() {
           </div>
           <label class="compact-label">学科<select id="modelSubject">${subjectOptions(state.modelSubject)}</select></label>
         </div>
+        ${isMachineLearning ? renderMlWorkshop() : ""}
         <p class="hint">${escapeHtml(lab.hint)}</p>
         ${isMachineLearning ? renderAiAlgorithmGenerator() : `
           ${renderModelTemplates(state.modelSubject)}
@@ -6738,6 +9477,7 @@ function renderModelCodePanel() {
         </div>
         <div class="model-code-tools">
           <button class="primary" type="button" id="runModelCodeBtn" ${state.modelCodeRunning ? "disabled" : ""}>${state.modelCodeRunning ? "运行中..." : "运行测试"}</button>
+          <button class="mini" type="button" id="repairModelCodeBtn" ${state.modelCodeRunning ? "disabled" : ""}>Run + repair</button>
           <button class="mini" type="button" id="closeModelCodeBtn">关闭</button>
         </div>
       </div>
@@ -6777,7 +9517,12 @@ function installGeneratedAlgorithm(payload, prompt) {
       prompt,
       generationSource: payload.sourceType || "",
       citations: payload.citations || [],
+      explanation: payload.explanation || null,
+      workflow: payload.workflow || [],
+      experiment: payload.experiment || null,
       verifiedRun: payload.verifiedRun || null,
+      repairHistory: payload.repairHistory || [],
+      repairAttempts: payload.repairAttempts || 0,
       runResult: verifiedOutput
     }
   };
@@ -6789,10 +9534,13 @@ function installGeneratedAlgorithm(payload, prompt) {
   state.modelCodeDraft = component.props.code;
   state.modelCodeRan = Boolean(verifiedOutput);
   state.modelRunResult = verifiedOutput;
+  state.modelExperimentRecord = payload.experiment || null;
 }
 
-async function runCurrentModelCode() {
+async function runCurrentModelCode(options = {}) {
+  const autoRepair = Boolean(options.autoRepair);
   const runButton = document.getElementById("runModelCodeBtn");
+  const repairButton = document.getElementById("repairModelCodeBtn");
   const resultOutput = document.querySelector(".run-result-panel pre");
   const setRunResult = (text) => {
     state.modelRunResult = text;
@@ -6808,47 +9556,71 @@ async function runCurrentModelCode() {
     component.props.code = draft;
   }
   if (!String(draft || "").trim()) {
-    setRunResult("执行状态：运行失败（退出码 1）\n\n[stderr]\n代码为空，请先生成或输入 Python 代码。");
+    setRunResult("Run failed: code is empty. Please generate or enter Python code first.");
     state.modelCodeRan = true;
     return null;
   }
   state.modelCodeRunning = true;
   if (runButton) {
     runButton.disabled = true;
-    runButton.textContent = "运行中...";
+    runButton.textContent = "Running...";
   }
-  setRunResult("正在执行代码，请稍候...");
+  if (repairButton) {
+    repairButton.disabled = true;
+    repairButton.textContent = autoRepair ? "Repairing..." : "Run + repair";
+  }
+  setRunResult(autoRepair ? "Running code; if it fails, auto repair will retry..." : "Running code...");
   try {
     const payload = await api("/api/model-code/run", {
       method: "POST",
       body: {
         userId: state.user.id,
         subject: state.modelSubject,
-        title: definition?.title || component?.label || "自定义算法代码",
-        code: draft
+        title: definition?.title || component?.label || "Custom algorithm code",
+        code: draft,
+        prompt: component?.props?.prompt || state.modelAlgorithmPrompt || definition?.title || "",
+        codeMode: state.modelCodeMode,
+        difficulty: state.modelDifficulty,
+        autoRepair,
+        maxRepairAttempts: 2
       }
     });
     state.modelCodeRan = true;
-    setRunResult(payload.output || "程序执行结束，但没有返回输出。请在代码中使用 print(...) 输出测试结果。");
+    const nextCode = payload.repairedCode || draft;
+    if (payload.repairedCode) {
+      state.modelCodeDraft = payload.repairedCode;
+      if (editor) editor.value = payload.repairedCode;
+    }
+    setRunResult(payload.output || "Program finished without output. Use print(...) to show test results.");
     const current = state.modelComponents.find((item) => item.id === state.modelCodeComponentId);
     if (current) {
       current.props = current.props && typeof current.props === "object" ? current.props : {};
-      current.props.code = draft;
+      current.props.code = nextCode;
       current.props.runResult = state.modelRunResult;
       current.props.lastExitCode = payload.exitCode;
       current.props.lastDurationMs = payload.durationMs;
       current.props.lastRunAt = new Date().toISOString();
+      current.props.workflow = payload.workflow || current.props.workflow || [];
+      current.props.repairHistory = payload.repairHistory || current.props.repairHistory || [];
+      current.props.repairAttempts = payload.repairAttempts || 0;
     }
     return payload;
   } catch (error) {
     state.modelCodeRan = true;
-    setRunResult(`执行状态：运行接口错误\n\n[stderr]\n${error.message}`);
+    setRunResult(`Run API error
+
+[stderr]
+${error.message}`);
     return null;
   } finally {
     state.modelCodeRunning = false;
     if (runButton) {
       runButton.disabled = false;
-      runButton.textContent = "运行测试";
+      runButton.textContent = "Run test";
+    }
+    if (repairButton) {
+      repairButton.disabled = false;
+      repairButton.textContent = "Run + repair";
     }
   }
 }
@@ -6879,6 +9651,59 @@ function bindModelPage() {
     state.mathFunctionXMax = "10";
     renderContent();
   });
+  document.querySelectorAll("[data-ml-experiment], [data-ml-run]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const key = button.dataset.mlExperiment || button.dataset.mlRun;
+      const experiment = ML_WORKSHOP_EXPERIMENTS.find((item) => item.key === key);
+      if (!experiment) return;
+      state.mlWorkshop.experimentKey = key;
+      state.mlWorkshop.conclusionCheck = null;
+      state.modelSubject = "机器学习";
+      state.modelAlgorithmPrompt = `${experiment.title}：${experiment.steps.join("；")}。`;
+      const opened = applyModelTemplate(experiment.templateKey, { openCode: true, runExample: Boolean(button.dataset.mlRun) });
+      if (!opened) return showToast("实验模板暂不可用", "error");
+      renderContent();
+      if (button.dataset.mlRun) {
+        await runCurrentModelCode();
+        showToast("实验示例已真实运行，请依据结果填写反思");
+      } else {
+        showToast("实验已载入，可查看代码并运行");
+      }
+    });
+  });
+  document.querySelectorAll("[data-ml-evidence]").forEach((input) => {
+    input.addEventListener("input", () => {
+      state.mlWorkshop[input.dataset.mlEvidence] = input.value;
+      state.mlWorkshop.conclusionCheck = null;
+    });
+  });
+  document.querySelectorAll("[data-ml-evidence-file]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const files = Array.from(input.files || []).slice(0, 5);
+      const maxBytes = 2 * 1024 * 1024;
+      const accepted = files.filter((file) => file.size <= maxBytes);
+      if (accepted.length !== files.length) showToast("单个附件不能超过 2 MB，仅保留符合大小的文件", "error");
+      state.mlWorkshop.evidenceFiles = [...state.mlWorkshop.evidenceFiles, ...accepted.map((file) => ({ name: file.name, type: file.type, size: file.size }))].slice(0, 8);
+      renderContent();
+    });
+  });
+  document.querySelector("[data-ml-check]")?.addEventListener("click", () => {
+    checkMlConclusion();
+    renderContent();
+  });
+  document.querySelector("[data-ml-save-evidence]")?.addEventListener("click", async () => {
+    if (!hasModelDraft()) return showToast("请先载入并运行一个实验，再归档学习证据", "error");
+    if (!state.mlWorkshop.findings.trim()) return showToast("请先填写“我发现了什么”", "error");
+    checkMlConclusion();
+    persistOpenModelCodeDraft();
+    const experiment = activeMlWorkshopExperiment();
+    try {
+      await api("/api/models", { method: "POST", body: { userId: state.user.id, name: `${experiment.title} · 实验作品`, subject: "机器学习", mode: "algorithm", components: modelDraftComponents(), experiment: currentModelExperimentRecord(), notes: `实验反思：${state.mlWorkshop.findings}\n预期差异：${state.mlWorkshop.mismatch}\n改进计划：${state.mlWorkshop.improvement}` } });
+      await loadState();
+      renderShell();
+      showToast("实验作品已归档到学习证据档案");
+    } catch (error) { showToast(error.message, "error"); }
+  });
   document.getElementById("openBlankAlgorithmCanvas")?.addEventListener("click", () => {
     createBlankAlgorithmCanvas();
     renderContent();
@@ -6888,13 +9713,22 @@ function bindModelPage() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const prompt = String(form.get("prompt") || "").trim();
-    if (!prompt) return showToast("请输入想要生成的算法", "error");
+    if (!prompt) return showToast("??????????", "error");
     state.modelAlgorithmPrompt = prompt;
+    state.modelCodeMode = String(form.get("codeMode") || "teaching");
+    state.modelDifficulty = String(form.get("difficulty") || "standard");
     state.modelAlgorithmGenerating = true;
-    state.modelRunResult = "正在检索课程资料并生成算法代码...";
+    state.modelRunResult = "???????????????...";
+    state.modelExperimentRecord = null;
     state.modelGenerationInfo = {
-      sourceLabel: "检索中",
-      summary: "正在检索课程资料、知识图谱和已上传内容。"
+      sourceLabel: "???",
+      summary: "????????????????????",
+      workflow: [
+        { label: "Course search tool", status: "running", detail: "Searching course materials and graph" },
+        { label: "Code generation tool", status: "pending", detail: "Waiting for course context" },
+        { label: "Python sandbox runner", status: "pending", detail: "Run after generation" },
+        { label: "Error repair tool", status: "pending", detail: "Repair if execution fails" }
+      ]
     };
     renderContent();
     try {
@@ -6902,27 +9736,36 @@ function bindModelPage() {
         method: "POST",
         body: {
           userId: state.user.id,
-          subject: state.modelSubject || "机器学习",
-          prompt
+          subject: state.modelSubject || "????",
+          prompt,
+          codeMode: state.modelCodeMode,
+          difficulty: state.modelDifficulty,
+          maxRepairAttempts: 2
         }
       });
       installGeneratedAlgorithm(payload, prompt);
       const sourceLabels = {
-        course: "来自课程资料",
-        openai: "来自 OpenAI",
-        local: "系统内置生成"
+        course: "??????",
+        openai: "?? OpenAI",
+        local: "??????"
       };
       state.modelGenerationInfo = {
-        sourceLabel: sourceLabels[payload.sourceType] || "生成完成",
-        summary: payload.summary || (payload.sourceType === "course" ? "已命中课程资料，并据此生成算法代码。" : "已生成可运行算法代码。"),
-        citations: payload.citations || []
+        sourceLabel: sourceLabels[payload.sourceType] || "????",
+        summary: payload.summary || (payload.sourceType === "course" ? "??????????????????" : "???????????"),
+        citations: payload.citations || [],
+        workflow: payload.workflow || [],
+        explanation: payload.explanation || null
       };
+      state.modelExperimentRecord = payload.experiment || null;
       renderContent();
       await runCurrentModelCode();
     } catch (error) {
-      state.modelRunResult = `生成失败\n\n[stderr]\n${error.message}`;
+      state.modelRunResult = `????
+
+[stderr]
+${error.message}`;
       state.modelGenerationInfo = {
-        sourceLabel: "生成失败",
+        sourceLabel: "????",
         summary: error.message
       };
       showToast(error.message, "error");
@@ -7063,6 +9906,10 @@ function bindModelPage() {
     event.preventDefault();
     await runCurrentModelCode();
   });
+  document.getElementById("repairModelCodeBtn")?.addEventListener("click", async (event) => {
+    event.preventDefault();
+    await runCurrentModelCode({ autoRepair: true });
+  });
   document.getElementById("clearModelCanvas")?.addEventListener("click", () => {
     state.modelComponents = [];
     state.selectedComponentId = null;
@@ -7100,6 +9947,7 @@ function bindModelPage() {
           subject: state.modelSubject,
           mode: state.modelSubject === "机器学习" ? "algorithm" : state.modelMode,
           components,
+          experiment: currentModelExperimentRecord(),
           notes: form.get("notes")
         }
       });
@@ -7130,6 +9978,16 @@ function bindModelPage() {
       state.modelComponents = normalizeLoadedModelComponents(model);
       state.selectedComponentId = state.modelComponents[0]?.id || null;
       state.modelGenerationInfo = null;
+      state.modelExperimentRecord = model.experiment || null;
+      const savedWorkshop = model.experiment?.workshop;
+      if (savedWorkshop) {
+        state.mlWorkshop = { ...state.mlWorkshop, experimentKey: savedWorkshop.experimentKey || state.mlWorkshop.experimentKey, findings: savedWorkshop.findings || "", mismatch: savedWorkshop.mismatch || "", improvement: savedWorkshop.improvement || "", evidenceFiles: Array.isArray(savedWorkshop.evidenceFiles) ? savedWorkshop.evidenceFiles : [], conclusionCheck: savedWorkshop.conclusionCheck || null };
+      }
+      if (model.experiment) {
+        state.modelCodeMode = model.experiment.codeMode || state.modelCodeMode;
+        state.modelDifficulty = model.experiment.difficulty || state.modelDifficulty;
+        state.modelAlgorithmPrompt = model.experiment.prompt || state.modelAlgorithmPrompt;
+      }
       resetModelCodeState();
       if (model.subject === "机器学习") {
         const codeComponent = state.modelComponents.find((component) => componentSupportsCode(component));
@@ -7793,108 +10651,151 @@ function renderClassPage() {
   const classes = state.data.classes || [];
   const active = classes.find((klass) => klass.id === state.selectedClassId) || classes[0];
   if (active && !state.selectedClassId) state.selectedClassId = active.id;
-  const students = active ? active.studentIds.map((id) => state.data.users.find((user) => user.id === id)).filter(Boolean) : [];
+  if (!active) state.classManageOpen = false;
+  const students = active ? (active.studentIds || []).map((id) => state.data.users.find((user) => user.id === id)).filter(Boolean) : [];
   const applications = active?.applications || [];
   const totalStudentIds = new Set(classes.flatMap((klass) => klass.studentIds || []));
+  const totalApplications = classes.reduce((sum, klass) => sum + (klass.applications || []).filter((item) => item.status === "pending").length, 0);
+  return state.classManageOpen && active
+    ? renderTeacherClassDetail(active, students, applications)
+    : renderTeacherClassList(classes, active, totalStudentIds, totalApplications);
+}
+
+function renderTeacherClassList(classes, active, totalStudentIds, totalApplications) {
   return `
-    <div class="class-page-shell">
-      <section class="workbench-title class-title">
-        <div>
-          <h2>班级管理</h2>
-          <p>班级创建、学生导入、名单查看和申请记录集中处理。</p>
-        </div>
-        <div class="inline-stats">
+    <div class="class-page-shell class-course-shell class-management-grid">
+      <section class="course-page-tabs class-course-tabs" role="tablist" aria-label="班级管理">
+        <button type="button" class="active">我管理的班级</button>
+      </section>
+      <section class="class-course-toolbar">
+        <form id="createClassForm" class="class-course-create">
+          <button class="primary" type="submit">${iconSvg("users")} 新建班级</button>
+          <input name="name" placeholder="班级名称" required />
+          <select name="subject">${subjectOptions(state.user.subject || "物理")}</select>
+        </form>
+        <div class="class-course-summary inline-stats">
           <span>${classes.length}<small>班级</small></span>
           <span>${totalStudentIds.size}<small>总学生</small></span>
-          <span>${applications.length}<small>当前申请</small></span>
+          <span>${totalApplications}<small>待审核</small></span>
         </div>
       </section>
-      <div class="class-management-grid">
-        <section class="panel class-selector-panel">
-          <form id="createClassForm" class="stack class-create-form">
-            <h3>创建班级</h3>
-            <div class="form-grid">
-              <label>班级名称<input name="name" placeholder="例如：高一 3 班" /></label>
-              <label>学科<select name="subject">${subjectOptions(state.user.subject || "物理")}</select></label>
-            </div>
-            <button class="primary" type="submit">创建班级</button>
-          </form>
-          <div class="split-head class-list-head">
-            <div>
-              <h3>班级列表</h3>
-              <p class="hint">选择班级后在右侧查看学生名单。</p>
-            </div>
-            <span>${active ? escapeHtml(active.subject) : "未创建"}</span>
-          </div>
-          <div class="class-tabs">
+      <section class="class-course-board">
+        ${classes.length ? `
+          <div class="class-course-grid">
             ${classes.map((klass) => {
               const count = (klass.studentIds || []).length;
+              const pending = (klass.applications || []).filter((item) => item.status === "pending").length;
               return `
-                <button class="${active?.id === klass.id ? "active" : ""}" data-class="${klass.id}">
-                  <strong>${escapeHtml(klass.name)}</strong>
-                  <span>${escapeHtml(klass.subject)} · ${count} 人 · ${escapeHtml(klass.inviteCode)}</span>
-                </button>
+                <article class="class-course-card ${active?.id === klass.id ? "active" : ""}" data-class-card="${escapeHtml(klass.id)}" tabindex="0" role="button" title="双击进入管理班级">
+                  <div class="class-course-card-main">
+                    <span>${escapeHtml(klass.subject)}</span>
+                    <strong>${escapeHtml(klass.name)}</strong>
+                  </div>
+                  <div class="class-course-card-meta">
+                    <span>${count} 人</span>
+                    <span>${escapeHtml(klass.inviteCode)}</span>
+                    <span>${pending} 申请</span>
+                  </div>
+                  <button class="mini" type="button" data-open-class="${escapeHtml(klass.id)}">管理</button>
+                </article>
               `;
-            }).join("") || emptyBlock("暂无班级")}
+            }).join("")}
           </div>
-        </section>
-        <div class="class-workspace">
-          ${active ? `
-            <section class="panel class-active-panel">
-              <div>
-                <h3>${escapeHtml(active.name)} · ${escapeHtml(active.subject)}</h3>
-                <p class="hint">邀请码：${escapeHtml(active.inviteCode)} · 学生可用邀请码或班级 ID 申请加入。</p>
-              </div>
-              <div class="class-active-actions">
-                <article><strong>${students.length}</strong><span>学生</span></article>
-                <article><strong>${escapeHtml(active.inviteCode)}</strong><span>邀请码</span></article>
-                <button class="mini primary" type="button" data-class-tool="import">导入学生</button>
-                <button class="mini" type="button" data-class-tool="applications">申请记录 ${applications.length}</button>
-                <button class="danger" type="button" data-delete-class="${active.id}" data-class-name="${escapeHtml(active.name)}">解散班级</button>
-              </div>
-            </section>
-            <section class="panel class-roster-panel class-roster-full-panel">
-              <div class="split-head">
-                <h3>学生名单</h3>
-                <span>${students.length} 人</span>
-              </div>
-              <div class="table-list class-student-list">
-                ${students.map((student) => `<div><span>${escapeHtml(student.name)}</span><span>${student.id}</span><span>${(student.classIds || []).length} 个班级</span><button class="mini danger" type="button" data-remove-class-student="${student.id}" data-student-name="${escapeHtml(student.name)}" data-class-name="${escapeHtml(active.name)}">移除</button></div>`).join("") || emptyBlock("暂无学生")}
-              </div>
-            </section>
-          ` : `<section class="panel">${emptyBlock("请先创建班级。")}</section>`}
-        </div>
-      </div>
-      ${active ? renderClassToolModal(active, applications) : ""}
+        ` : `
+          <div class="class-course-empty">
+            <strong>暂无班级</strong>
+          </div>
+        `}
+      </section>
     </div>
   `;
 }
 
-function renderClassToolModal(active, applications) {
+function renderTeacherClassDetail(active, students, applications) {
+  const pending = applications.filter((item) => item.status === "pending").length;
+  return `
+    <div class="class-page-shell class-detail-shell">
+      <section class="panel class-active-panel class-detail-head">
+        <div>
+          <h3>${escapeHtml(active.name)} · ${escapeHtml(active.subject)}</h3>
+          <p class="hint">邀请码：${escapeHtml(active.inviteCode)} · 学生可用邀请码或班级 ID 申请加入。</p>
+        </div>
+        <div class="class-active-actions">
+          <button class="class-stat-button" type="button" data-class-tool="roster"><strong>${students.length}</strong><span>学生</span></button>
+          <article><strong>${escapeHtml(active.inviteCode)}</strong><span>邀请码</span></article>
+          <button class="class-stat-button" type="button" data-class-tool="import"><strong>导入</strong><span>学生</span></button>
+          <button class="class-stat-button" type="button" data-class-tool="applications"><strong>${pending}</strong><span>待审核</span></button>
+          <button class="mini" type="button" data-class-back>返回</button>
+          <button class="danger" type="button" data-delete-class="${active.id}" data-class-name="${escapeHtml(active.name)}">解散班级</button>
+        </div>
+      </section>
+      ${renderTeacherClassFeatureGrid(active)}
+      ${renderClassToolModal(active, applications, students)}
+    </div>
+  `;
+}
+
+function renderTeacherClassFeatureGrid(active) {
+  const features = [
+    { key: "ai", icon: "bot", label: "AI助教" },
+    { key: "lesson_room", icon: "school", label: "AI课堂" },
+    { key: "homework", icon: "clipboard", label: "作业管理" },
+    { key: "graph", icon: "network", label: "知识图谱" },
+    { key: "materials", icon: "files", label: "课程资料" },
+    { key: "learning", icon: "target", label: "学情" }
+  ];
+  return `
+    <section class="class-feature-grid" aria-label="班级功能">
+      ${features.map((item) => `
+        <button class="class-feature-button" type="button" data-class-feature="${item.key}" data-class-id="${escapeHtml(active.id)}" data-class-subject="${escapeHtml(active.subject || "")}">
+          ${iconSvg(item.icon, item.label)}
+          <strong>${escapeHtml(item.label)}</strong>
+        </button>
+      `).join("")}
+    </section>
+  `;
+}
+
+function classApplicationStatusText(status) {
+  return {
+    pending: "待审核",
+    approved: "已同意",
+    rejected: "已拒绝"
+  }[status] || status || "未知";
+}
+
+function renderClassToolModal(active, applications, students = []) {
   if (!state.classTool) return "";
-  const modalBody = state.classTool === "applications"
+  const pendingApplications = (applications || []).filter((item) => item.status === "pending");
+  const modalBody = state.classTool === "roster"
     ? `
-      <h2>申请记录</h2>
+      <h2>学生名单</h2>
+      <div class="table-list class-student-list class-modal-table">
+        ${students.map((student) => `<div><span>${escapeHtml(student.name)}</span><span>${student.id}</span><span>${(student.classIds || []).length} 个班级</span><button class="mini danger" type="button" data-remove-class-student="${student.id}" data-student-name="${escapeHtml(student.name)}" data-class-name="${escapeHtml(active.name)}">移除</button></div>`).join("") || emptyBlock("暂无学生")}
+      </div>
+    `
+    : state.classTool === "applications"
+    ? `
+      <h2>待审核申请</h2>
       <div class="table-list class-tool-table">
-        ${applications.map((item) => `
+        ${pendingApplications.map((item) => `
           <div>
             <span>${escapeHtml(item.studentName)}</span>
-            <span>${escapeHtml(item.status)}</span>
+            <span>${escapeHtml(classApplicationStatusText(item.status))}</span>
             <span>${escapeHtml(item.reason)}</span>
             <span class="row-actions">
-              ${item.status === "pending" ? `
-                <button class="mini primary" type="button" data-class-application-action="accept" data-class-application-id="${escapeHtml(item.id)}">同意</button>
-                <button class="mini danger" type="button" data-class-application-action="reject" data-class-application-id="${escapeHtml(item.id)}">拒绝</button>
-              ` : ""}
+              <button class="mini primary" type="button" data-class-application-action="accept" data-class-application-id="${escapeHtml(item.id)}">同意</button>
+              <button class="mini danger" type="button" data-class-application-action="reject" data-class-application-id="${escapeHtml(item.id)}">拒绝</button>
             </span>
           </div>
-        `).join("") || emptyBlock("暂无申请")}
+        `).join("") || emptyBlock("暂无待审核申请")}
       </div>
     `
     : `
       <h2>导入学生</h2>
       <p class="hint">${escapeHtml(active.name)} · 默认密码 123456。每行一名学生，格式：姓名,8位ID；没有账号的学生会自动创建占位账号。</p>
       <form id="importStudentsForm" class="stack">
+        <label>选择名单文件<input id="importStudentsFile" name="file" type="file" accept=".csv,.txt,text/csv,text/plain" /></label>
         <textarea name="students" rows="8" placeholder="张三,20261234&#10;李四,20262345"></textarea>
         <button class="primary" type="submit">导入到 ${escapeHtml(active.name)}</button>
       </form>
@@ -7919,6 +10820,7 @@ function bindClassPage() {
         body: { teacherId: state.user.id, name: form.get("name"), subject: form.get("subject") }
       });
       state.selectedClassId = payload.class.id;
+      state.classManageOpen = true;
       state.classTool = null;
       await loadState();
       renderShell();
@@ -7926,6 +10828,41 @@ function bindClassPage() {
     } catch (error) {
       showToast(error.message, "error");
     }
+  });
+  document.querySelectorAll("[data-class-card]").forEach((card) => {
+    const openClass = () => {
+      state.selectedClassId = card.dataset.classCard;
+      state.classManageOpen = true;
+      state.classTool = null;
+      renderContent();
+    };
+    card.addEventListener("click", (event) => {
+      if (event.target.closest("[data-open-class]")) return;
+      state.selectedClassId = card.dataset.classCard;
+      state.classTool = null;
+      renderContent();
+    });
+    card.addEventListener("dblclick", openClass);
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      openClass();
+    });
+  });
+  document.querySelectorAll("[data-open-class]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedClassId = button.dataset.openClass;
+      state.classManageOpen = true;
+      state.classTool = null;
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-class-back]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.classManageOpen = false;
+      state.classTool = null;
+      renderContent();
+    });
   });
   document.querySelectorAll("[data-class]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -7938,6 +10875,35 @@ function bindClassPage() {
     button.addEventListener("click", () => {
       state.classTool = button.dataset.classTool;
       renderContent();
+    });
+  });
+  document.querySelectorAll("[data-class-feature]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.classFeature;
+      const classId = button.dataset.classId || state.selectedClassId || "";
+      const classSubject = button.dataset.classSubject || "";
+      state.aiClassId = classId;
+      state.classTool = null;
+      if (classSubject) {
+        state.aiSubject = classSubject;
+        state.graphSubject = classSubject;
+        state.materialSubjectFilter = classSubject;
+      }
+      if (action === "homework") {
+        state.selectedClassId = classId;
+        state.page = "homework";
+      } else if (action === "graph") {
+        state.page = "graph";
+      } else if (action === "materials") {
+        state.page = "materials";
+      } else {
+        state.page = "ai";
+        state.aiMode = action === "ai" ? "qa" : "plan";
+        state.aiTaskKey = action === "lesson_room" ? "classroom_generation" : action === "learning" ? "class_analysis" : "qa";
+        state.aiTeacherTask = state.aiTaskKey === "qa" ? "lesson_plan" : state.aiTaskKey;
+      }
+      await loadState();
+      renderShell();
     });
   });
   document.getElementById("closeClassTool")?.addEventListener("click", () => {
@@ -7954,6 +10920,7 @@ function bindClassPage() {
           body: { teacherId: state.user.id }
         });
         state.selectedClassId = null;
+        state.classManageOpen = false;
         state.classTool = null;
         await loadState();
         renderShell();
@@ -7998,6 +10965,17 @@ function bindClassPage() {
       showToast(`已导入 ${payload.added.length} 名学生`);
     } catch (error) {
       showToast(error.message, "error");
+    }
+  });
+  document.getElementById("importStudentsFile")?.addEventListener("change", async (event) => {
+    const file = event.currentTarget.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const textarea = document.querySelector("#importStudentsForm textarea[name='students']");
+      if (textarea) textarea.value = text;
+    } catch (error) {
+      showToast(error.message || "名单文件读取失败", "error");
     }
   });
   document.querySelectorAll("[data-class-application-action]").forEach((button) => {
@@ -8076,6 +11054,18 @@ function renderTeacherHomeworkPage() {
         </div>
       </form>
     </section>
+    ${renderTeacherLearningDiagnosis(activeClassId, classes, submissions)}
+    <section class="panel misconception-task-panel">
+      <div class="split-head"><div><h3>按错因发布分层任务</h3><p class="hint">选择知识点或错因标签，系统筛选目标学生并保留补救前后的成效数据。</p></div><span class="graph-badge ready">诊断 → 干预 → 复测</span></div>
+      <form id="createMisconceptionTaskForm" class="misconception-task-form">
+        <input type="hidden" name="classId" value="${escapeHtml(activeClassId)}" />
+        <div class="form-grid"><label>知识点 / 错因标签<select name="errorTag"><option value="过拟合与欠拟合混淆">过拟合与欠拟合混淆</option><option value="Precision 与 Recall 适用场景混淆">Precision 与 Recall 适用场景混淆</option><option value="标准化与归一化混淆">标准化与归一化混淆</option><option value="损失函数概念混淆">损失函数概念混淆</option></select></label><label>任务难度<select name="difficulty"><option value="基础">基础</option><option value="进阶" selected>进阶</option><option value="迁移">迁移</option></select></label></div>
+        <div class="form-grid"><label>截止时间<input name="dueAt" type="datetime-local" /></label><label>补救资源<input name="resources" value="概念辨析微课；参数调节实验；变式题" /></label></div>
+        <label>任务说明<textarea name="description" rows="2">针对该错因完成概念辨析 2 题、参数调节实验 1 个、反思 1 条。</textarea></label>
+        <div class="misconception-task-target"><strong>目标学生</strong><span data-task-target-count>将根据错因标签自动筛选</span></div>
+        <button class="primary" type="submit">生成并发布分层任务包</button>
+      </form>
+    </section>
     <section class="panel homework-board-panel">
       <div class="split-head">
         <div>
@@ -8109,6 +11099,30 @@ function renderTeacherHomeworkPage() {
   `;
 }
 
+function renderTeacherLearningDiagnosis(classId, classes, submissions) {
+  const view = state.classLearningView || "topic";
+  const active = classes.find((item) => item.id === classId);
+  const studentIds = new Set(active?.studentIds || []);
+  const students = (state.data.users || []).filter((user) => studentIds.has(user.id));
+  const mastery = (state.data.studentMastery || []).filter((item) => studentIds.has(item.studentId));
+  const wrongNotes = (state.data.wrongNotes || []).filter((item) => studentIds.has(item.userId));
+  const topicMap = new Map();
+  mastery.forEach((item) => { const key = item.topic || item.knowledgePoint || "待定位"; const row = topicMap.get(key) || { topic: key, scores: [], students: new Set() }; row.scores.push(Number(item.score ?? item.mastery ?? 0)); row.students.add(item.studentId); topicMap.set(key, row); });
+  const topics = [...topicMap.values()].map((row) => ({ ...row, average: row.scores.length ? row.scores.reduce((a, b) => a + b, 0) / row.scores.length : 0 })).sort((a, b) => a.average - b.average).slice(0, 8);
+  const errors = new Map();
+  wrongNotes.forEach((note) => { const key = note.topic || "未归类错因"; const row = errors.get(key) || { tag: key, count: 0, students: new Set() }; row.count += 1; row.students.add(note.userId); errors.set(key, row); });
+  const topErrors = [...errors.values()].sort((a, b) => b.count - a.count).slice(0, 10);
+  const highRisk = students.filter((student) => { const rows = mastery.filter((item) => item.studentId === student.id); return rows.length && rows.reduce((sum, item) => sum + Number(item.score ?? item.mastery ?? 0), 0) / rows.length < 0.58; });
+  const graded = submissions.filter((item) => item.status === "graded");
+  const improvement = graded.length ? Math.round(graded.filter((item) => Number(item.score || 0) >= 80).length / graded.length * 100) : 0;
+  return `<section class="panel class-learning-diagnosis">
+    <div class="split-head"><div><span class="cycle-eyebrow">CLASS LEARNING DIAGNOSIS</span><h3>班级学情诊断看板</h3><p class="hint">按知识点、错因和学生三种视图组织干预优先级。</p></div><span class="class-diagnosis-kpi">干预后改善率 ${improvement}%</span></div>
+    <div class="diagnosis-view-tabs"><button type="button" class="${view === "topic" ? "active" : ""}" data-class-learning-view="topic">按知识点</button><button type="button" class="${view === "error" ? "active" : ""}" data-class-learning-view="error">按错因</button><button type="button" class="${view === "student" ? "active" : ""}" data-class-learning-view="student">按学生</button></div>
+    ${view === "topic" ? `<div class="class-diagnosis-grid"><div><h4>知识点掌握度热力图</h4><div class="mastery-heatmap">${topics.map((item) => `<div class="heatmap-row"><span>${escapeHtml(item.topic)}</span><i><b style="width:${Math.max(4, Math.min(100, item.average * 100))}%"></b></i><strong>${Math.round(item.average * 100)}%</strong></div>`).join("") || `<span class="hint">暂无掌握度数据</span>`}</div></div><div><h4>高频错因 Top 10</h4><div class="class-error-list">${topErrors.map((item, index) => `<button type="button" data-error-tag="${escapeHtml(item.tag)}"><b>${index + 1}</b><span>${escapeHtml(item.tag)}</span><em>${item.students.size} 人</em></button>`).join("") || `<span class="hint">暂无错因数据</span>`}</div></div></div>` : view === "error" ? `<div class="class-diagnosis-grid"><div><h4>错因 Top 10 · 学生覆盖</h4><div class="class-error-list">${topErrors.map((item, index) => `<button type="button" data-error-tag="${escapeHtml(item.tag)}"><b>${index + 1}</b><span>${escapeHtml(item.tag)}</span><em>${item.students.size} 人 · ${item.count} 次</em></button>`).join("") || `<span class="hint">暂无错因数据</span>`}</div></div><div class="ai-intervention-advice"><h4>按错因的干预建议</h4><p>优先选择覆盖人数最多的错因发布任务，采用“概念辨析 → 实验操作 → 变式复测”的分层干预链。</p></div></div>` : `<div class="student-diagnosis-table">${students.map((student) => { const rows = mastery.filter((item) => item.studentId === student.id); const avg = rows.length ? rows.reduce((sum, item) => sum + Number(item.score ?? item.mastery ?? 0), 0) / rows.length : 0; const noteCount = wrongNotes.filter((item) => item.userId === student.id).length; return `<div><strong>${escapeHtml(student.name)}</strong><span>掌握度 ${Math.round(avg * 100)}%</span><span>错因 ${noteCount} 条</span><em>${avg < .58 ? "高风险" : "持续跟踪"}</em></div>`; }).join("") || `<span class="hint">暂无学生学情记录</span>`}</div>`}
+    ${view !== "student" ? `<div class="class-diagnosis-bottom"><div><h4>高风险学生</h4><div class="risk-student-list">${highRisk.map((student) => `<span>${escapeHtml(student.name)} <small>需优先干预</small></span>`).join("") || `<span class="hint">当前没有识别到高风险学生</span>`}</div></div><div class="ai-intervention-advice"><h4>AI 教师干预建议</h4><p>${topErrors[0] ? `建议优先针对“${escapeHtml(topErrors[0].tag)}”发布分层任务，覆盖 ${topErrors[0].students.size} 名学生；先用概念辨析，再用实验或变式题验证迁移。` : "完成一次前测或作业批改后，AI 会根据班级错因生成干预建议。"}</p></div></div>` : ""}
+  </section>`;
+}
+
 function homeworkBoardColumns(homework, submissions, classes) {
   const studentCount = (homeworkItem) => classes.find((klass) => klass.id === homeworkItem.classId)?.studentIds?.length || 0;
   const byHomework = (homeworkItem) => submissions.filter((sub) => sub.homeworkId === homeworkItem.id);
@@ -8139,12 +11153,17 @@ function renderTeacherHomeworkItem(item, submissions) {
   const itemSubmissions = submissions.filter((sub) => sub.homeworkId === item.id);
   const graded = itemSubmissions.filter((sub) => sub.status === "graded").length;
   const reviewPending = itemSubmissions.filter((sub) => sub.status === "review_pending").length;
+  const targetIds = Array.isArray(item.targetStudentIds) && item.targetStudentIds.length ? item.targetStudentIds : [];
+  const targetSubs = itemSubmissions.filter((sub) => !targetIds.length || targetIds.includes(sub.studentId));
+  const completedRate = targetIds.length ? Math.round(targetSubs.length / targetIds.length * 100) : null;
+  const improvedRate = targetSubs.length ? Math.round(targetSubs.filter((sub) => Number(sub.score || 0) >= 80).length / targetSubs.length * 100) : null;
   return `
     <article class="list-card homework-teacher-card" data-teacher-homework="${item.id}">
       <div>
         <h3>${escapeHtml(item.title)}</h3>
         <p>${escapeHtml(compactText(item.description || "无文字说明", 82))}</p>
         <small>${fmtTime(item.createdAt)} · 提交 ${itemSubmissions.length} 份 · 已确认 ${graded} 份${reviewPending ? ` · 待确认 ${reviewPending} 份` : ""}</small>
+        ${item.taskType === "misconception-remediation" ? `<div class="remediation-metrics"><span>目标 ${targetIds.length || "全班"} 人</span><span>完成率 ${completedRate === null ? "待提交" : `${completedRate}%`}</span><span>错因改善 ${improvedRate === null ? "待复测" : `${improvedRate}%`}</span></div>` : ""}
         <div class="mini-submission-row">
           ${itemSubmissions.slice(0, 3).map((sub) => {
             const student = state.data.users.find((user) => user.id === sub.studentId);
@@ -8285,6 +11304,28 @@ function bindTeacherHomeworkPage() {
     } catch (error) {
       showToast(error.message, "error");
     }
+  });
+  document.getElementById("createMisconceptionTaskForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const errorTag = String(form.get("errorTag") || "");
+    const classId = String(form.get("classId") || "");
+    const klass = (state.data.classes || []).find((item) => item.id === classId);
+    const students = (state.data.users || []).filter((user) => (klass?.studentIds || []).includes(user.id));
+    const notes = (state.data.wrongNotes || []).filter((note) => students.some((student) => student.id === note.userId) && `${note.topic || ""} ${note.analysis || ""}`.includes(errorTag.split(" ")[0]));
+    try {
+      await api("/api/homework", { method: "POST", body: { teacherId: state.user.id, classId, title: `错因补救：${errorTag}`, description: form.get("description"), answer: "完成任务后提交过程、结果和反思", rubric: "概念辨析 40分\n实验证据 35分\n学习反思 25分", errorTag, taskType: "misconception-remediation", difficulty: form.get("difficulty"), dueAt: form.get("dueAt"), resources: String(form.get("resources") || "").split(/；|;/).filter(Boolean), targetStudentIds: notes.length ? [...new Set(notes.map((note) => note.userId))] : students.map((student) => student.id), baselineErrorCount: notes.length, baselineStudentCount: notes.length ? new Set(notes.map((note) => note.userId)).size : students.length } });
+      await loadState(); renderShell(); showToast(`已发布错因补救任务，筛选 ${notes.length ? new Set(notes.map((note) => note.userId)).size : students.length} 名学生`);
+    } catch (error) { showToast(error.message, "error"); }
+  });
+  document.querySelectorAll("[data-error-tag]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const select = document.querySelector('#createMisconceptionTaskForm select[name="errorTag"]');
+      if (select) { const option = Array.from(select.options).find((item) => item.value.includes(button.dataset.errorTag) || button.dataset.errorTag.includes(item.value.split(" ")[0])); if (option) select.value = option.value; select.focus(); }
+    });
+  });
+  document.querySelectorAll("[data-class-learning-view]").forEach((button) => {
+    button.addEventListener("click", () => { state.classLearningView = button.dataset.classLearningView; renderContent(); });
   });
   document.querySelectorAll("[data-teacher-homework]").forEach((card) => {
     card.addEventListener("dblclick", () => {
@@ -8455,6 +11496,181 @@ function renderStudentClassMembershipList(classes = []) {
   `;
 }
 
+function renderStudentCoursesPage() {
+  if (state.user.role !== "student") return emptyBlock("教师端不显示我的课程。");
+  const classes = state.data.classes || [];
+  const homework = state.data.homework || [];
+  const submissions = state.data.submissions || [];
+  const completedHomeworkIds = new Set(submissions.filter((item) => item.studentId === state.user.id).map((item) => item.homeworkId));
+  const active = classes.find((klass) => klass.id === state.studentCourseClassId);
+  if (active) return renderStudentCourseDetail(active, homework, completedHomeworkIds);
+  return `
+    <div class="student-courses-shell">
+      <section class="course-page-tabs student-course-tabs" role="tablist" aria-label="我的课程">
+        <button type="button" class="active">我学的课</button>
+      </section>
+      <section class="student-course-toolbar">
+        <form id="joinClassForm" class="join-class-form">
+          <input name="classCode" placeholder="输入班级邀请码 / 班级 ID" required />
+          <button class="primary" type="submit">加入班级</button>
+        </form>
+        <div class="inline-stats student-course-stats">
+          <span>${classes.length}<small>课程</small></span>
+          <span>${homework.length}<small>作业</small></span>
+          <span>${completedHomeworkIds.size}<small>已提交</small></span>
+        </div>
+      </section>
+      <section class="student-course-board">
+        ${classes.length ? `
+          <div class="student-course-grid">
+            ${classes.map((klass) => {
+              const teacher = (state.data.users || []).find((user) => user.id === klass.teacherId);
+              const classHomework = homework.filter((item) => item.classId === klass.id);
+              const submitted = classHomework.filter((item) => completedHomeworkIds.has(item.id)).length;
+              return `
+                <article class="student-course-card" data-student-course-card="${escapeHtml(klass.id)}" tabindex="0" role="button" title="双击进入班级">
+                  <div class="student-course-card-head">
+                    <span>${escapeHtml(klass.subject)}</span>
+                    <button class="mini danger" type="button" data-leave-class="${escapeHtml(klass.id)}" data-class-name="${escapeHtml(klass.name)}">退出</button>
+                  </div>
+                  <strong>${escapeHtml(klass.name)}</strong>
+                  <p>教师：${escapeHtml(teacher?.name || klass.teacherId || "未设置")}</p>
+                  <div class="student-course-card-meta">
+                    <span>${(klass.studentIds || []).length} 人</span>
+                    <span>${classHomework.length} 作业</span>
+                    <span>${submitted} 已提交</span>
+                  </div>
+                </article>
+              `;
+            }).join("")}
+          </div>
+        ` : `
+          <div class="student-course-empty">
+            <strong>暂无课程</strong>
+          </div>
+        `}
+      </section>
+    </div>
+  `;
+}
+
+function renderStudentCourseDetail(active, homework, completedHomeworkIds) {
+  const classHomework = homework.filter((item) => item.classId === active.id);
+  const submitted = classHomework.filter((item) => completedHomeworkIds.has(item.id)).length;
+  const teacher = (state.data.users || []).find((user) => user.id === active.teacherId);
+  const features = [
+    { key: "ai", icon: "bot", label: "AI助教" },
+    { key: "lesson", icon: "school", label: "课堂" },
+    { key: "homework", icon: "clipboard", label: "作业" },
+    { key: "graph", icon: "network", label: "图谱" },
+    { key: "lab", icon: "lab", label: "实验室" },
+    { key: "record", icon: "target", label: "学习记录" }
+  ];
+  return `
+    <div class="student-courses-shell student-course-detail-shell">
+      <section class="panel class-active-panel student-course-detail-head">
+        <div>
+          <h3>${escapeHtml(active.name)} · ${escapeHtml(active.subject)}</h3>
+          <p class="hint">教师：${escapeHtml(teacher?.name || active.teacherId || "未设置")}</p>
+        </div>
+        <div class="class-active-actions">
+          <article><strong>${(active.studentIds || []).length}</strong><span>学生</span></article>
+          <article><strong>${classHomework.length}</strong><span>作业</span></article>
+          <article><strong>${submitted}</strong><span>已提交</span></article>
+          <button class="mini" type="button" data-student-course-back>返回</button>
+        </div>
+      </section>
+      <section class="class-feature-grid student-course-feature-grid" aria-label="班级学习功能">
+        ${features.map((item) => `
+          <button class="class-feature-button" type="button" data-student-course-action="${item.key}" data-class-id="${escapeHtml(active.id)}" data-class-subject="${escapeHtml(active.subject || "")}">
+            ${iconSvg(item.icon, item.label)}
+            <strong>${escapeHtml(item.label)}</strong>
+          </button>
+        `).join("")}
+      </section>
+    </div>
+  `;
+}
+
+function bindStudentCoursesPage() {
+  document.getElementById("joinClassForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const code = String(new FormData(event.currentTarget).get("classCode") || "").trim();
+    if (!code) return showToast("请输入班级邀请码或班级 ID", "error");
+    try {
+      const payload = await api(`/api/classes/${encodeURIComponent(code)}/apply`, {
+        method: "POST",
+        body: { studentId: state.user.id }
+      });
+      await loadState();
+      renderShell();
+      showToast(payload.application?.status === "pending" ? "申请已提交，等待教师同意" : "已加入班级");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.querySelectorAll("[data-leave-class]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const className = button.dataset.className || "该班级";
+      if (!confirm(`确认退出「${className}」？\n\n退出后将不再看到该班级的作业和资料。`)) return;
+      try {
+        await api(`/api/classes/${encodeURIComponent(button.dataset.leaveClass)}/students/${encodeURIComponent(state.user.id)}`, {
+          method: "DELETE"
+        });
+        state.homeworkDetailId = null;
+        await loadState();
+        renderShell();
+        showToast(`已退出「${className}」`);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  });
+  document.querySelectorAll("[data-student-course-card]").forEach((card) => {
+    const openCourse = () => {
+      state.studentCourseClassId = card.dataset.studentCourseCard;
+      renderContent();
+    };
+    card.addEventListener("dblclick", (event) => {
+      if (event.target.closest("[data-leave-class]")) return;
+      openCourse();
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      openCourse();
+    });
+  });
+  document.querySelectorAll("[data-student-course-back]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.studentCourseClassId = null;
+      renderContent();
+    });
+  });
+  document.querySelectorAll("[data-student-course-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.studentCourseAction;
+      const classSubject = button.dataset.classSubject || "";
+      if (classSubject) {
+        state.aiSubject = classSubject;
+        state.graphSubject = classSubject;
+        state.modelSubject = MODEL_LABS[classSubject] ? classSubject : state.modelSubject;
+      }
+      if (action === "homework") state.page = "homework";
+      else if (action === "graph") state.page = "graph";
+      else if (action === "lab") state.page = "models";
+      else if (action === "record") state.page = "profile";
+      else {
+        state.page = "ai";
+        state.aiMode = action === "lesson" ? "guided" : "qa";
+        state.aiTaskKey = state.aiMode;
+      }
+      await loadState();
+      renderShell();
+    });
+  });
+}
+
 function renderStudentHomeworkModal() {
   const item = (state.data.homework || []).find((homework) => homework.id === state.homeworkDetailId);
   if (!item) return "";
@@ -8548,91 +11764,126 @@ function bindStudentHomeworkPage() {
   });
 }
 
-function renderAdminPage() {
-  if (state.user.role !== "admin") return emptyBlock("只有管理员可以访问运营面板。");
-  const overview = state.adminOverview;
-  if (!overview) {
-    return `
-      <section class="panel admin-panel">
-        <div class="split-head">
-          <h3>平台运营面板</h3>
-          <button class="mini" type="button" id="refreshAdminOverview">加载数据</button>
-        </div>
-        ${emptyBlock("正在加载运营数据。")}
-      </section>
-    `;
-  }
-  const counts = overview.counts || {};
-  const checks = overview.checks || {};
+function renderAdminExportSection(section) {
+  const rows = section?.rows || [];
   return `
-    <section class="panel admin-panel">
-      <div class="split-head">
+    <article class="admin-export-section">
+      <div>
+        <strong>${escapeHtml(section?.title || "")}</strong>
+        <span>${rows.length} 条</span>
+      </div>
+      <p>${rows.length ? escapeHtml(Object.values(rows[0]).filter(Boolean).slice(0, 3).join(" · ")) : "暂无数据"}</p>
+    </article>
+  `;
+}
+
+function renderAdminPage() {
+  if (state.user.role !== "admin") return emptyBlock("只有管理员可以访问数据导出。");
+  const report = state.adminExport?.report || null;
+  const summary = report?.summary || {};
+  const sections = report?.sections || [];
+  return `
+    <div class="admin-export-shell">
+      <section class="workbench-title admin-export-title">
         <div>
-          <h3>平台运营面板</h3>
-          <p class="hint">查看系统健康、数据规模、任务状态、审计日志和安全配置。</p>
+          <h2>管理员数据导出</h2>
+          <p>导出 HTML / PDF / JSON / CSV，内容限定为匿名学生学习数据和教师评价指导记录。</p>
         </div>
         <div class="actions compact-actions">
-          <button class="mini" type="button" id="refreshAdminOverview">刷新</button>
-          <button class="primary" type="button" id="adminBackupBtn">一键备份</button>
+          <button class="mini" type="button" data-admin-refresh>刷新数据</button>
         </div>
-      </div>
-      <section class="dashboard-stats">
-        ${renderDashboardStat("用户", counts.users || 0, `${counts.teachers || 0} 教师 / ${counts.students || 0} 学生`)}
-        ${renderDashboardStat("资料", counts.materials || 0, `${counts.publicMaterials || 0} 份学生可见`)}
-        ${renderDashboardStat("图谱", counts.graphs || 0, `${counts.publicGraphs || 0} 个已开放`)}
-        ${renderDashboardStat("作业", counts.homework || 0, `${counts.submissions || 0} 份提交`)}
       </section>
-      <div class="admin-grid">
-        <section class="detail-card">
-          <strong>系统健康状态</strong>
-          <p>healthz：${escapeHtml(overview.health?.status || "unknown")}；readyz：${escapeHtml(overview.ready?.status || "unknown")}；存储：${escapeHtml(checks.storage || "unknown")}</p>
-          ${(overview.warnings || []).map((warning) => `<p class="warning-text">${escapeHtml(warning)}</p>`).join("") || `<p>安全配置无当前告警。</p>`}
+      ${report ? `
+        <section class="dashboard-stats compact admin-export-stats">
+          ${renderDashboardStat("匿名学生", summary.students || 0, `${summary.classes || 0} 个班级`)}
+          ${renderDashboardStat("学习事件", summary.learningEvents || 0, "学习周期时间线")}
+          ${renderDashboardStat("作业/测验", Number(summary.homeworkResults || 0) + Number(summary.testResults || 0), "成绩与结果")}
+          ${renderDashboardStat("反思/指导", Number(summary.reflections || 0) + Number(summary.teacherGuidance || 0), "摘要记录")}
         </section>
-        <section class="detail-card">
-          <strong>最近登录</strong>
-          <div class="table-list">
-            ${(overview.recentUsers || []).map((user) => `<div><span>${escapeHtml(user.name)}</span><span>${escapeHtml(roleName(user.role))}</span><span>${user.lastLoginAt ? fmtTime(user.lastLoginAt) : "未登录"}</span></div>`).join("") || emptyBlock("暂无登录记录")}
+        <section class="panel admin-export-panel">
+          <div class="split-head">
+            <div>
+              <h3>导出格式</h3>
+              <p class="hint">PDF 会打开打印页，可在浏览器打印对话框中保存为 PDF。</p>
+            </div>
+            <div class="actions compact-actions admin-export-actions">
+              <button class="primary" type="button" data-admin-export="html">HTML</button>
+              <button class="primary" type="button" data-admin-export="pdf">PDF</button>
+              <button class="mini" type="button" data-admin-export="json">JSON</button>
+              <button class="mini" type="button" data-admin-export="csv">CSV</button>
+            </div>
+          </div>
+          <div class="admin-export-grid">
+            ${sections.map(renderAdminExportSection).join("")}
           </div>
         </section>
-        <section class="detail-card">
-          <strong>图谱生成任务</strong>
-          <div class="graph-job-list">
-            ${(overview.graphJobs || []).slice(0, 6).map((job) => `<article class="graph-job-card ${escapeHtml(job.status || "")}"><div><strong>${escapeHtml(job.meta?.title || job.meta?.sourceName || job.id)}</strong><span>${escapeHtml(graphJobStatusLabel(job.status))} · ${job.progress || 0}%</span>${job.error ? `<p>${escapeHtml(job.error)}</p>` : ""}</div></article>`).join("") || emptyBlock("暂无任务")}
+      ` : `
+        <section class="panel admin-export-panel">
+          <div class="split-head">
+            <h3>导出数据</h3>
+            <button class="primary" type="button" data-admin-refresh>加载数据</button>
           </div>
+          ${emptyBlock("正在加载管理员导出数据。")}
         </section>
-        <section class="detail-card">
-          <strong>审计日志</strong>
-          <div class="table-list">
-            ${(overview.auditLogs || []).slice(0, 8).map((log) => `<div><span>${escapeHtml(log.action)}</span><span>${escapeHtml(log.actorId || "system")}</span><span>${fmtTime(log.createdAt)}</span></div>`).join("") || emptyBlock("暂无审计日志")}
-          </div>
-        </section>
-      </div>
-    </section>
+      `}
+    </div>
   `;
+}
+
+async function loadAdminExportPreview() {
+  const payload = await api("/api/admin/export?format=json");
+  state.adminExport = payload;
+}
+
+async function downloadAdminExport(format) {
+  const printWindow = format === "pdf" ? window.open("", "_blank", "noopener,noreferrer") : null;
+  let payload;
+  try {
+    payload = await api(`/api/admin/export?format=${encodeURIComponent(format)}`);
+  } catch (error) {
+    if (printWindow) printWindow.close();
+    throw error;
+  }
+  state.adminExport = payload;
+  if (payload.format === "pdf") {
+    const blob = new Blob([payload.content], { type: payload.mime || "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    if (printWindow) printWindow.location.href = url;
+    else window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
+    showToast("已打开 PDF 打印页");
+    return;
+  }
+  downloadText(payload.fileName, payload.content, payload.mime || "text/plain;charset=utf-8");
+  showToast(`已导出 ${payload.fileName}`);
 }
 
 function bindAdminPage() {
   if (state.user.role !== "admin") return;
-  const loadOverview = async () => {
+  document.querySelectorAll("[data-admin-refresh]").forEach((button) => button.addEventListener("click", async () => {
     try {
-      const payload = await api("/api/admin/overview");
-      state.adminOverview = payload.overview;
+      await loadAdminExportPreview();
       renderContent();
+      showToast("导出数据已刷新");
     } catch (error) {
       showToast(error.message, "error");
     }
-  };
-  document.getElementById("refreshAdminOverview")?.addEventListener("click", loadOverview);
-  document.getElementById("adminBackupBtn")?.addEventListener("click", async () => {
-    try {
-      const payload = await api("/api/admin/backup", { method: "POST", body: { userId: state.user.id } });
-      await loadOverview();
-      showToast(`备份完成：${payload.fileName}`);
-    } catch (error) {
-      showToast(error.message, "error");
-    }
+  }));
+  document.querySelectorAll("[data-admin-export]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await downloadAdminExport(button.dataset.adminExport);
+        renderContent();
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
   });
-  if (!state.adminOverview) loadOverview();
+  if (!state.adminExport) {
+    loadAdminExportPreview()
+      .then(() => renderContent())
+      .catch((error) => showToast(error.message, "error"));
+  }
 }
 
 function renderProfilePage() {
