@@ -41,25 +41,15 @@ function main() {
     DATA_DIR: resolveEnv("DATA_DIR"),
     LOG_DIR: resolveEnv("LOG_DIR"),
     STORAGE_DRIVER: resolveEnv("STORAGE_DRIVER"),
-    SESSION_SECRET: resolveEnv("SESSION_SECRET"),
-    DIFY_CALLBACK_TOKEN: resolveEnv("DIFY_CALLBACK_TOKEN"),
-    OPENAI_API_KEY: resolveEnv("OPENAI_API_KEY"),
-    DIFY_STUDENT_WORKFLOW_API_KEY: resolveEnv("DIFY_STUDENT_WORKFLOW_API_KEY"),
-    DIFY_TEACHER_WORKFLOW_API_KEY: resolveEnv("DIFY_TEACHER_WORKFLOW_API_KEY")
+    SESSION_SECRET: resolveEnv("SESSION_SECRET")
   };
 
   if (!env.SESSION_SECRET || /replace-with|change-me|secret/i.test(env.SESSION_SECRET)) {
     addIssue(issues, "error", "SESSION_SECRET 未设置为强随机值");
   }
-  if (!env.DIFY_CALLBACK_TOKEN || /replace-me|change-me|token/i.test(env.DIFY_CALLBACK_TOKEN)) {
-    addIssue(issues, "warn", "DIFY_CALLBACK_TOKEN 仍像占位值，Dify 回调可能被拒绝");
-  }
   if (!env.DATA_DIR) addIssue(issues, "warn", "DATA_DIR 未显式设置，建议指向 ./data");
   if (!env.LOG_DIR) addIssue(issues, "warn", "LOG_DIR 未显式设置，建议指向 ./logs");
   if (!env.STORAGE_DRIVER) addIssue(issues, "warn", "STORAGE_DRIVER 未显式设置，默认使用 SQLite；已有 JSON 请先迁移");
-  if (!env.OPENAI_API_KEY) addIssue(issues, "warn", "OPENAI_API_KEY 未设置，若依赖 OpenAI 回答需补充");
-  if (!env.DIFY_STUDENT_WORKFLOW_API_KEY) addIssue(issues, "warn", "DIFY_STUDENT_WORKFLOW_API_KEY 未设置，学生端工作流无法联通");
-  if (!env.DIFY_TEACHER_WORKFLOW_API_KEY) addIssue(issues, "warn", "DIFY_TEACHER_WORKFLOW_API_KEY 未设置，教师端工作流无法联通");
 
   const requiredFiles = [
     "server.js",

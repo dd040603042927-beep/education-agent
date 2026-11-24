@@ -47,8 +47,53 @@ function createSqliteStore(options) {
   sqlite.exec("PRAGMA foreign_keys = ON;");
   sqlite.exec("PRAGMA busy_timeout = 5000;");
   sqlite.exec(schemaSql);
-  if (!sqlite.prepare("PRAGMA table_info(diagnosis_results)").all().some((column) => column.name === "idempotency_key")) {
-    sqlite.exec("ALTER TABLE diagnosis_results ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT '';");
+  const columnsFor = (table) => sqlite.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name);
+  const addColumn = (table, definition) => {
+    const name = definition.trim().split(/\s+/)[0];
+    if (!columnsFor(table).includes(name)) sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${definition};`);
+  };
+  addColumn("learning_events", "graph_version TEXT NOT NULL DEFAULT 'legacy'");
+  addColumn("learning_events", "node_version TEXT NOT NULL DEFAULT 'legacy'");
+  addColumn("diagnosis_results", "idempotency_key TEXT NOT NULL DEFAULT ''");
+  addColumn("diagnosis_results", "graph_id TEXT NOT NULL DEFAULT ''");
+  addColumn("diagnosis_results", "node_id TEXT NOT NULL DEFAULT ''");
+  addColumn("diagnosis_results", "graph_version TEXT NOT NULL DEFAULT 'legacy'");
+  addColumn("diagnosis_results", "node_version TEXT NOT NULL DEFAULT 'legacy'");
+
+  const masteryColumns = columnsFor("student_mastery");
+  if (!masteryColumns.includes("graph_version") || !masteryColumns.includes("node_version")) {
+    sqlite.exec("DROP INDEX IF EXISTS idx_student_mastery_student_score;");
+    sqlite.exec("ALTER TABLE student_mastery RENAME TO student_mastery_legacy;");
+    sqlite.exec(`
+      CREATE TABLE student_mastery (
+        student_id TEXT NOT NULL,
+        subject TEXT NOT NULL DEFAULT '',
+        knowledge_point TEXT NOT NULL,
+        graph_id TEXT NOT NULL DEFAULT '',
+        node_id TEXT NOT NULL DEFAULT '',
+        graph_version TEXT NOT NULL DEFAULT 'legacy',
+        node_version TEXT NOT NULL DEFAULT 'legacy',
+        score REAL,
+        status TEXT NOT NULL DEFAULT '',
+        evidence_count INTEGER NOT NULL DEFAULT 0,
+        last_event_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(student_id, graph_id, graph_version, node_id)
+      );
+    `);
+    sqlite.exec(`
+      INSERT INTO student_mastery (
+        student_id, subject, knowledge_point, graph_id, node_id, graph_version, node_version,
+        score, status, evidence_count, last_event_id, updated_at
+      )
+      SELECT student_id, subject, knowledge_point,
+        CASE WHEN graph_id = '' THEN 'legacy:' || subject ELSE graph_id END,
+        CASE WHEN node_id = '' THEN 'legacy:' || knowledge_point ELSE node_id END,
+        'legacy', 'legacy', score, status, evidence_count, last_event_id, updated_at
+      FROM student_mastery_legacy;
+    `);
+    sqlite.exec("DROP TABLE student_mastery_legacy;");
+    sqlite.exec("CREATE INDEX IF NOT EXISTS idx_student_mastery_student_score ON student_mastery(student_id, score);");
   }
 
   const readState = sqlite.prepare("SELECT value_json FROM app_state WHERE key = ?");
@@ -67,21 +112,21 @@ function createSqliteStore(options) {
       INSERT INTO learning_events (
         id, student_id, class_id, teacher_id, subject, event_type, source,
         knowledge_point, graph_id, node_id, homework_id, submission_id,
-        score, duration_seconds, payload_json, idempotency_key, occurred_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        graph_version, node_version, score, duration_seconds, payload_json, idempotency_key, occurred_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertDiagnosis = sqlite.prepare(`
       INSERT INTO diagnosis_results (
         id, student_id, event_id, topic, mastery_score, mastery_level,
         error_tags_json, missing_points_json, evidence_json, final_answer,
-        model_or_workflow, created_at, idempotency_key
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        model_or_workflow, graph_id, node_id, graph_version, node_version, created_at, idempotency_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertMastery = sqlite.prepare(`
       INSERT INTO student_mastery (
-        student_id, subject, knowledge_point, graph_id, node_id, score,
+        student_id, subject, knowledge_point, graph_id, node_id, graph_version, node_version, score,
         status, evidence_count, last_event_id, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     (db.learningEvents || []).forEach((item) => {
@@ -98,6 +143,8 @@ function createSqliteStore(options) {
         item.nodeId || item.node_id || "",
         item.homeworkId || item.homework_id || "",
         item.submissionId || item.submission_id || "",
+        item.graphVersion || item.graph_version || "legacy",
+        item.nodeVersion || item.node_version || "legacy",
         toScore(item.score),
         item.durationSeconds == null && item.duration_seconds == null ? null : Number(item.durationSeconds ?? item.duration_seconds),
         jsonText(item.payload || {}),
@@ -122,6 +169,10 @@ function createSqliteStore(options) {
         jsonText(item.evidence || []),
         item.finalAnswer || item.final_answer || "",
         item.modelOrWorkflow || item.model_or_workflow || "",
+        item.graphId || item.graph_id || "",
+        item.nodeId || item.node_id || "",
+        item.graphVersion || item.graph_version || "legacy",
+        item.nodeVersion || item.node_version || "legacy",
         item.createdAt || item.created_at || "",
         item.idempotencyKey || item.idempotency_key || ""
       );
@@ -132,8 +183,10 @@ function createSqliteStore(options) {
         item.studentId || item.student_id || "",
         item.subject || "",
         item.knowledgePoint || item.knowledge_point || "",
-        item.graphId || item.graph_id || "",
-        item.nodeId || item.node_id || "",
+        item.graphId || item.graph_id || `legacy:${item.subject || ""}`,
+        item.nodeId || item.node_id || `legacy:${item.knowledgePoint || item.knowledge_point || ""}`,
+        item.graphVersion || item.graph_version || "legacy",
+        item.nodeVersion || item.node_version || "legacy",
         toScore(item.score),
         item.status || "",
         Number(item.evidenceCount || item.evidence_count || 0),
@@ -151,10 +204,25 @@ function createSqliteStore(options) {
 
   function readLearningTable(table) {
     return sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => {
-      return Object.fromEntries(Object.entries(row).map(([column, value]) => {
+      const item = Object.fromEntries(Object.entries(row).map(([column, value]) => {
         const name = column.replace(/_json$/, "").replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
         return [name, column.endsWith("_json") ? JSON.parse(value) : column === "event_id" ? value || "" : value];
       }));
+      const legacyMastery = table === "student_mastery" && String(item.graphId || "").startsWith("legacy:") && String(item.nodeId || "").startsWith("legacy:");
+      const legacyUnlinked = item.graphVersion === "legacy" && (!item.graphId || legacyMastery) && (!item.nodeId || legacyMastery);
+      if (legacyMastery) {
+        item.graphId = "";
+        item.nodeId = "";
+      }
+      if (legacyUnlinked) {
+        delete item.graphVersion;
+        delete item.nodeVersion;
+      }
+      if (table === "diagnosis_results" && legacyUnlinked) {
+        delete item.graphId;
+        delete item.nodeId;
+      }
+      return item;
     });
   }
 
@@ -341,6 +409,10 @@ function createSqliteStore(options) {
     return jobRow(sqlite.prepare("SELECT * FROM background_jobs WHERE id = ?").get(id));
   }
 
+  function listJobs() {
+    return sqlite.prepare("SELECT * FROM background_jobs ORDER BY created_at DESC").all().map(jobRow);
+  }
+
   function read() {
     sqlite.exec("BEGIN;");
     let db;
@@ -412,6 +484,7 @@ function createSqliteStore(options) {
     completeJob,
     failJob,
     getJob,
+    listJobs,
     close: () => sqlite.close()
   };
 }

@@ -1,0 +1,18 @@
+.git
+.agents
+.codex
+.edge-*
+backups
+Course Materials
+data
+logs
+preview-data
+docx_render_check
+dify
+*.docx
+*.pdf
+*.pptx
+*.zip
+.env
+.env.*
+!.env.example

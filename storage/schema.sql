@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS learning_events (
   knowledge_point TEXT NOT NULL DEFAULT '',
   graph_id TEXT NOT NULL DEFAULT '',
   node_id TEXT NOT NULL DEFAULT '',
+  graph_version TEXT NOT NULL DEFAULT 'legacy',
+  node_version TEXT NOT NULL DEFAULT 'legacy',
   homework_id TEXT NOT NULL DEFAULT '',
   submission_id TEXT NOT NULL DEFAULT '',
   score REAL,
@@ -57,6 +59,10 @@ CREATE TABLE IF NOT EXISTS diagnosis_results (
   evidence_json TEXT NOT NULL DEFAULT '[]',
   final_answer TEXT NOT NULL DEFAULT '',
   model_or_workflow TEXT NOT NULL DEFAULT '',
+  graph_id TEXT NOT NULL DEFAULT '',
+  node_id TEXT NOT NULL DEFAULT '',
+  graph_version TEXT NOT NULL DEFAULT 'legacy',
+  node_version TEXT NOT NULL DEFAULT 'legacy',
   idempotency_key TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   FOREIGN KEY(event_id) REFERENCES learning_events(id) ON DELETE SET NULL
@@ -74,12 +80,14 @@ CREATE TABLE IF NOT EXISTS student_mastery (
   knowledge_point TEXT NOT NULL,
   graph_id TEXT NOT NULL DEFAULT '',
   node_id TEXT NOT NULL DEFAULT '',
+  graph_version TEXT NOT NULL DEFAULT 'legacy',
+  node_version TEXT NOT NULL DEFAULT 'legacy',
   score REAL,
   status TEXT NOT NULL DEFAULT '',
   evidence_count INTEGER NOT NULL DEFAULT 0,
   last_event_id TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
-  PRIMARY KEY(student_id, subject, knowledge_point)
+  PRIMARY KEY(student_id, graph_id, graph_version, node_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_student_mastery_student_score

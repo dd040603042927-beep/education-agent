@@ -56,22 +56,19 @@ $env:PORT=5108
 node server.js
 ```
 
-项目启动时会自动读取根目录 `.env`。建议复制 `.env.example` 为 `.env`，至少设置强随机 `SESSION_SECRET`。如果通过 HTTPS 反向代理公开访问，请设置 `COOKIE_SECURE=true`。
+项目启动时会自动读取根目录 `.env`。建议复制 `.env.example` 为 `.env`，至少设置强随机 `SESSION_SECRET`。面向多用户公开使用时，请部署一个中心服务并让所有人访问同一个地址；不要在每台电脑各自启动服务，否则账号、班级和邀请码不会互通。可直接使用 `docker compose up -d --build`，详见 [DEPLOYMENT.md](./DEPLOYMENT.md)。如果通过 HTTPS 反向代理公开访问，请设置 `COOKIE_SECURE=true`。
 
 ## AI 模型对接
 
-学生端 AI 助教直接使用后端的 OpenAI 兼容 `/chat/completions` 接口。后端先检索当前学生可见的课程资料、错因资料和知识图谱，再将引用证据、学生掌握度、薄弱点和近期学习活动一并传给模型。模型只负责生成回答与结构化诊断，引用校验、学习事件和画像写入仍由项目后端完成。
+管理员登录后，在左侧“配置 API”中填写服务类型、API 地址、模型名称、API Key 与超时时间。学生端和教师端统一使用这份持久化配置，保存后立即生效，无需修改 `.env` 或重启服务。API Key 仅在服务端保存，配置读取接口不会回显密钥。
 
-```env
-OPENAI_API_KEY=replace-with-your-openai-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4.1-mini
-OPENAI_TIMEOUT_MS=25000
-```
+支持 OpenAI 兼容接口和本地 Ollama。Ollama 地址通常填写 `http://127.0.0.1:11434/v1`，模型名填写已安装的标签，例如 `qwen3:8b`。
+
+若 Ollama 同时提供本地向量模型，且 `EMBEDDING_BASE_URL` 指向 Ollama 的 `/v1` 接口，可设置 `EMBEDDING_API_KEY=ollama-local`、`EMBEDDING_MODEL=bge-m3` 和 `EMBEDDING_PROVIDER=openai`，避免继续请求 OpenAI 的 `text-embedding-3-small`。Embedding 模型需在 Ollama 中已安装。
 
 学生没有提交自我理解时，模型只生成分层讲解和自检问题，不更新本轮掌握度。学生提交作答或使用批改模式时，模型才返回掌握度、错因和缺漏点，后端将其作为结构化学习证据保存。
 
-教师端教学工作流仍可继续使用 Dify，并保留 `DIFY_TEACHER_WORKFLOW_API_KEY` 与 `DIFY_CALLBACK_TOKEN` 配置；学生端不再读取 `DIFY_STUDENT_WORKFLOW_API_KEY`。
+教师端教学助手与学生端学习助手使用同一管理员配置的模型服务；课程检索、引用校验、学习事件和画像写入仍由项目后端处理。
 
 图谱生成支持一次选择多个 PDF/TXT/EPUB/Markdown 文件。前端会逐个分块上传，后端在一个图谱任务中解析多个文件并汇总文本、文件名、OCR 结果和补充目录，最终生成一个融合图谱。
 
@@ -131,12 +128,11 @@ npm run backup
 - 大文件处理：PDF 上传改为 6MB 分块上传和后台任务，默认不再设置固定总上传大小，不把文件转成 Base64 JSON；生成时显示上传、解析、抽取、生成、保存进度，并对单个分块、图片流、解压输出和文本量做保护。
 - 高级 PDF/OCR 智能体：后端优先调用 Python 的 PyMuPDF 读取 PDF 文本层，失败时再尝试 pdfplumber、pypdf；如果文本层不足，会用 PyMuPDF 渲染页面并调用 PaddleOCR 识别扫描版内容，最后才回退到 Node 轻量解析器。
 - AI 对话：按讲解/出题/方案或学习方向生成回答，并保存历史。
-- 模型显示：拖拉组件构建学科模型，支持真实/理想状态、保存、下载、删除；机器学习算法实验室可在画布代码编辑器中运行当前 Python 代码，真实返回 stdout/stderr/退出码/耗时，而不是固定展示预设结果。
 - 聊天：按 ID 或姓名加好友、私聊、群聊、删除好友、删除选中消息。
 - 班级：创建多学科班级、导入学生、邀请码申请加入、自动处理名单。
 - 作业：发布文字/图片/视频作业与答案，学生提交多媒体答案，教师 AI 批改或手动批改。
 
-数据保存在 `data/db.json`，首次启动会自动生成演示数据。
+数据默认保存在 `data/education.db`，首次启动会自动生成演示数据。
 
 默认存储已切换为 SQLite WAL。学习事件、诊断结果、掌握度记录由独立数据表读写，课程片段向量保存在 `knowledge_chunks`，其余业务暂时保留在 `app_state`；当前仍采用全量对象读写接口，不等同于完成所有业务分表或解决多进程并发更新。SQLite 迁移见 `docs/SQLITE_MIGRATION.md`，Embedding 配置与索引重建见 `docs/EMBEDDING_RETRIEVAL.md`。正式多班级、多学校长期运行前，还需逐步拆分业务表并引入任务队列、监控和端到端测试。发行路线和剩余清单见 [RELEASE_CHECKLIST.md](./RELEASE_CHECKLIST.md)。
 

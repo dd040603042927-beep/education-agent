@@ -1,0 +1,24 @@
+services:
+  education-agent:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5107"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 5107
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      BACKUP_DIR: /app/backups
+      STORAGE_DRIVER: sqlite
+      DATABASE_URL: /app/data/education.db
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env before starting}
+      COOKIE_SECURE: "false"
+    volumes:
+      - ./production-data:/app/data
+      - ./production-logs:/app/logs
+
+# Run one replica only while the application stores its shared state in SQLite.
+# Do not start a second copy with another data directory: users would see a
+# different account, class, and invitation database.

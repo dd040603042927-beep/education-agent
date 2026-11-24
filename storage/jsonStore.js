@@ -52,12 +52,13 @@ function createJsonStore(options) {
   }
 
   function getJob(id) { return jobs(read()).find((item) => item.id === id) || null; }
+  function listJobs() { return [...jobs(read())].sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || ""))); }
   function recoverJobs() { const db = read(); let changed = false; jobs(db).forEach((item) => { if (item.status === "running") { item.status = "queued"; item.error = "interrupted by restart"; item.updatedAt = new Date().toISOString(); changed = true; } }); if (changed) write(db); }
   function claimNextJob() { const db = read(); const timestamp = new Date().toISOString(); const item = jobs(db).find((job) => job.status === "queued" && job.runAfter <= timestamp); if (!item) return null; item.status = "running"; item.attempts += 1; item.startedAt = timestamp; item.updatedAt = timestamp; write(db); return item; }
   function completeJob(id, result) { const db = read(); const item = jobs(db).find((job) => job.id === id); if (!item) return null; item.status = "complete"; item.result = result; item.error = ""; item.completedAt = item.updatedAt = new Date().toISOString(); write(db); return item; }
   function failJob(id, error, retryable) { const db = read(); const item = jobs(db).find((job) => job.id === id); if (!item) return null; const timestamp = new Date().toISOString(); const retry = retryable && item.attempts < item.maxAttempts; item.status = retry ? "queued" : "failed"; item.error = String(error || "job failed").slice(0, 2000); item.runAfter = retry ? new Date(Date.now() + 1000).toISOString() : timestamp; item.completedAt = retry ? "" : timestamp; item.updatedAt = timestamp; write(db); return item; }
 
-  return { read, write, metadata, enqueueJob, recoverJobs, claimNextJob, completeJob, failJob, getJob };
+  return { read, write, metadata, enqueueJob, recoverJobs, claimNextJob, completeJob, failJob, getJob, listJobs };
 }
 
 module.exports = { createJsonStore };

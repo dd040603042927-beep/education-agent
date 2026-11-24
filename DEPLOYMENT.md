@@ -1,91 +1,68 @@
 # 智慧教育智能体平台部署说明
 
-本项目当前适合“校内演示 / 小范围内测”。正式多学校、多班级长期运行前，仍应按 `RELEASE_CHECKLIST.md` 推进数据库、任务队列、真实 RAG、监控和备份。
+## 多用户部署原则
 
-## 1. 本地或局域网启动
+不同电脑上的教师、学生和管理员必须访问同一个服务地址，例如 `http://服务器公网 IP:5000`。账号、班级、邀请码、课程资料和学习记录保存在该服务实例的同一份 SQLite 数据库中。
 
-复制环境变量模板：
+不要在教师电脑、学生电脑或多台服务器上分别运行 `node server.js` 并让用户混用这些地址。每一份 `DATA_DIR` 都是一套独立系统；邀请码提示“资源不存在”通常意味着邀请码创建在另一份数据库中。
+
+当前存储实现适合一个应用进程配一份 SQLite 数据库。不要扩容为多个 Node 容器或多副本共享数据库文件；需要多实例部署时，应先把其余业务状态从 `app_state` 拆分到 PostgreSQL。
+
+## 服务器启动
+
+1. 将整个项目部署到一台持续运行的服务器。所有访问者使用同一个公网 IP 或域名。
+2. 在项目根目录创建 `.env`，至少设置一个新的高强度 `SESSION_SECRET`。不要提交该文件。
+3. 运行：
 
 ```powershell
-Copy-Item .env.example .env
+docker compose up -d --build
 ```
 
-修改 `.env`，至少设置强随机 `SESSION_SECRET`。本机运行时保持：
+Compose 会把宿主机的 `production-data/` 挂载到容器 `/app/data`，因此容器重建、服务器重启后仍会保留所有账号、班级和邀请码。默认将服务器 `5000` 端口映射到应用 `5107` 端口。
+
+4. 在服务器本机检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5000/api/healthz
+```
+
+返回的 `storagePath` 应为容器中的 `/app/data/education.db`。之后所有用户都从浏览器访问同一个公网地址，不要使用各自电脑的 `localhost`。
+
+5. 在服务器安全组和防火墙中仅放行实际对外端口。正式公网使用应配置域名和 HTTPS 反向代理，并将 Compose 中的 `COOKIE_SECURE` 改为 `true` 后重新启动。
+
+## 现有数据与邀请码
+
+只复制代码不会复制班级和邀请码。迁移服务器时应在停服状态下备份并迁移完整的持久化目录：
 
 ```text
-HOST=127.0.0.1
+production-data/
+production-logs/
+```
+
+如果邀请码只存在于旧的 `data/db.json`、而当前服务使用的是 `data/education.db`，说明 JSON 和 SQLite 是两套数据。先停止服务并备份，再按 [SQLite 迁移说明](./docs/SQLITE_MIGRATION.md) 执行迁移；已有 SQLite 新数据时不要直接使用 `--replace`，它会以旧 JSON 覆盖新数据，必须先确认哪一份才是权威数据。
+
+## 局域网临时测试
+
+无需 Docker 时，可在一台作为中心主机的电脑上设置：
+
+```ini
+HOST=0.0.0.0
 PORT=5107
 DATA_DIR=./data
-LOG_DIR=./logs
-COOKIE_SECURE=false
-SESSION_IDLE_TIMEOUT_MS=172800000
+STORAGE_DRIVER=sqlite
+DATABASE_URL=file:./data/education.db
 ```
 
-登录态最长 2 天无活动过期；即使旧配置里 `SESSION_TTL_MS` 大于 2 天，服务也会按 2 天上限处理。
+然后运行 `node server.js`。其他设备用 `http://中心主机 IP:5107` 访问；不要在其他设备再启动本项目。
 
-启动：
+## 备份和验证
 
-```powershell
-node server.js
-```
-
-本机访问：
-
-```text
-http://127.0.0.1:5107
-```
-
-## 2. OCR 说明
-
-本地运行可以处理文本层 PDF、Office 文档和文本资料；扫描版 PDF 的完整 OCR 需要安装 Python、PyMuPDF、PaddleOCR 等依赖。
-
-本机运行时可通过环境变量指定 Python：
-
-```text
-PDF_AGENT_PYTHON=python
-```
-
-OCR 页数和超时时间可在 `.env` 中调整：
-
-```text
-PDF_AGENT_OCR_MAX_PAGES=80
-PDF_AGENT_OCR_LEADING_PAGES=40
-PDF_AGENT_TIMEOUT_MS=1200000
-```
-
-## 3. 发布前检查
-
-每次发布前至少执行：
-
-```powershell
-node --check server.js
-node --check public\app.js
-npm.cmd test
-```
-
-`npm test` 在部分 Windows PowerShell 环境会被执行策略拦截，可改用 `npm.cmd test`。
-
-## 4. 备份与恢复
-
-当前版本仍使用 JSON 数据文件。小范围内测时必须定期备份：
-
-```text
-data/db.json
-data/uploads/
-data/runtime/
-logs/audit.log
-```
-
-可以直接运行：
+在服务器上定期执行：
 
 ```powershell
 npm run backup
+npm run check
+npm test
 ```
 
-备份会生成到：
-
-```text
-backups/backup-时间戳/
-```
-
-恢复时停止服务，替换 `data/` 和 `logs/` 后重新启动。多人并发和长期运行建议尽快迁移到 SQLite WAL 或 PostgreSQL。
+备份含用户资料和可能的模型密钥，应限制服务器目录权限。发布前还应使用不同浏览器或无痕窗口分别登录教师与学生账号，验证学生可通过教师生成的邀请码申请加入同一班级。
